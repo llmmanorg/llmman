@@ -950,3 +950,157 @@ async fn a_token_service_credential_is_spent_as_a_bearer_and_listed_without_its_
 fn target_request(target: &Target) -> reqwest::Request {
     built(target, "https://p.example/v1/x")
 }
+
+// ---------------------------------------------------------------------------
+// A launched agent that can switch provider
+// ---------------------------------------------------------------------------
+
+fn bearer_of(token: &str) -> HeaderMap {
+    headers_with(&[("authorization", &format!("Bearer {token}"))])
+}
+
+/// The rule that makes it safe to offer an agent every provider: a key
+/// registered for provider A is spent on A and never reaches B after the
+/// agent switches, and the token itself is no one's credential.
+#[tokio::test]
+async fn a_session_key_is_sent_to_its_own_provider_and_never_another() {
+    let _fx = fixture();
+    let state = test_state();
+    let token =
+        sessions::open([("credtest".to_string(), "sk-for-credtest".to_string())].into()).unwrap();
+    let headers = bearer_of(&token);
+
+    // The provider the key belongs to gets it.
+    let own = remote(&state, "llmman.provider/credtest/m", Some(&headers))
+        .await
+        .unwrap();
+    let cred = own.credential.as_ref().expect("a credential");
+    assert_eq!(
+        (cred.kind, cred.secret.expose()),
+        ("session", "sk-for-credtest")
+    );
+    let sent = built(&Target::Remote(own), "https://credtest.example/v1/x");
+    assert_eq!(sent.headers()["authorization"], "Bearer sk-for-credtest");
+
+    // After a switch to another provider, the same header carries no key
+    // for it: an error naming what to set, not the first provider's key.
+    let err = remote(&state, "llmman.provider/openai/gpt-5", Some(&headers)).await;
+    let Err(err) = err else {
+        panic!("the key of one provider was sent to another");
+    };
+    assert_eq!(err.1, StatusCode::UNAUTHORIZED);
+    let message = err.0.to_string();
+    assert!(
+        message.contains("openai") && message.contains("OPENAI_API_KEY"),
+        "{message}"
+    );
+    assert!(
+        !message.contains("sk-for-credtest") && !message.contains(&token),
+        "{message}"
+    );
+    sessions::close(&token);
+}
+
+#[tokio::test]
+async fn a_session_holds_one_key_per_provider_and_a_closed_one_holds_none() {
+    let _fx = fixture();
+    let state = test_state();
+    let token = sessions::open(
+        [
+            ("credtest".to_string(), "sk-one".to_string()),
+            ("openai".to_string(), "sk-two".to_string()),
+        ]
+        .into(),
+    )
+    .unwrap();
+    let headers = bearer_of(&token);
+    for (model, want) in [
+        ("llmman.provider/credtest/m", "sk-one"),
+        ("llmman.provider/openai/gpt-5", "sk-two"),
+    ] {
+        let target = remote(&state, model, Some(&headers)).await.unwrap();
+        assert_eq!(target.credential.as_ref().unwrap().secret.expose(), want);
+    }
+    sessions::close(&token);
+    // An expired or restarted daemon's token is never forwarded as a key.
+    let err = remote(&state, "llmman.provider/credtest/m", Some(&headers))
+        .await
+        .unwrap_err();
+    assert_eq!(err.1, StatusCode::UNAUTHORIZED);
+    assert!(!err.0.to_string().contains(&token));
+}
+
+/// A client that names one provider and sends that provider's own key, as
+/// `llmman run --provider` and third-party clients do, is unchanged.
+#[tokio::test]
+async fn a_key_in_the_header_is_still_the_callers_for_the_provider_it_names() {
+    let _fx = fixture();
+    let target = remote(
+        &test_state(),
+        "llmman.provider/credtest/m",
+        Some(&bearer_of("sk-callers-own")),
+    )
+    .await
+    .unwrap();
+    let cred = target.credential.as_ref().unwrap();
+    assert_eq!(
+        (cred.kind, cred.secret.expose()),
+        ("request", "sk-callers-own")
+    );
+}
+
+#[tokio::test]
+async fn opening_a_session_is_refused_from_another_sites_page() {
+    let refused = handle_open_session(
+        headers_with(&[("sec-fetch-site", "cross-site")]),
+        Json(OpenSessionBody {
+            keys: [("p".to_string(), "k".to_string())].into(),
+        }),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(refused.1, StatusCode::FORBIDDEN);
+    let (status, Json(opened)) = handle_open_session(
+        HeaderMap::new(),
+        Json(OpenSessionBody {
+            keys: [("p".to_string(), "k".to_string())].into(),
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(
+        handle_close_session(bearer_of(&opened.token)).await,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        handle_close_session(bearer_of(&opened.token)).await,
+        StatusCode::NOT_FOUND
+    );
+}
+
+/// What `POST /llmman/sessions` accepts is bounded by the route itself, not
+/// by the 2 MiB default: a launch needs a key per provider, no more.
+#[tokio::test]
+async fn opening_a_session_refuses_a_body_larger_than_a_launch_needs() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = build_router(test_state(), false);
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let url = format!("http://127.0.0.1:{}/llmman/sessions", addr.port());
+    let open = |keys: serde_json::Value| {
+        Client::new()
+            .post(&url)
+            .json(&serde_json::json!({ "keys": keys }))
+            .send()
+    };
+
+    let resp = open(serde_json::json!({ "openai": "sk-test" }))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let big = "k".repeat(sessions::BODY_LIMIT_BYTES);
+    let resp = open(serde_json::json!({ "openai": big })).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+}

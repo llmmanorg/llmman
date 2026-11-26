@@ -6,7 +6,7 @@ reference; this is the one-line summary of each subcommand.
 | Command | Description |
 |---------|-------------|
 | `serve`   | Start an inference server (Ollama / OpenAI / Anthropic APIs) |
-| `launch`  | Launch an integration (Claude Code, OpenCode, …); `--optimizer tk` compacts the output of the agent's shell commands `--optimizer cvmn` asks for terse replies and `--optimizer hdrm` compresses what the agent sends the model (see [optimizers.md](optimizers.md)) |
+| `launch`  | Launch an integration (Claude Code, OpenCode, …) with every model and variant available inside it (copilot and Gemini CLI take one model; only claude, codex, opencode, hermes and openclaw read their own last model for a launch with neither flag); `--model`/`--provider` choose the one it starts on (see [providers.md](providers.md#every-model-inside-the-agent)); `--optimizer tk` compacts the output of the agent's shell commands `--optimizer cvmn` asks for terse replies and `--optimizer hdrm` compresses what the agent sends the model (see [optimizers.md](optimizers.md)) |
 | `run`     | Run a model interactively or with a one-shot prompt |
 | `pull`    | Pull a model from a registry or HuggingFace |
 | `search`  | Search for models on Docker Hub and Hugging Face (Docker Hub results first), with a `FIT` column: how much of this machine's model memory each default download takes |

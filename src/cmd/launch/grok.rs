@@ -1,16 +1,22 @@
 //! `llmman launch grok` (Grok Build).
 
+use super::models::{ModelEntry, ModelList};
 use std::path::{Path, PathBuf};
 
-use anyhow::Context;
-
 use super::common;
-use super::{env_dir, exec_with_env, find_on_path, has_forwarded_model_flag, server, Effort};
+use super::{
+    env_dir_or_home, exec_with_env, find_on_path, has_forwarded_model_flag, server, Effort,
+};
 
 /// The per-model `env_key` in llmman's Grok config reads this variable.
 /// A model credential outranks both Grok's signed-in session and its global
 /// `XAI_API_KEY`, without putting the actual key on disk.
 const GROK_API_KEY_ENV: &str = "LLMMAN_GROK_API_KEY";
+
+/// How many rows Grok Build is offered: it puts every configured model in the prompt of every
+/// request (about 45 bytes a row; the whole catalog was 470 KB, over a Claude model's 200k window),
+/// so only the front of the list is given.
+const GROK_MODEL_LIMIT: usize = 300;
 
 /// grok: point its custom-model catalog and inference client at llmman's
 /// OpenAI-compatible surface. Every auxiliary model is pinned too: without
@@ -18,14 +24,22 @@ const GROK_API_KEY_ENV: &str = "LLMMAN_GROK_API_KEY";
 /// description, web search, and prompt suggestions, then asks the local
 /// daemon to load one after the main model already answered successfully.
 ///
+/// Grok Build merges the `[model.<id>]` entries of its config with the
+/// catalog it fetches from `GROK_MODELS_LIST_URL`, so the config carries
+/// every model of the list, hosted ones included, which `/v1/models` does
+/// not list; each is switched to inside Grok by its `reference`. Grok
+/// Build 1.0.92 lists them in `grok models` and sends the reference as is.
+///
 /// The model flag is injected only when the caller did not provide one
 /// after `--`. This matches `qwen::qwen_args` and lets an explicit
 /// integration argument win without passing a duplicate flag. `--model` is
-/// not looked for after a second `--`.
+/// not looked for after a second `--`; a model named there that the list
+/// lacks is added to it.
 pub(super) fn launch_grok(
     model: &str,
     api_key: &str,
-    effort: Option<&Effort>,
+    _effort: Option<&Effort>,
+    models: &ModelList,
     extra_args: &[String],
 ) -> anyhow::Result<()> {
     let bin = find_grok().ok_or_else(|| anyhow::anyhow!("grok is not installed"))?;
@@ -35,8 +49,7 @@ pub(super) fn launch_grok(
     // Never edit the user's config.toml. This child is wholly llmman-owned,
     // and setting GROK_HOME below scopes it to this launched process.
     let home = grok_home()?.join("llmman");
-    let efforts = effort.map_or(&[][..], |e| &e.levels);
-    write_grok_config(&home, effective_model, &base_url, efforts)?;
+    write_grok_config(&home, &grok_list(models, effective_model), &base_url)?;
     let home = home.to_string_lossy().into_owned();
     let args = grok_args(model, extra_args);
     exec_with_env(
@@ -44,6 +57,27 @@ pub(super) fn launch_grok(
         &args,
         &grok_env(effective_model, api_key, &base_url, &models_url, &home),
     )
+}
+
+/// What Grok Build is given: the front of `models` (see
+/// [`GROK_MODEL_LIMIT`]), and `model` where the caller named one it lacks.
+fn grok_list(models: &ModelList, model: &str) -> ModelList {
+    let limited = models.limited(
+        "grok",
+        GROK_MODEL_LIMIT,
+        "Grok Build sends its model list with every request",
+    );
+    with_model(&limited, model)
+}
+
+/// `models`, and `model` as a last row when the caller named one the list
+/// does not hold.
+fn with_model(models: &ModelList, model: &str) -> ModelList {
+    let mut entries = models.entries().to_vec();
+    if !model.is_empty() && !entries.iter().any(|e| e.reference == model) {
+        entries.push(ModelEntry::unlisted(model));
+    }
+    ModelList::of(entries)
 }
 
 fn grok_env<'a>(
@@ -74,42 +108,54 @@ fn grok_env<'a>(
 
 /// Grok's configured home, or its documented `~/.grok` default.
 pub(super) fn grok_home() -> anyhow::Result<PathBuf> {
-    if let Some(path) = env_dir("GROK_HOME") {
-        return Ok(path);
-    }
-    Ok(dirs::home_dir().context("no home directory")?.join(".grok"))
+    env_dir_or_home("GROK_HOME", ".grok")
 }
 
-fn write_grok_config(
-    home: &Path,
-    model: &str,
-    base_url: &str,
-    efforts: &[&str],
-) -> anyhow::Result<()> {
+fn write_grok_config(home: &Path, models: &ModelList, base_url: &str) -> anyhow::Result<()> {
     let path = home.join("config.toml");
-    std::fs::create_dir_all(home).with_context(|| format!("create {}", home.display()))?;
-    let contents = grok_config_document(model, base_url, efforts);
-    crate::fsutil::write_atomic(&path, contents.as_bytes())
-        .with_context(|| format!("write {}", path.display()))
+    let contents = grok_config_document(models, base_url);
+    common::write_atomic_in_dir(&path, contents.as_bytes())
 }
 
-/// Grok Build ignores `--effort` for a model without `efforts` listed.
-fn grok_config_document(model: &str, base_url: &str, efforts: &[&str]) -> String {
-    let mut entry = toml_edit::Table::new();
-    entry["model"] = toml_edit::value(model);
-    entry["base_url"] = toml_edit::value(base_url);
-    entry["env_key"] = toml_edit::value(GROK_API_KEY_ENV);
-    entry["api_backend"] = toml_edit::value("chat_completions");
-    if !efforts.is_empty() {
-        entry["reasoning_efforts"] =
-            toml_edit::value(efforts.iter().copied().collect::<toml_edit::Array>());
+/// One `[model.<id>]` per row, keyed by the `reference` Grok sends and is
+/// selected by (`--model`, `GROK_DEFAULT_MODEL`).
+fn grok_config_document(models: &ModelList, base_url: &str) -> String {
+    let ids = models.unique_keys(|e| e.reference.clone());
+    let names = models.display_names();
+    let mut table = toml_edit::Table::new();
+    table.set_implicit(true);
+    for ((id, name), entry) in ids.iter().zip(&names).zip(models.entries()) {
+        table.insert(
+            id,
+            toml_edit::Item::Table(grok_model(entry, name, base_url)),
+        );
     }
-
-    let mut models = toml_edit::Table::new();
-    models.insert(model, toml_edit::Item::Table(entry));
     let mut document = toml_edit::DocumentMut::new();
-    document.insert("model", toml_edit::Item::Table(models));
+    document.insert("model", toml_edit::Item::Table(table));
     document.to_string()
+}
+
+/// The one mapping of a row to a Grok model. Grok Build ignores `--effort`
+/// for a model without `reasoning_efforts` listed, and takes neither the
+/// image input nor the tool calling from its config.
+fn grok_model(entry: &ModelEntry, name: &str, base_url: &str) -> toml_edit::Table {
+    let mut model = toml_edit::Table::new();
+    model["model"] = toml_edit::value(entry.reference.as_str());
+    model["name"] = toml_edit::value(name);
+    model["base_url"] = toml_edit::value(base_url);
+    model["env_key"] = toml_edit::value(GROK_API_KEY_ENV);
+    model["api_backend"] = toml_edit::value("chat_completions");
+    if let Some(window) = entry.context_window {
+        model["context_window"] = toml_edit::value(window as i64);
+    }
+    if let Some(output) = entry.max_output {
+        model["max_completion_tokens"] = toml_edit::value(i64::from(output));
+    }
+    let efforts = entry.spelled_variants("grok");
+    if !efforts.is_empty() {
+        model["reasoning_efforts"] = toml_edit::value(efforts.iter().collect::<toml_edit::Array>());
+    }
+    model
 }
 
 fn grok_args(model: &str, extra_args: &[String]) -> Vec<String> {
@@ -135,6 +181,20 @@ fn grok_fallback(home: &Path) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn grok_gets_the_front_of_a_long_list_and_always_the_model_it_starts_on() {
+        let row = |i: usize| ModelEntry::unlisted(&format!("llmman.provider/p/m{i}"));
+        let long = ModelList::of((0..GROK_MODEL_LIMIT + 50).map(row).collect());
+        let list = grok_list(&long, "llmman.provider/p/m0");
+        assert_eq!(list.entries().len(), GROK_MODEL_LIMIT);
+        assert_eq!(list.entries()[0].reference, "llmman.provider/p/m0");
+        // A model named after `--` that the front lacks is added, not lost.
+        let far = format!("llmman.provider/p/m{}", GROK_MODEL_LIMIT + 10);
+        let list = grok_list(&long, &far);
+        assert_eq!(list.entries().len(), GROK_MODEL_LIMIT + 1);
+        assert_eq!(list.entries().last().unwrap().reference, far);
+    }
 
     /// Grok Build uses the custom-model endpoint for both catalog lookup
     /// and inference. Its auxiliary samplers must follow the selected
@@ -189,7 +249,8 @@ mod tests {
     #[test]
     fn grok_config_uses_the_model_credential_without_persisting_it() {
         let model = r#"org/model.\"quoted\""#;
-        let text = grok_config_document(model, "http://127.0.0.1:17434/v1", &[]);
+        let list = ModelList::of(vec![ModelEntry::unlisted(model)]);
+        let text = grok_config_document(&list, "http://127.0.0.1:17434/v1");
 
         let parsed: toml::Value = text.parse().expect("valid TOML");
         let entry = &parsed["model"][model];
@@ -218,7 +279,8 @@ mod tests {
         std::fs::write(&user_config, "[model.mine]\napi_key = \"keep-me\"\n").unwrap();
 
         let isolated = root.join("llmman");
-        write_grok_config(&isolated, "m", "http://127.0.0.1:17434/v1", &[]).unwrap();
+        let list = ModelList::of(vec![ModelEntry::unlisted("m")]);
+        write_grok_config(&isolated, &list, "http://127.0.0.1:17434/v1").unwrap();
 
         assert_eq!(
             std::fs::read_to_string(user_config).unwrap(),
@@ -279,15 +341,101 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
+    fn hosted(provider: &str, id: &str) -> ModelEntry {
+        ModelEntry::unlisted(&format!("llmman.provider/{provider}/{id}"))
+    }
+
+    fn list() -> ModelList {
+        let mut local = ModelEntry::unlisted("docker.io/ai/qwen3.5:0.8b");
+        local.id = "qwen3.5:0.8b".into();
+        local.context_window = Some(32_768);
+        local.thinking = Some(vec!["none".into(), "thinking".into()]);
+        let mut agent = hosted("alpha", "agent");
+        agent.context_window = Some(200_000);
+        agent.max_output = Some(8_000);
+        agent.thinking = Some(vec!["low".into(), "high".into()]);
+        let mut plain = hosted("beta", "agent");
+        plain.thinking = Some(Vec::new());
+        ModelList::of(vec![local, agent, plain])
+    }
+
+    /// Every row is a model Grok can be switched to by the reference the
+    /// daemon routes, the starting one first and keyed like the one
+    /// `--model` and `GROK_DEFAULT_MODEL` name.
     #[test]
-    fn grok_config_lists_the_variants_levels() {
-        let text = grok_config_document("m", "http://h/v1", &["none", "high"]);
+    fn grok_config_has_a_model_per_row_keyed_by_its_reference() {
+        let text = grok_config_document(&list(), "http://h/v1");
         let parsed: toml::Value = text.parse().expect("valid TOML");
+        let models = parsed["model"].as_table().unwrap();
+        let keys: Vec<&str> = models.keys().map(String::as_str).collect();
         assert_eq!(
-            parsed["model"]["m"]["reasoning_efforts"],
-            toml::Value::Array(vec!["none".into(), "high".into()])
+            keys,
+            [
+                "docker.io/ai/qwen3.5:0.8b",
+                "llmman.provider/alpha/agent",
+                "llmman.provider/beta/agent"
+            ]
         );
-        let text = grok_config_document("m", "http://h/v1", &[]);
-        assert!(!text.contains("reasoning_efforts"), "{text}");
+        for (key, entry) in models {
+            assert_eq!(entry["model"].as_str(), Some(key.as_str()));
+            assert_eq!(entry["base_url"].as_str(), Some("http://h/v1"));
+            assert_eq!(entry["env_key"].as_str(), Some(GROK_API_KEY_ENV));
+            assert!(entry.get("api_key").is_none());
+        }
+        // Plain ids, with the provider only where two rows share one.
+        assert_eq!(
+            models["docker.io/ai/qwen3.5:0.8b"]["name"].as_str(),
+            Some("qwen3.5:0.8b")
+        );
+        assert_eq!(
+            models["llmman.provider/alpha/agent"]["name"].as_str(),
+            Some("alpha/agent")
+        );
+        assert_eq!(
+            models["llmman.provider/beta/agent"]["name"].as_str(),
+            Some("beta/agent")
+        );
+    }
+
+    #[test]
+    fn grok_config_carries_each_rows_window_output_and_variants() {
+        let text = grok_config_document(&list(), "http://h/v1");
+        let parsed: toml::Value = text.parse().expect("valid TOML");
+        let models = &parsed["model"];
+        let agent = &models["llmman.provider/alpha/agent"];
+        assert_eq!(agent["context_window"].as_integer(), Some(200_000));
+        assert_eq!(agent["max_completion_tokens"].as_integer(), Some(8_000));
+        assert_eq!(
+            agent["reasoning_efforts"],
+            toml::Value::Array(vec!["low".into(), "high".into()])
+        );
+        // `thinking` is Grok's `medium`; `none` is its own word for off.
+        let local = &models["docker.io/ai/qwen3.5:0.8b"];
+        assert_eq!(
+            local["reasoning_efforts"],
+            toml::Value::Array(vec!["none".into(), "medium".into()])
+        );
+        assert!(local.get("max_completion_tokens").is_none());
+        // A model that does not think lists no level, so `--effort` is ignored.
+        let plain = &models["llmman.provider/beta/agent"];
+        assert!(plain.get("reasoning_efforts").is_none());
+        assert!(plain.get("context_window").is_none());
+    }
+
+    #[test]
+    fn a_model_named_after_the_separator_is_added_when_the_list_lacks_it() {
+        let list = list();
+        assert_eq!(with_model(&list, "llmman.provider/alpha/agent"), list);
+        assert_eq!(with_model(&list, ""), list);
+        let more = with_model(&list, "gemma4:12b");
+        assert_eq!(more.entries().len(), 4);
+        assert_eq!(more.entries()[3].reference, "gemma4:12b");
+        assert_eq!(more.entries()[0], list.entries()[0]);
+    }
+
+    #[test]
+    fn grok_config_holds_no_credential() {
+        let text = grok_config_document(&list(), "http://h/v1");
+        assert!(!text.contains("api_key ="), "{text}");
     }
 }

@@ -2,7 +2,9 @@
 
 use std::path::PathBuf;
 
+use super::models::{ModelEntry, ModelList};
 use super::{common, exec_with_env, find_on_path, run_with_env, server};
+use crate::providers;
 
 /// openclaw's own onboarding independently re-verifies/pulls whatever
 /// `--custom-model-id` names against its configured endpoint, and
@@ -43,62 +45,88 @@ fn base_url(url: &str) -> &str {
     url.strip_suffix("/v1").unwrap_or(url)
 }
 
-/// openclaw budgets against `contextTokens` when it is set. A provider at
-/// another server, from an earlier onboarding, is left alone.
-fn with_context_window(
-    config: &serde_json::Value,
-    server: &str,
-    model: &str,
-    window: u64,
-) -> serde_json::Value {
-    let mut config = config.clone();
-    let Some(provider) = config.pointer_mut("/models/providers/ollama") else {
-        return config;
-    };
-    if provider["baseUrl"].as_str().map(base_url) != Some(base_url(server)) {
-        return config;
-    }
-    let model = crate::storage::default_tag(model);
-    // `provider["models"]` would insert a null when the key is missing.
-    let entries = provider.get_mut("models").and_then(|m| m.as_array_mut());
-    for entry in entries.into_iter().flatten() {
-        let id = entry["id"].as_str().map(crate::storage::default_tag);
-        if id.as_deref() == Some(model.as_str()) {
-            entry["contextWindow"] = window.into();
-            entry["contextTokens"] = window.into();
-        }
-    }
-    config
+/// The provider onboarding writes, and the one openclaw signs in to without
+/// a credential of its own (a provider of another name is refused as
+/// unauthenticated). Every launch points it at the daemon.
+const OPENCLAW_PROVIDER: &str = "ollama";
+
+/// What openclaw is told a model costs, in US dollars per million tokens as
+/// the catalog has it: nothing for a stored model, and for one whose price
+/// the catalog does not publish.
+fn openclaw_cost(cost: Option<crate::daemon::ModelCost>) -> serde_json::Value {
+    let cost = cost.unwrap_or(crate::daemon::ModelCost {
+        input: 0.0,
+        output: 0.0,
+        cache_read: None,
+        cache_write: None,
+        reasoning: None,
+    });
+    serde_json::json!({
+        "input": cost.input,
+        "output": cost.output,
+        "cacheRead": cost.cache_read.unwrap_or(0.0),
+        "cacheWrite": cost.cache_write.unwrap_or(0.0),
+    })
 }
 
-/// The id the `ollama` provider at `server` lists `model` under.
-fn listed_id(config: &serde_json::Value, server: &str, model: &str) -> Option<String> {
-    let provider = config.pointer("/models/providers/ollama")?;
-    if provider["baseUrl"].as_str().map(base_url) != Some(base_url(server)) {
-        return None;
+/// One row as an openclaw model: the routed name as its id, the plain label as its name, and only
+/// what is known (an absent key is left to openclaw). The window is both what it holds and
+/// `contextTokens`, which openclaw otherwise caps at 32k for a local model.
+fn openclaw_model(entry: &ModelEntry) -> serde_json::Value {
+    let mut model = serde_json::json!({
+        "id": entry.reference,
+        "name": entry.label(),
+        "input": if entry.vision { vec!["text", "image"] } else { vec!["text"] },
+        "cost": openclaw_cost(entry.cost),
+    });
+    if let Some(window) = entry.context_window {
+        model["contextWindow"] = window.into();
+        model["contextTokens"] = window.into();
     }
-    let wanted = crate::storage::default_tag(model);
-    provider["models"]
-        .as_array()?
-        .iter()
-        .filter_map(|entry| entry["id"].as_str())
-        .find(|id| crate::storage::default_tag(id) == wanted)
-        .map(str::to_owned)
+    if let Some(output) = entry.max_output {
+        model["maxTokens"] = output.into();
+    }
+    if let Some(thinking) = &entry.thinking {
+        model["reasoning"] = (!thinking.is_empty()).into();
+    }
+    if let Some(tools) = entry.tools {
+        model["compat"] = serde_json::json!({ "supportsTools": tools });
+    }
+    model
 }
 
-/// `agents.defaults.model.primary` is the model openclaw uses, and onboarding
-/// sets it once. Without this, a later `--model` is ignored and `llmman serve`
-/// loads whatever the first launch named. Only a model the provider lists.
-fn with_primary_model(config: &serde_json::Value, server: &str, model: &str) -> serde_json::Value {
+/// `config` with the `ollama` provider holding every model of the list at `server` and the first
+/// one as primary, on every launch rather than only the onboarding one, so `/model` offers the
+/// rest. The rest of the config is kept.
+fn with_models(config: &serde_json::Value, server: &str, models: &ModelList) -> serde_json::Value {
     use serde_json::{json, Map, Value};
     fn child<'a>(map: &'a mut Map<String, Value>, key: &str) -> Option<&'a mut Map<String, Value>> {
         map.entry(key).or_insert_with(|| json!({})).as_object_mut()
     }
     let mut config = config.clone();
-    let Some(id) = listed_id(&config, server, model) else {
+    let Some(start) = models.start() else {
         return config;
     };
-    let primary = format!("ollama/{id}");
+    let rows: Vec<Value> = models.entries().iter().map(openclaw_model).collect();
+    let providers = config
+        .as_object_mut()
+        .and_then(|c| child(c, "models"))
+        .and_then(|m| child(m, "providers"));
+    if let Some(providers) = providers {
+        let provider = providers
+            .entry(OPENCLAW_PROVIDER)
+            .or_insert_with(|| json!({}));
+        if let Some(provider) = provider.as_object_mut() {
+            // What every integration holds for a model llmman serves. The
+            // `ollama-local` marker onboarding writes would be taken for
+            // a provider's key and forwarded to it.
+            provider.insert("apiKey".into(), providers::PLACEHOLDER_API_KEY.into());
+            provider.insert("baseUrl".into(), base_url(server).into());
+            provider.insert("api".into(), "ollama".into());
+            provider.insert("models".into(), rows.into());
+        }
+    }
+    let primary = format!("{OPENCLAW_PROVIDER}/{}", start.reference);
     let defaults = config
         .as_object_mut()
         .and_then(|c| child(c, "agents"))
@@ -118,70 +146,69 @@ fn with_primary_model(config: &serde_json::Value, server: &str, model: &str) -> 
     config
 }
 
-/// The model `config` uses, if it names one other than `wanted`.
-fn other_primary_model<'a>(config: &'a serde_json::Value, wanted: &str) -> Option<&'a str> {
+/// The model openclaw last ran: its primary model, without the provider
+/// prefix.
+pub(super) fn remembered_model() -> Option<String> {
+    let text = std::fs::read_to_string(onboarded_config()?).ok()?;
+    let config: serde_json::Value = serde_json::from_str(&text).ok()?;
     let model = config.pointer("/agents/defaults/model")?;
     let primary = model.as_str().or_else(|| model["primary"].as_str())?;
-    let id = primary.strip_prefix("ollama/").unwrap_or(primary);
-    (crate::storage::default_tag(id) != crate::storage::default_tag(wanted)).then_some(primary)
+    let provider_prefix = format!("{OPENCLAW_PROVIDER}/");
+    Some(
+        primary
+            .strip_prefix(provider_prefix.as_str())
+            .unwrap_or(primary)
+            .to_string(),
+    )
 }
 
 /// openclaw: runs its non-interactive onboarding (once) against our
-/// /v1 endpoint, declares `context_window` on the model it set up, then
-/// hands off to it directly. The real gateway/TUI/channel-setup
-/// lifecycle a full setup wizard also manages is left to openclaw's own
-/// defaults.
+/// /v1 endpoint, then on every launch writes a provider holding the whole
+/// model list with the starting model as its primary one, and hands off to
+/// it directly. The real gateway/TUI/channel-setup lifecycle a full setup
+/// wizard also manages is left to openclaw's own defaults.
 pub(super) fn launch_openclaw(
     model: &str,
-    context_window: Option<u64>,
+    models: &ModelList,
     extra_args: &[String],
 ) -> anyhow::Result<()> {
     let bin =
         find_on_path("openclaw").ok_or_else(|| anyhow::anyhow!("openclaw is not installed"))?;
 
     if onboarded_config().is_none() {
-        let effective_model = openclaw_model_id(model);
-        // Through run_with_env so a --sandbox onboards the copy it runs.
-        let onboard = [
+        // Onboarding verifies the model against the endpoint, which a
+        // provider-routed reference is not for it to pull: a stored one
+        // is, and with none it picks its own.
+        let stored = models.entries().iter().find(|e| e.provider.is_none());
+        let mut onboard = vec![
             "onboard",
             "--non-interactive",
             "--accept-risk",
             "--auth-choice",
             "ollama",
             "--custom-base-url",
-            &format!("{}/v1", server()),
-            "--custom-model-id",
-            effective_model,
-            "--skip-health",
-            "--skip-channels",
-            "--skip-skills",
         ]
-        .map(String::from);
+        .into_iter()
+        .map(String::from)
+        .collect::<Vec<_>>();
+        onboard.push(format!("{}/v1", server()));
+        if let Some(stored) = stored {
+            onboard.extend([
+                "--custom-model-id".into(),
+                openclaw_model_id(&stored.reference).into(),
+            ]);
+        }
+        onboard.extend(["--skip-health", "--skip-channels", "--skip-skills"].map(String::from));
+        // Through run_with_env so a --sandbox onboards the copy it runs.
         let code = run_with_env(&bin, &onboard, &[])?;
         anyhow::ensure!(code == 0, "openclaw onboarding failed");
     }
     if let (false, Some(config)) = (model.is_empty(), onboarded_config()) {
-        let (server, wanted) = (server(), openclaw_model_id(model));
-        let mut kept = None;
+        let server = server();
         if let Err(e) = common::write_json_merged(&config, "openclaw", |existing| {
-            if listed_id(existing, &server, wanted).is_none() {
-                kept = other_primary_model(existing, wanted).map(str::to_owned);
-            }
-            with_primary_model(existing, &server, wanted)
+            with_models(existing, &server, models)
         }) {
-            eprintln!("[llmman] openclaw: primary model not set: {e:#}");
-        }
-        if let Some(kept) = kept {
-            eprintln!("[llmman] openclaw: it has no {wanted} from this server, so it keeps {kept}");
-        }
-    }
-    if let (Some(window), Some(config)) = (context_window, onboarded_config()) {
-        let (server, model) = (server(), openclaw_model_id(model));
-        // openclaw starts with the window it already has.
-        if let Err(e) = common::write_json_merged(&config, "openclaw", |existing| {
-            with_context_window(existing, &server, model, window)
-        }) {
-            eprintln!("[llmman] openclaw: context window not declared: {e:#}");
+            eprintln!("[llmman] openclaw: models not set: {e:#}");
         }
     }
 
@@ -211,140 +238,118 @@ mod tests {
 
     const SERVER: &str = "http://127.0.0.1:17434";
 
-    fn onboarded(base_url: &str, models: serde_json::Value) -> serde_json::Value {
-        serde_json::json!({ "models": { "providers": { "ollama": {
-            "baseUrl": base_url, "api": "ollama", "models": models,
-        } } } })
-    }
-
+    /// A hosted row carries the catalog's prices; a stored one, and one with
+    /// no price published, none.
     #[test]
-    fn the_onboarded_model_entry_takes_the_served_window() {
-        let entry = |id: &str| serde_json::json!({ "id": id, "contextWindow": 128000 });
-        let mut config = onboarded(
-            SERVER,
-            serde_json::json!([entry("docker.io/ai/qwen3.5:0.8b"), entry("qwen3.5:0.8b")]),
-        );
-        config["agents"] = serde_json::json!({ "defaults": { "model": {
-            "primary": "ollama/qwen3.5:0.8b",
-        } } });
-        config["gateway"] = serde_json::json!({ "auth": { "token": "kept" } });
-
-        let mut expected = config.clone();
-        expected["models"]["providers"]["ollama"]["models"][1] = serde_json::json!({
-            "id": "qwen3.5:0.8b", "contextWindow": 32768, "contextTokens": 32768,
-        });
+    fn a_hosted_row_carries_the_catalogs_prices_and_others_none() {
+        let priced = ModelEntry {
+            cost: Some(crate::daemon::ModelCost {
+                input: 3.0,
+                output: 15.0,
+                cache_read: Some(0.3),
+                cache_write: None,
+                reasoning: None,
+            }),
+            ..ModelEntry::unlisted("llmman.provider/alpha/agent")
+        };
         assert_eq!(
-            with_context_window(&config, SERVER, "qwen3.5:0.8b", 32768),
-            expected
+            openclaw_model(&priced)["cost"],
+            serde_json::json!({ "input": 3.0, "output": 15.0, "cacheRead": 0.3, "cacheWrite": 0.0 })
+        );
+        assert_eq!(
+            openclaw_model(&ModelEntry::unlisted("qwen3.5:0.8b"))["cost"],
+            serde_json::json!({ "input": 0.0, "output": 0.0, "cacheRead": 0.0, "cacheWrite": 0.0 })
         );
     }
 
+    fn row(reference: &str, window: Option<u64>) -> ModelEntry {
+        ModelEntry {
+            context_window: window,
+            vision: reference.contains("vision"),
+            thinking: Some(vec!["none".into(), "high".into()]),
+            tools: Some(true),
+            ..ModelEntry::unlisted(reference)
+        }
+    }
+
+    fn list() -> ModelList {
+        ModelList::of(vec![
+            row("llmman.provider/anthropic/claude-x", Some(200_000)),
+            row("qwen3.5:0.8b", Some(32768)),
+            row("docker.io/ai/vision-model", None),
+        ])
+    }
+
     #[test]
-    fn a_listed_model_becomes_the_primary_one() {
-        let entry = |id: &str| serde_json::json!({ "id": id, "contextWindow": 128000 });
-        let mut config = onboarded(
-            SERVER,
-            serde_json::json!([entry("qwen3.8:27b-nvfp4"), entry("qwen3.8:27b")]),
-        );
-        config["agents"] = serde_json::json!({ "defaults": {
-            "workspace": "/w", "model": { "primary": "ollama/qwen3.8:27b-nvfp4" },
-        } });
-        let updated = with_primary_model(&config, SERVER, "qwen3.8:27b");
+    fn the_provider_holds_every_model_and_the_first_is_primary() {
+        let onboarded = serde_json::json!({
+            "gateway": { "auth": { "token": "kept" } },
+            "models": { "providers": { "ollama": { "baseUrl": "http://elsewhere:11434", "apiKey": "ollama-local" } } },
+            "agents": { "defaults": { "workspace": "/w", "model": { "primary": "ollama/old" } } },
+        });
+        let updated = with_models(&onboarded, &format!("{SERVER}/v1"), &list());
+        let provider = &updated["models"]["providers"]["ollama"];
+        assert_eq!(provider["baseUrl"], SERVER);
+        assert_eq!(provider["api"], "ollama");
+        let rows = provider["models"].as_array().unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0]["id"], "llmman.provider/anthropic/claude-x");
+        assert_eq!(rows[0]["name"], "anthropic/claude-x");
+        assert_eq!(rows[0]["contextWindow"], 200_000);
+        assert_eq!(rows[0]["contextTokens"], 200_000);
+        assert_eq!(rows[1]["name"], "qwen3.5:0.8b");
+        assert_eq!(rows[2]["input"], serde_json::json!(["text", "image"]));
+        assert!(rows[2].get("contextWindow").is_none());
+        assert_eq!(rows[0]["compat"]["supportsTools"], true);
         assert_eq!(
             updated["agents"]["defaults"]["model"]["primary"],
-            "ollama/qwen3.8:27b"
+            "ollama/llmman.provider/anthropic/claude-x"
         );
+        // Everything else stays, the provider's own credential included.
         assert_eq!(updated["agents"]["defaults"]["workspace"], "/w");
-        // The id is the listed one, whichever spelling was asked for.
-        let mut listed = onboarded(SERVER, serde_json::json!([entry("hf.co/a/b:latest")]));
-        listed["agents"] = config["agents"].clone();
-        assert_eq!(
-            with_primary_model(&listed, &format!("{SERVER}/v1"), "hf.co/a/b")["agents"]["defaults"]
-                ["model"]["primary"],
-            "ollama/hf.co/a/b:latest"
+        assert_eq!(updated["gateway"]["auth"]["token"], "kept");
+        assert_eq!(provider["apiKey"], "llmman");
+        // A second launch on another model replaces the list and the primary.
+        let again = with_models(
+            &updated,
+            SERVER,
+            &ModelList::of(vec![row("qwen3.5:0.8b", Some(32768))]),
         );
-        // The older, plain-string spelling of the model.
-        listed["agents"]["defaults"]["model"] = "ollama/other".into();
         assert_eq!(
-            with_primary_model(&listed, SERVER, "hf.co/a/b")["agents"]["defaults"]["model"],
-            "ollama/hf.co/a/b:latest"
+            again["models"]["providers"]["ollama"]["models"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
         );
-        // No `agents` section yet.
-        let bare = onboarded(SERVER, serde_json::json!([entry("hf.co/a/b:latest")]));
         assert_eq!(
-            with_primary_model(&bare, SERVER, "hf.co/a/b")["agents"]["defaults"]["model"]
-                ["primary"],
-            "ollama/hf.co/a/b:latest"
+            again["agents"]["defaults"]["model"]["primary"],
+            "ollama/qwen3.5:0.8b"
         );
     }
 
     #[test]
-    fn an_unlisted_model_or_another_server_leaves_the_primary_model_alone() {
-        let entry = serde_json::json!({ "id": "qwen3.8:27b", "contextWindow": 128000 });
-        let mut config = onboarded(SERVER, serde_json::json!([entry]));
-        config["agents"] = serde_json::json!({ "defaults": { "model": {
-            "primary": "ollama/qwen3.8:27b",
-        } } });
-        assert_eq!(with_primary_model(&config, SERVER, "gemma4"), config);
-        // A different primary, so the server check is what keeps it.
-        let mut elsewhere = config.clone();
-        elsewhere["agents"]["defaults"]["model"]["primary"] = "ollama/gemma4".into();
+    fn the_older_spelling_of_the_model_and_a_bare_config_are_handled() {
+        let mut older = serde_json::json!({ "agents": { "defaults": { "model": "ollama/old" } } });
+        older = with_models(&older, SERVER, &list());
         assert_eq!(
-            with_primary_model(&elsewhere, "http://127.0.0.1:11434", "qwen3.8:27b"),
-            elsewhere
+            older["agents"]["defaults"]["model"],
+            "ollama/llmman.provider/anthropic/claude-x"
         );
+        let bare = with_models(&serde_json::json!({}), SERVER, &list());
         assert_eq!(
-            with_primary_model(&serde_json::json!({}), SERVER, "x"),
-            serde_json::json!({})
+            bare["agents"]["defaults"]["model"]["primary"],
+            "ollama/llmman.provider/anthropic/claude-x"
         );
-        assert_eq!(
-            other_primary_model(&config, "gemma4"),
-            Some("ollama/qwen3.8:27b")
-        );
-        assert_eq!(other_primary_model(&config, "qwen3.8:27b"), None);
-        // `:latest` is the default tag.
-        let mut tagged = config.clone();
-        tagged["agents"]["defaults"]["model"]["primary"] = "ollama/hf.co/a/b:latest".into();
-        assert_eq!(other_primary_model(&tagged, "hf.co/a/b"), None);
+        // A launch with no model changes nothing.
+        let config = serde_json::json!({ "a": 1 });
+        assert_eq!(with_models(&config, SERVER, &ModelList::default()), config);
     }
 
     #[test]
-    fn an_untagged_model_finds_its_latest_entry() {
-        let id = "hf.co/HuggingFaceTB/SmolLM2-135M-Instruct";
-        let models = serde_json::json!([{ "id": format!("{id}:latest"), "contextWindow": 128000 }]);
-        for (stored, server) in [
-            (SERVER.to_string(), SERVER.to_string()),
-            (format!("{SERVER}/"), format!("{SERVER}/v1")),
-            (format!("{SERVER}/v1/"), SERVER.to_string()),
-        ] {
-            let updated =
-                with_context_window(&onboarded(&stored, models.clone()), &server, id, 8192);
-            let entry = &updated["models"]["providers"]["ollama"]["models"][0];
-            assert_eq!(entry["contextWindow"], 8192, "{stored} {server}");
-            assert_eq!(entry["contextTokens"], 8192, "{stored} {server}");
-        }
-    }
-
-    #[test]
-    fn nothing_changes_without_this_servers_onboarded_entry() {
-        let qwen = serde_json::json!([{ "id": "qwen3.5:0.8b", "contextWindow": 128000 }]);
-        let configs = [
-            serde_json::json!({}),
-            serde_json::json!({ "models": { "providers": { "other": { "models": [] } } } }),
-            onboarded(
-                SERVER,
-                serde_json::json!([{ "id": "gemma4", "contextWindow": 128000 }]),
-            ),
-            onboarded("http://127.0.0.1:11434", qwen.clone()),
-            serde_json::json!({ "models": { "providers": { "ollama": { "models": qwen } } } }),
-            serde_json::json!({ "models": { "providers": { "ollama": { "baseUrl": SERVER } } } }),
-        ];
-        for config in configs {
-            assert_eq!(
-                with_context_window(&config, SERVER, "qwen3.5:0.8b", 32768),
-                config,
-                "{config}"
-            );
-        }
+    fn the_config_holds_no_credential_of_a_provider() {
+        let text =
+            serde_json::to_string(&with_models(&serde_json::json!({}), SERVER, &list())).unwrap();
+        assert!(!text.contains("session") && !text.contains("sk-"));
     }
 }

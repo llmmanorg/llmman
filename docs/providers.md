@@ -16,6 +16,63 @@ Requests still go through `llmman serve`; `--provider` changes where the
 daemon forwards them, not who the client talks to, so local and hosted
 models share one endpoint and one integration config.
 
+## Every model inside the agent
+
+`llmman launch` gives the agent every pulled model and every chat model of
+every provider (embedding, speech, transcription and image models are left
+out), each with its variants, window and image input where known. The flags
+choose the starting model only:
+
+| Flags | The agent starts on |
+|-------|---------------------|
+| `--provider P --model M` | `M` of `P`; `P`'s models are listed first |
+| `--provider P` | `P`'s default: the most recently released tool-calling chat model whose input price is at or below the median of P's tool-calling chat models (no price stays eligible, no release date counts as oldest, a tie goes to the greater id; a provider with no dates and no prices, such as one from `llmman.conf`, gets the first one it lists). One stderr line says which |
+| `--model M` | the pulled model `M` (pulled and preloaded if needed) |
+| neither | the model the agent last ran, else the pulled model that is loaded now, else the one pulled most recently, else the default of a provider you hold a key for (said on stderr, with the rule that picked it); with nothing usable it stops and says how to fix that |
+
+`--variant` is checked against the starting model in every case.
+
+Two agents take one model and ignore the list: GitHub Copilot CLI and
+Gemini CLI (its `/model` does not change the model). And only claude, codex,
+opencode, hermes and openclaw keep a model llmman can read, so only for them
+does "the model the agent last ran" apply to a launch with neither flag; the
+others go straight to the pulled model or provider. A bare `llmman launch kimi`
+keeps Kimi Code's own model and gives it the list beside it in its
+`config.toml`. With `--sandbox openshell`, which shares no file with the
+agent, goose, vibe, kimi and aider get their one starting model with no list
+file, claude and opencode get it without the picker, and Gemini CLI is
+refused.
+
+Rows an earlier launch wrote into a shared configuration (Droid, Pi, OMP) and
+that are no longer offered are taken out again; rows you added stay. A Droid
+entry's place is part of its id, so an old llmman entry that stands before one
+of yours stays. With `OPENCODE_CONFIG` set, opencode gets your file and the
+list as one config written for the launch (yours is never changed).
+
+The list is thousands of rows, so it travels in a file in the agent's own
+state directory (mode 0600, no secret in it, removed when the agent exits),
+never in an environment variable or an argument. An agent with a real limit
+gets the front of the list (start, its provider, pulled models, providers
+with a key) and one line saying what was left out.
+
+**Keys.** An agent that can switch provider cannot hold one provider's key:
+the daemon would send it to whichever provider the next request names. So
+`llmman launch` registers the keys this shell holds with the daemon, each
+under its own provider (`POST /llmman/sessions`, in the daemon's memory
+only, dropped when the agent exits or after 12 idle hours) and hands the
+agent a session token instead. A request is served with the key registered
+for the provider it names and no other; a provider with no key falls back
+to the daemon's own, or fails with a message naming the variable to set.
+The variable a key is read from is the one the launcher itself ties to the
+provider (`llmman.conf`, a built-in endpoint, or the cached provider catalog),
+never one the daemon names, and for a loopback daemon no more than a remote
+one. The daemon keeps at most 64 sessions and never evicts one used within
+the last hour: with 64 in use a new launch is refused with a message saying
+so. Against a daemon on another machine (TLS) only the starting provider's key
+is registered. A daemon that requires an API key, and the integrations
+configured through a file (`hermes`, `cline`, `pi`, `openclaw`),
+cannot carry a token: they use the daemon's own keys.
+
 The daemon also records each reply's tokens, priced at the catalog's
 rates (cache, reasoning and long-context included); `llmman usage` sums them. See
 `LLMMAN_NOUSAGE` in [configuration.md](configuration.md).
@@ -548,27 +605,28 @@ installed:
 | `claude` | Claude Code | yes |
 | `opencode` | OpenCode | yes |
 | `codex` | OpenAI Codex CLI | yes (below) |
-| `pi` | Pi coding agent | yes |
+| `pi` | Pi coding agent | yes, but the daemon holds the key (below) |
 | `aider` | Aider | yes |
 | `qwen` | Qwen Code | yes |
 | `dsh` | DeepSeek Harness | yes |
 | `goose` | Block goose | yes |
-| `goose-desktop` | Block goose Desktop (requires `--model`, or `OPENAI_TRANSCRIPTION_MODEL` for dictation only) | yes |
-| `grok` | Grok Build (requires `--model`) | no: its fetched model catalog cannot represent llmman's hosted-provider routing reference |
-| `docker-agent` | Docker Agent (requires `--model`) | yes |
+| `goose-desktop` | Block goose Desktop (`OPENAI_TRANSCRIPTION_MODEL` alone starts it for dictation only) | yes |
+| `grok` | Grok Build (offered the first 300 models: it sends its list with every request) | yes |
+| `docker-agent` | Docker Agent | yes |
 | `vibe` | Mistral Vibe CLI | yes |
 | `hermes` | Hermes Agent | yes, but the daemon holds the key (below) |
-| `agy` | Antigravity CLI (requires `--model`) | yes |
-| `gemini` | Gemini CLI | no: llmman cannot confirm the key would come here rather than go to Google |
-| `cline` | Cline (requires `--model`) | yes |
-| `kimi` | Kimi Code CLI | no: llmman has not verified it with a provider-routed model |
-| `copilot` | GitHub Copilot CLI (`gh`) | no: it has no way to send a key |
-| `openclaw` | OpenClaw | no: it only takes a model during first-run onboarding |
+| `agy` | Antigravity CLI | yes |
+| `gemini` | Gemini CLI (one model: `/model` does not change it) | yes: its model calls go to `llmman serve`, and it holds a session token or the daemon's own key, never a provider key |
+| `cline` | Cline | yes |
+| `kimi` | Kimi Code CLI (the end-of-life Python kimi-cli takes pulled models only) | yes |
+| `copilot` | GitHub Copilot CLI (`copilot`, BYOK; one model: its list is ignored) | yes: it holds a session token, never a provider key |
+| `openclaw` | OpenClaw | yes, but the daemon holds the key (below) |
+| `omp` | OMP coding agent (pulled models only) | no: it stops at startup on a model id that names two vendors, such as `llmman.provider/amazon-bedrock/openai.gpt-5.4` |
 
 Any extra arguments after `--` are forwarded to the integration's own CLI.
 
-`hermes` is configured through a file on disk, so it can't carry a key
-per request; `llmman serve` needs one of its own, spent only for a
+`hermes`, `cline`, `pi` and `openclaw` are configured through a file
+on disk, so they can't carry a key per request; `llmman serve` needs one of its own, spent only for a
 loopback daemon and never for a cross-site browser request. On a shared
 machine prefer an integration that sends its own key.
 
@@ -669,8 +727,9 @@ with a 501.
 `reasoning_effort` takes the form the model accepts, by the version in
 a Claude's name. From Claude 4.6 (Sonnet 5, Opus 4.7, an unversioned
 preview) it is adaptive thinking with the level as `output_config.effort`
-(`minimal` as `low`); `none` turns thinking off, or on Fable and Mythos,
-which always think, is `low`. Through Claude 4.5, and on another
+(`minimal` as `low`); `none` turns thinking off (`disabled`, or
+`between_tools` on Sonnet 5 and later, which refuse `disabled`), or on
+Fable and Mythos, which always think, is `low`. Through Claude 4.5, and on another
 vendor's Messages endpoint, it is a budget spent from `max_tokens`, left
 off for the continuation of a tool call or a forced tool, which want a
 signed thinking block no OpenAI client can hand back.

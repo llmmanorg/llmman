@@ -1,5 +1,6 @@
 //! `llmman launch copilot` (and the `copilot-cli` alias).
 
+use super::models::ModelList;
 use std::path::{Path, PathBuf};
 
 use super::{exec_with_env_removing, find_on_path, has_forwarded_model_flag, server};
@@ -15,6 +16,7 @@ const COPILOT_ENV_TO_CLEAR: &[&str] = &[
 pub(super) fn launch_copilot(
     model: &str,
     api_key: &str,
+    _models: &ModelList,
     extra_args: &[String],
 ) -> anyhow::Result<()> {
     let bin = find_copilot().ok_or_else(|| anyhow::anyhow!("copilot is not installed"))?;

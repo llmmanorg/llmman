@@ -1844,10 +1844,34 @@ pub struct ProviderModel {
     /// `limit.output`), `None` on the same terms as `context`.
     #[serde(default)]
     pub output: Option<u32>,
+    /// Whether it answers chat; `None` from a daemon that predates the
+    /// field, which a caller judges by the id (see [`Self::answers_chat`]).
+    #[serde(default)]
+    pub chat: Option<bool>,
+    /// Whether it takes images in.
+    #[serde(default)]
+    pub vision: bool,
+    /// models.dev's `tool_call`; `None` where it says nothing.
+    #[serde(default)]
+    pub tools: Option<bool>,
+    /// models.dev's `release_date`; `None` where it has none, and from a
+    /// daemon that predates the field.
+    #[serde(default)]
+    pub released: Option<String>,
+}
+
+impl ProviderModel {
+    /// Whether this model can be offered as a chat model. A daemon that
+    /// does not say is read by the id: embedding, speech, transcription,
+    /// image and video models, and rerankers, name themselves.
+    pub fn answers_chat(&self) -> bool {
+        self.chat
+            .unwrap_or_else(|| crate::providers::Caps::of_id(&self.id).chat)
+    }
 }
 
 /// US dollars per million tokens (see [`crate::providers::Cost`]).
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
 pub struct ModelCost {
     pub input: f64,
     pub output: f64,
@@ -1865,13 +1889,14 @@ impl ProviderDetail {
     /// each request (see `client_api_key` in cmd::serve). `None` need not
     /// be fatal — the daemon may hold it ([`ProviderDetail::key_set`]).
     ///
-    /// The daemon names the variable, so a process squatting the port
-    /// could name an unrelated secret — inside the trust boundary this
-    /// whole module sits in either way: that daemon is handed every
-    /// prompt, and every key, regardless. It does not name the
-    /// `llmman.conf` entry, which is keyed by the provider id.
+    /// The variable is the one this process itself ties to the provider
+    /// ([`crate::providers::own_key_env`]), never the one the daemon names:
+    /// a daemon on another machine, or a process squatting the port, could
+    /// otherwise name any secret in this environment and be sent it. The
+    /// `llmman.conf` entry is keyed by the provider id.
     pub fn api_key(&self) -> Option<String> {
-        crate::providers::key_for(&self.id, self.key_env.as_deref())
+        let own = crate::providers::own_key_env(&self.id).flatten();
+        crate::providers::key_for(&self.id, own.as_deref())
     }
 
     /// Just the ids, for a caller that only needs to name one (see
@@ -1953,6 +1978,104 @@ impl ProviderDetail {
     /// describes the host it dials rather than how that daemon is bound.
     pub fn daemon_key_usable(&self) -> bool {
         self.key_usable
+    }
+}
+
+/// One stored model in [`LaunchModels`]; see `LocalModelResponse` in
+/// `cmd::serve::ollama`.
+#[derive(Debug, Deserialize)]
+pub struct LocalModel {
+    pub name: String,
+    pub chat: bool,
+    #[serde(default)]
+    pub vision: bool,
+    #[serde(default)]
+    pub tools: bool,
+    /// The window a load would serve, else the trained one.
+    #[serde(default)]
+    pub context: Option<u64>,
+    /// The chat template's thinking choices; `None` without a template.
+    #[serde(default)]
+    pub thinking: Option<Vec<String>>,
+    /// Whether it is loaded now.
+    #[serde(default)]
+    pub loaded: bool,
+    /// When it was pulled, in seconds since the epoch.
+    #[serde(default)]
+    pub pulled: Option<u64>,
+}
+
+/// Wire shape of `GET /llmman/models`: every stored model and every
+/// provider with its models, in one answer.
+#[derive(Debug, Deserialize)]
+pub struct LaunchModels {
+    pub local: Vec<LocalModel>,
+    pub providers: Vec<ProviderDetail>,
+}
+
+/// Every model the daemon can serve, in one request that loads nothing.
+/// `Ok(None)` when the daemon predates the route, which only a restart fixes.
+pub fn launch_models() -> anyhow::Result<Option<LaunchModels>> {
+    let resp = client()?
+        .get(format!("{}/llmman/models", server()))
+        .send()
+        .context("request /llmman/models")?;
+    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    anyhow::ensure!(
+        resp.status().is_success(),
+        "/llmman/models: server returned {}: {}",
+        resp.status(),
+        api_error(&resp.text().unwrap_or_default()).unwrap_or_default()
+    );
+    Ok(Some(resp.json().context("parse /llmman/models")?))
+}
+
+/// Registers `keys` (provider id to key) with the daemon for one agent
+/// session and returns the token the agent sends in their place (see
+/// `cmd::serve::sessions`). Only over [`connects_securely`], which every
+/// caller has already checked.
+pub fn open_session(keys: &std::collections::BTreeMap<String, String>) -> anyhow::Result<String> {
+    #[derive(Deserialize)]
+    struct Opened {
+        token: String,
+    }
+    // No redirects: a 307/308 would replay the keys to wherever it points.
+    let resp = client_builder()?
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .context("build http client")?
+        .post(format!("{}/llmman/sessions", server()))
+        .json(&serde_json::json!({ "keys": keys }))
+        .send()
+        .context("request /llmman/sessions")?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().unwrap_or_default();
+        anyhow::bail!(
+            "{}",
+            api_error(&body).unwrap_or(format!(
+                "/llmman/sessions: server returned {status}; an older llmman serve has no \
+                 sessions, so stop it and launch again"
+            ))
+        );
+    }
+    Ok(resp
+        .json::<Opened>()
+        .context("parse /llmman/sessions")?
+        .token)
+}
+
+/// Closes a session [`open_session`] opened, best effort: the daemon
+/// forgets an idle one anyway.
+pub fn close_session(token: &str) {
+    if let Ok(client) = client() {
+        let _ = client
+            .delete(format!("{}/llmman/sessions", server()))
+            .bearer_auth(token)
+            .timeout(Duration::from_secs(2))
+            .send();
     }
 }
 

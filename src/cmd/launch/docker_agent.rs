@@ -7,25 +7,33 @@ use anyhow::Context;
 use crate::daemon;
 
 use super::common;
+use super::models::{self, ModelEntry, ModelList};
 use super::{before_terminator, exec_with_env, find_on_path, has_flag, server};
 
 /// The env var the generated `token_key` names, so no key reaches disk
 /// (same role as `qwen::QWEN_ENV_KEY` and `dsh::DSH_API_KEY_ENV`).
 const DOCKER_AGENT_API_KEY_ENV: &str = "LLMMAN_API_KEY";
 
-/// The generated model entry's name, which its `root` agent selects it by.
+/// The model name the refusal's example agent file gives its entry.
 const DOCKER_AGENT_MODEL_NAME: &str = "llmman";
 
-/// docker-agent: write an agent file whose single `openai`-provider model
-/// points at this daemon, then hand that file to `docker-agent run`.
+/// docker-agent: write an agent file whose `models:` holds every model of
+/// the list, each an `openai`-provider model pointing at this daemon, then
+/// hand that file to `docker-agent run`. `/model` inside docker-agent picks
+/// among them, and sends the entry's `model`, the reference, as written.
 ///
 /// An agent file, not docker-agent's own `~/.config/cagent/config.yaml`:
 /// a `models:` map there is ignored, and the entry cannot then be
 /// selected. Writing one llmman owns also leaves `~/.config/cagent`
 /// alone.
+///
+/// The file is thousands of entries and belongs to this launch alone, so it
+/// is one [`models::write_transient`] per process, removed when docker-agent
+/// exits: concurrent launches never read each other's.
 pub(super) fn launch_docker_agent(
-    model: &str,
+    _model: &str,
     api_key: &str,
+    models: &ModelList,
     extra_args: &[String],
 ) -> anyhow::Result<()> {
     // `run` has already rejected these arguments before starting the
@@ -33,8 +41,8 @@ pub(super) fn launch_docker_agent(
     check_docker_agent_args(extra_args)?;
     let bin = find_docker_agent().ok_or_else(docker_agent_missing)?;
 
-    let path = docker_agent_agent_file(&docker_agent_config_dir()?, model);
-    write_docker_agent_file(&path, model, &format!("{}/v1", server()))?;
+    let document = docker_agent_document(models, &format!("{}/v1", server()))?;
+    let path = models::write_transient(&docker_agent_config_dir()?, "agent", "yaml", &document)?;
 
     let args = docker_agent_args(&path, extra_args);
     exec_with_env(&bin, &args, &[(DOCKER_AGENT_API_KEY_ENV, api_key)])
@@ -103,60 +111,14 @@ pub(super) fn docker_agent_config_dir() -> anyhow::Result<PathBuf> {
     Ok(dir.join("launch").join("docker-agent"))
 }
 
-/// The agent file a launch of `model` writes. One name for every model
-/// would let a concurrent launch overwrite it between this write and
-/// docker-agent's read, running that launch's model instead; naming it
-/// after the model leaves concurrent launches writing the same document
-/// and the directory holding one file per model rather than per run.
-fn docker_agent_agent_file(dir: &Path, model: &str) -> PathBuf {
-    dir.join(format!("agent-{}.yaml", docker_agent_file_stem(model)))
-}
-
-/// How much of the model a file name spells out. The rest of the name
-/// is `agent-`, the digest and `.yaml`, so the whole stays well inside
-/// the 255 a file name gets and leaves room under Windows' path limit.
-const DOCKER_AGENT_NAME_MAX: usize = 80;
-
-/// `model` as one bounded file name: everything a path separator or a
-/// Windows file name cannot carry — `/`, `:` — becomes `-`, the result
-/// is cut to [`DOCKER_AGENT_NAME_MAX`], and a digest of the whole id
-/// follows it.
+/// The agent file docker-agent reads: a `models:` map with a key per row,
+/// and an `agents.root` naming the first row's key, the one the launch starts
+/// on. `provider: openai` picks the API client, not the destination —
+/// `base_url` is what aims it here.
 ///
-/// The digest is what keeps one file per model. Without it two ids that
-/// sanitize alike (`a/b-c:d` and `a/b:c-d`) or that differ past the cut
-/// would share a file, and launched at the same moment each agent could
-/// read the other's model — the collision this name exists to prevent.
-/// A provider id is not a model reference and is never checked for
-/// length, so the cut is what keeps a long one from failing the write.
-fn docker_agent_file_stem(model: &str) -> String {
-    use sha2::Digest as _;
-    let safe: String = model
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
-                c
-            } else {
-                '-'
-            }
-        })
-        .take(DOCKER_AGENT_NAME_MAX)
-        .collect();
-    let digest = hex::encode(sha2::Sha256::digest(model.as_bytes()));
-    format!("{safe}-{}", &digest[..8])
-}
-
-fn write_docker_agent_file(path: &Path, model: &str, base_url: &str) -> anyhow::Result<()> {
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
-    }
-    let contents = docker_agent_document(model, base_url);
-    crate::fsutil::write_atomic(path, contents.as_bytes())
-        .with_context(|| format!("write {}", path.display()))
-}
-
-/// The agent file docker-agent reads: a `models:` map, and an
-/// `agents.root` naming one entry. `provider: openai` picks the API
-/// client, not the destination — `base_url` is what aims it here.
+/// A key is the row's plain id, told apart where two rows share one, and
+/// what `/model` shows. YAML would keep only the last of two equal keys, so
+/// they are made unique first.
 ///
 /// `root` gets the `shell` and `filesystem` toolsets — the two
 /// docker-agent's own guidance calls the ones most agents need. It asks
@@ -168,19 +130,67 @@ fn write_docker_agent_file(path: &Path, model: &str, base_url: &str) -> anyhow::
 /// daemon merges them (`consolidate_chat_system_messages`), so the
 /// agent that reaches the model carries one leading system message
 /// whatever the template accepts.
-fn docker_agent_document(model: &str, base_url: &str) -> String {
-    let quoted_model = common::yaml_quote(model);
-    let quoted_base_url = common::yaml_quote(base_url);
-    format!(
+fn docker_agent_document(models: &ModelList, base_url: &str) -> anyhow::Result<String> {
+    let name = models.display_namer();
+    let keys = models.unique_keys(&name);
+    let start = keys
+        .first()
+        .context("docker-agent needs a model to start on")?;
+    let declares_images = models.entries().iter().any(|entry| entry.vision);
+    let version = if declares_images {
+        DOCKER_AGENT_CAPABILITIES_VERSION
+    } else {
+        DOCKER_AGENT_BASE_VERSION
+    };
+    let entries: String = models
+        .entries()
+        .iter()
+        .zip(&keys)
+        .map(|(entry, key)| docker_agent_model(key, entry, base_url, declares_images))
+        .collect();
+    let quoted_start = common::yaml_quote(start);
+    Ok(format!(
         "# Written by `llmman launch docker-agent`; edits are overwritten.\n\
-         version: \"2\"\n\
-         models:\n  {DOCKER_AGENT_MODEL_NAME}:\n    provider: openai\n    model: {quoted_model}\n    \
-         base_url: {quoted_base_url}\n    token_key: {DOCKER_AGENT_API_KEY_ENV}\n\
-         agents:\n  root:\n    model: {DOCKER_AGENT_MODEL_NAME}\n    \
+         version: \"{version}\"\n\
+         models:\n{entries}\
+         agents:\n  root:\n    model: {quoted_start}\n    \
          description: The agent `llmman launch docker-agent` runs.\n    \
          instruction: You are a helpful AI assistant with access to the shell and \
          the filesystem.\n    \
          toolsets:\n      - type: shell\n      - type: filesystem\n"
+    ))
+}
+
+/// The config version for a list where no model takes images. Docker
+/// Desktop's docker-agent 1.50.0 stops at 8, so this is the one it reads.
+const DOCKER_AGENT_BASE_VERSION: &str = "2";
+
+/// The config version that takes `capabilities`, which lets an `openai` model with a `base_url`
+/// accept images. Used only when a model takes images: docker-agent 1.142.0 reads it, but 1.50.0
+/// (Docker Desktop's build) stops at schema 8 and refuses the file. `context_window` needs 16,
+/// which 1.142.0 rejects, so `max_tokens` is left out: without a window it cannot be kept clear of
+/// the prompt.
+const DOCKER_AGENT_CAPABILITIES_VERSION: &str = "11";
+
+/// One `models:` entry, on one line. `capabilities` is written only when the
+/// document is the version that takes it.
+fn docker_agent_model(
+    key: &str,
+    entry: &ModelEntry,
+    base_url: &str,
+    declares_images: bool,
+) -> String {
+    let capabilities = if declares_images {
+        format!(", capabilities: {{ image: {} }}", entry.vision)
+    } else {
+        String::new()
+    };
+    format!(
+        "  {}: {{ provider: openai, model: {}, base_url: {}, token_key: {DOCKER_AGENT_API_KEY_ENV}\
+         {capabilities} }}\n",
+        common::yaml_quote(key),
+        common::yaml_quote(&entry.reference),
+        common::yaml_quote(base_url),
     )
 }
 
@@ -264,24 +274,134 @@ mod tests {
         );
     }
 
+    fn hosted(provider: &str, id: &str) -> ModelEntry {
+        ModelEntry::unlisted(&crate::providers::format_remote_ref(provider, id))
+    }
+
+    fn document_of(entries: Vec<ModelEntry>) -> (String, serde_json::Value) {
+        let document =
+            docker_agent_document(&ModelList::of(entries), "http://127.0.0.1:17434/v1").unwrap();
+        let parsed = yaml_serde::from_str(&document).expect("valid YAML");
+        (document, parsed)
+    }
+
     /// `base_url` is what makes an `openai`-provider model reach this
     /// daemon instead of api.openai.com.
     #[test]
     fn docker_agent_document_routes_an_openai_provider_model_at_the_daemon() {
-        let document = docker_agent_document("m", "http://127.0.0.1:17434/v1");
-        assert!(document.contains("provider: openai"), "{document}");
-        assert!(document.contains("model: \"m\""), "{document}");
+        let (document, doc) = document_of(vec![hosted("alpha", "m")]);
+        let entry = &doc["models"]["m"];
+        assert_eq!(entry["provider"], "openai", "{document}");
+        assert_eq!(entry["model"], "llmman.provider/alpha/m", "{document}");
+        assert_eq!(entry["base_url"], "http://127.0.0.1:17434/v1", "{document}");
+        // The agent selects the entry by the key the model map gives it.
+        assert_eq!(doc["agents"]["root"]["model"], "m", "{document}");
+    }
+
+    /// Every row is a model docker-agent can switch to, the starting one
+    /// first and the one `root` runs; `/model` sends each one's reference.
+    #[test]
+    fn docker_agent_document_holds_every_model_with_the_start_selected() {
+        let entries = vec![
+            ModelEntry::unlisted("docker.io/ai/qwen3.5:0.8b"),
+            hosted("alpha", "a"),
+            hosted("beta", "b"),
+        ];
+        let (document, doc) = document_of(entries.clone());
+        let models = doc["models"].as_object().unwrap();
+        assert_eq!(models.len(), 3);
+        for (entry, key) in entries.iter().zip(["qwen3.5:0.8b", "a", "b"]) {
+            assert_eq!(models[key]["model"], entry.reference.as_str(), "{key}");
+        }
+        // Written in list order, whatever order the parser keeps them in.
+        let at = |key: &str| document.find(&format!("\"{key}\":")).unwrap();
         assert!(
-            document.contains("base_url: \"http://127.0.0.1:17434/v1\""),
+            at("qwen3.5:0.8b") < at("a") && at("a") < at("b"),
             "{document}"
         );
-        // The agent selects the entry by the name the model map gives it.
-        assert!(
-            document.contains(&format!("  {DOCKER_AGENT_MODEL_NAME}:")),
+        assert_eq!(doc["agents"]["root"]["model"], "qwen3.5:0.8b");
+    }
+
+    /// Two providers can offer one id; YAML keeps the last of two equal
+    /// keys, so each row must still be there, and tell its provider.
+    #[test]
+    fn docker_agent_document_keeps_models_of_the_same_id_from_different_providers() {
+        let entries = vec![
+            hosted("alpha", "gpt"),
+            hosted("beta", "gpt"),
+            hosted("gamma", "gpt"),
+            ModelEntry::unlisted("gpt"),
+        ];
+        let (document, doc) = document_of(entries.clone());
+        let models = doc["models"].as_object().unwrap();
+        assert_eq!(models.len(), entries.len(), "{document}");
+        for entry in &entries {
+            let found = models
+                .values()
+                .filter(|m| m["model"] == entry.reference.as_str())
+                .count();
+            assert_eq!(found, 1, "{}: {document}", entry.reference);
+        }
+        // The same id of a provider and of a stored model: told apart too.
+        assert!(models.contains_key("alpha/gpt"), "{document}");
+        assert!(models.contains_key("beta/gpt"), "{document}");
+        assert!(models.contains_key("gpt"), "{document}");
+        assert_eq!(doc["agents"]["root"]["model"], "alpha/gpt");
+    }
+
+    /// An id that two rows of one provider share (a list can repeat) is
+    /// still one key per row.
+    #[test]
+    fn docker_agent_document_numbers_equal_keys() {
+        let entries = vec![hosted("alpha", "m"), hosted("alpha", "m")];
+        let (_, doc) = document_of(entries);
+        let models = doc["models"].as_object().unwrap();
+        assert_eq!(models.len(), 2);
+    }
+
+    /// What a row says of images reaches docker-agent, which drops the
+    /// attachments of a model it is not told takes them.
+    #[test]
+    fn docker_agent_document_declares_images_for_a_vision_model_only() {
+        let seeing = ModelEntry {
+            vision: true,
+            ..hosted("alpha", "eyes")
+        };
+        let (document, doc) = document_of(vec![seeing, hosted("alpha", "blind")]);
+        assert_eq!(
+            doc["models"]["eyes"]["capabilities"]["image"], true,
             "{document}"
         );
-        assert!(
-            document.contains(&format!("model: {DOCKER_AGENT_MODEL_NAME}\n")),
+        assert_eq!(
+            doc["models"]["blind"]["capabilities"]["image"], false,
+            "{document}"
+        );
+        assert_eq!(doc["version"], DOCKER_AGENT_CAPABILITIES_VERSION);
+    }
+
+    /// A list that takes no images keeps the older document, which Docker
+    /// Desktop's docker-agent reads.
+    #[test]
+    fn docker_agent_document_of_text_only_models_is_version_2_without_capabilities() {
+        let (document, doc) = document_of(vec![hosted("alpha", "a"), hosted("beta", "b")]);
+        assert_eq!(doc["version"], DOCKER_AGENT_BASE_VERSION, "{document}");
+        assert_eq!(doc["version"], "2", "{document}");
+        assert!(!document.contains("capabilities"), "{document}");
+        for (key, entry) in doc["models"].as_object().unwrap() {
+            assert!(entry.get("capabilities").is_none(), "{key}: {document}");
+        }
+    }
+
+    #[test]
+    fn docker_agent_document_with_an_image_model_is_version_11_with_capabilities() {
+        let seeing = ModelEntry {
+            vision: true,
+            ..hosted("alpha", "eyes")
+        };
+        let (document, doc) = document_of(vec![hosted("alpha", "blind"), seeing]);
+        assert_eq!(doc["version"], "11", "{document}");
+        assert_eq!(
+            doc["models"]["eyes"]["capabilities"]["image"], true,
             "{document}"
         );
     }
@@ -291,11 +411,10 @@ mod tests {
     /// `dsh::write_dsh_settings` also promise.
     #[test]
     fn docker_agent_document_names_the_key_variable_rather_than_a_key() {
-        let document = docker_agent_document("m", "http://127.0.0.1:17434/v1");
-        assert!(
-            document.contains(&format!("token_key: {DOCKER_AGENT_API_KEY_ENV}")),
-            "{document}"
-        );
+        let (document, doc) = document_of(vec![hosted("alpha", "m"), hosted("beta", "m")]);
+        for (key, entry) in doc["models"].as_object().unwrap() {
+            assert_eq!(entry["token_key"], DOCKER_AGENT_API_KEY_ENV, "{key}");
+        }
         assert!(!document.contains("api_key"), "{document}");
         assert!(!document.contains("sk-"), "{document}");
     }
@@ -305,7 +424,7 @@ mod tests {
     /// (`consolidate_chat_system_messages`), not by leaving them out.
     #[test]
     fn docker_agent_document_gives_the_agent_shell_and_filesystem() {
-        let document = docker_agent_document("m", "http://127.0.0.1:17434/v1");
+        let (document, _) = document_of(vec![hosted("alpha", "m")]);
         assert!(document.contains("instruction:"), "{document}");
         assert!(document.contains("toolsets:"), "{document}");
         assert!(document.contains("- type: shell"), "{document}");
@@ -316,15 +435,29 @@ mod tests {
     /// colon rather than as the model's name.
     #[test]
     fn docker_agent_document_quotes_the_values_it_interpolates() {
-        let document = docker_agent_document("docker.io/ai/qwen3.5:0.8b", "http://h:1/v1");
+        let (document, doc) = document_of(vec![ModelEntry::unlisted("hf.co/o/qwen3.5:0.8b")]);
+        assert_eq!(
+            doc["models"]["hf.co/o/qwen3.5:0.8b"]["model"],
+            "hf.co/o/qwen3.5:0.8b"
+        );
         assert!(
-            document.contains("model: \"docker.io/ai/qwen3.5:0.8b\""),
+            document.contains("model: \"hf.co/o/qwen3.5:0.8b\""),
             "{document}"
         );
         assert!(
-            document.contains("base_url: \"http://h:1/v1\""),
+            document.contains("base_url: \"http://127.0.0.1:17434/v1\""),
             "{document}"
         );
+    }
+
+    /// Nothing to start on is refused here, not left to docker-agent to
+    /// report of an agent with no model.
+    #[test]
+    fn docker_agent_document_needs_a_model() {
+        let error = docker_agent_document(&ModelList::default(), "http://h/v1")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("model to start on"), "{error}");
     }
 
     /// llmman supplies the agent file, so a second one would be read as a
@@ -370,59 +503,6 @@ mod tests {
         // but does not exist is prose too.
         let absent = ["explain agent.yaml".to_string()];
         assert_eq!(docker_agent_config_argument_with(&absent, |_| false), None);
-    }
-
-    /// One name for every model would let a concurrent launch overwrite
-    /// the file before docker-agent reads it, so models that differ get
-    /// files that differ — including ones that sanitize or cut alike.
-    /// Whatever the id carries, the name stays one component of `dir`:
-    /// a model is not a path.
-    #[test]
-    fn docker_agent_names_its_agent_file_after_the_model() {
-        let dir = Path::new("/tmp/llmman/launch/docker-agent");
-        let file = |model: &str| docker_agent_agent_file(dir, model);
-        let name = |model: &str| {
-            file(model)
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap()
-                .to_string()
-        };
-        assert!(
-            name("docker.io/ai/qwen3.5:0.8b").starts_with("agent-docker.io-ai-qwen3.5-0.8b-"),
-            "{}",
-            name("docker.io/ai/qwen3.5:0.8b")
-        );
-        for (one, other) in [
-            ("docker.io/ai/qwen3.5:0.8b", "docker.io/ai/qwen3.5:9b"),
-            ("docker.io/ai/qwen3.5:0.8b", "docker.io/ai/gemma4:12b"),
-            ("qwen/qwen3-coder", "qwen/qwen3-max"),
-            // Sanitize alike: `/` and `:` both become `-`.
-            ("a/b-c:d", "a/b:c-d"),
-            // Differ only past the cut.
-            (
-                &format!("{}one", "m".repeat(DOCKER_AGENT_NAME_MAX)),
-                &format!("{}two", "m".repeat(DOCKER_AGENT_NAME_MAX)),
-            ),
-        ] {
-            assert_ne!(file(one), file(other), "{one} and {other} share a file");
-        }
-        // A provider id is never length-checked, so the name is bounded
-        // here or the write fails.
-        assert!(name(&"x".repeat(4096)).len() <= 255, "name is unbounded");
-        for model in ["a/b", "a:b", "a\\b", "a b", "a*b", "a?b", "a\"b", "..", "."] {
-            let file = docker_agent_agent_file(dir, model);
-            assert_eq!(file.parent(), Some(dir), "{model} escaped its directory");
-            let name = file.file_name().and_then(|n| n.to_str()).unwrap();
-            assert!(
-                name.starts_with("agent-") && name.ends_with(".yaml"),
-                "{name}"
-            );
-            assert!(
-                !name.contains(std::path::MAIN_SEPARATOR) && name != ".." && name != ".",
-                "{model} produced {name}"
-            );
-        }
     }
 
     /// The plugin directory is not on `PATH`, so without the fallback a
@@ -477,7 +557,7 @@ mod tests {
     fn docker_agent_refuses_a_forwarded_model_flag() {
         for spelling in ["--model", "--model=openai/gpt-5"] {
             let extra = [spelling.to_string(), "openai/gpt-5".to_string()];
-            let error = launch_docker_agent("m", "k", &extra)
+            let error = launch_docker_agent("m", "k", &ModelList::default(), &extra)
                 .unwrap_err()
                 .to_string();
             assert!(error.contains("api.openai.com"), "{spelling}: {error}");
@@ -521,9 +601,14 @@ mod tests {
         ));
         std::fs::write(&path, "agents: {}\n").unwrap();
         let named = path.to_string_lossy().into_owned();
-        let error = launch_docker_agent("m", "k", std::slice::from_ref(&named))
-            .unwrap_err()
-            .to_string();
+        let error = launch_docker_agent(
+            "m",
+            "k",
+            &ModelList::default(),
+            std::slice::from_ref(&named),
+        )
+        .unwrap_err()
+        .to_string();
         let _ = std::fs::remove_file(&path);
 
         assert!(error.contains(&named), "{error}");

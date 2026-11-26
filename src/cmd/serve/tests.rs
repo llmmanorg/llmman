@@ -210,7 +210,14 @@ fn client_api_key_reads_bearer_and_x_api_key() {
 /// the daemon's own configured key.
 #[test]
 fn client_api_key_ignores_the_local_placeholder_and_empty_values() {
-    for header in ["Bearer llmman", "Bearer ", "Bearer    ", ""] {
+    for header in [
+        "Bearer llmman",
+        "Bearer no-key-required",
+        "Bearer ollama-local",
+        "Bearer ",
+        "Bearer    ",
+        "",
+    ] {
         let mut headers = HeaderMap::new();
         headers.insert("authorization", header.parse().unwrap());
         assert_eq!(
@@ -221,7 +228,10 @@ fn client_api_key_ignores_the_local_placeholder_and_empty_values() {
     }
 
     let mut headers = HeaderMap::new();
-    headers.insert("x-api-key", PLACEHOLDER_API_KEY.parse().unwrap());
+    headers.insert(
+        "x-api-key",
+        crate::providers::PLACEHOLDER_API_KEY.parse().unwrap(),
+    );
     assert_eq!(client_api_key(Some(&headers)), None);
 
     assert_eq!(client_api_key(None), None);
@@ -812,7 +822,10 @@ async fn a_thinking_level_reaches_each_claude_in_its_own_form() {
     assert!(headers.get("anthropic-beta").is_none(), "{headers:?}");
 
     let (_, headers, sent) = &calls[1];
-    assert_eq!(sent["thinking"], serde_json::json!({ "type": "disabled" }));
+    assert_eq!(
+        sent["thinking"],
+        serde_json::json!({ "type": "between_tools" })
+    );
     assert!(sent.get("output_config").is_none(), "{sent}");
     assert!(headers.get("anthropic-beta").is_none());
 
@@ -2117,8 +2130,9 @@ fn a_single_provider_carries_its_models_and_their_prices() {
     assert_eq!(
         json["models"],
         serde_json::json!([
-            { "id": "a-model" },
-            { "id": "z-model", "cost": { "input": 2.5, "output": 10.0 } },
+            { "id": "a-model", "chat": true, "vision": false },
+            { "id": "z-model", "chat": true, "vision": false,
+              "cost": { "input": 2.5, "output": 10.0 } },
         ])
     );
 }
@@ -2508,6 +2522,57 @@ async fn a_configured_providers_models_are_asked_of_its_endpoint() {
         .await
         .is_empty());
     assert_eq!(seen.lock().await.len(), 1, "no second request was made");
+}
+
+/// A configured provider's `/v1/models` names every kind of model it
+/// serves; only what can chat is offered, and an embedding or speech id is
+/// never a provider's default start.
+#[test]
+fn a_configured_providers_non_chat_ids_are_not_chat_models() {
+    for id in [
+        "text-embedding-3-small",
+        "bge-reranker-v2",
+        "whisper-1",
+        "kokoro-tts",
+        "gpt-image-1",
+        "dall-e-3",
+    ] {
+        assert!(!ProviderModelResponse::bare(id.into()).chat, "{id}");
+    }
+    for id in ["qwen3-coder", "gemma4", "gpt-4o-audio-preview"] {
+        assert!(ProviderModelResponse::bare(id.into()).chat, "{id}");
+    }
+}
+
+/// `GET /llmman/models` answers with the stored models when the hosted
+/// catalog cannot be had: no cache, no configured provider, no network.
+#[tokio::test]
+async fn the_model_list_is_answered_without_a_provider_catalog() {
+    let dir = fresh_store_dir("models-offline");
+    let state = test_state_at(dir.clone());
+    let store = OciStore::open(&dir).unwrap();
+    store_one_model(&store, "offline-a", "text/plain", "README.md", b"a");
+    let answer = models_answer(
+        &state,
+        Err(AppError(anyhow!("no route"), StatusCode::BAD_GATEWAY)),
+    )
+    .await;
+    let _ = std::fs::remove_dir_all(&dir);
+    let answer = serde_json::to_value(answer.ok().unwrap().0).unwrap();
+    assert_eq!(answer["providers"], serde_json::json!([]));
+    assert_eq!(answer["local"][0]["name"], "docker.io/ai/offline-a:latest");
+}
+
+/// An older fetch that finishes after a newer one does not replace its list.
+#[test]
+fn an_older_configured_models_fetch_does_not_replace_a_newer_one() {
+    let (older, newer) = (Instant::now(), Instant::now() + Duration::from_secs(1));
+    let id = "remember-test";
+    remember_configured_models(id, newer, &["new".to_string()]);
+    remember_configured_models(id, older, &["old".to_string()]);
+    assert_eq!(CONFIGURED_MODELS.lock().unwrap()[id].1, ["new"]);
+    remember_configured_models(id, newer + Duration::from_secs(1), &["newest".to_string()]);
+    assert_eq!(CONFIGURED_MODELS.lock().unwrap()[id].1, ["newest"]);
 }
 
 // -- Idle-timeout auto-unload reaper --------------------------------------
@@ -4490,6 +4555,47 @@ async fn handle_show_reports_the_thinking_values_the_template_takes() {
     );
 }
 
+/// A launch starting on no named model prefers the one loaded now, else the
+/// one pulled last; `GET /llmman/models` says both without loading anything.
+#[tokio::test]
+async fn local_models_say_which_is_loaded_and_when_each_was_pulled() {
+    let dir = fresh_store_dir("local-models");
+    let state = test_state_at(dir.clone());
+    let store = OciStore::open(&dir).unwrap();
+    store_one_model(&store, "lm-a", "text/plain", "README.md", b"a");
+    store_one_model(&store, "lm-b", "text/plain", "README.md", b"bb");
+    let digest = store.find("docker.io/ai/lm-b:latest").unwrap().digest;
+    let mut fixture = running_model_fixture(None, Duration::ZERO, 0);
+    fixture.digest = digest;
+    state
+        .0
+        .manager
+        .lock()
+        .await
+        .running
+        .insert("docker.io/ai/lm-b:latest".into(), fixture);
+
+    let rows = ollama::local_models(&state).await.unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    let rows = serde_json::to_value(rows).unwrap();
+    let row = |name: &str| {
+        rows.as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["name"] == format!("docker.io/ai/{name}:latest"))
+            .unwrap_or_else(|| panic!("{name} not listed: {rows}"))
+            .clone()
+    };
+    assert_eq!(row("lm-b")["loaded"], true);
+    assert!(row("lm-a").get("loaded").is_none());
+    for name in ["lm-a", "lm-b"] {
+        assert!(
+            row(name)["pulled"].as_u64().unwrap() > 1_600_000_000,
+            "{name}"
+        );
+    }
+}
+
 /// `/api/tags` reads each model's format the way `/api/show` does,
 /// rather than calling everything `"gguf"`.
 #[tokio::test]
@@ -5328,6 +5434,13 @@ async fn record_prompt_logs_generation_requests_and_hands_the_body_on() {
         &[],
     )
     .await;
+    // AGY switched models: the path names the one that serves the request.
+    send(
+        &format!("/gemini/{encoded_model}/v1beta/models/llmman.provider/openai/gpt-5:streamGenerateContent"),
+        gemini,
+        &[],
+    )
+    .await;
 
     let entries = crate::promptlog::read(&log).unwrap();
     let _ = std::fs::remove_file(&log);
@@ -5337,6 +5450,7 @@ async fn record_prompt_logs_generation_requests_and_hands_the_body_on() {
         [
             "/api/chat",
             "/v1/chat/completions",
+            "/gemini/:model/*gemini_path",
             "/gemini/:model/*gemini_path"
         ],
         "{entries:?}"
@@ -5347,6 +5461,7 @@ async fn record_prompt_logs_generation_requests_and_hands_the_body_on() {
     assert_eq!(entries[2].model, PAIR);
     assert_eq!(entries[2].prompt, "describe this");
     assert_eq!(entries[2].client.as_deref(), Some("test-agent/1"));
+    assert_eq!(entries[3].model, "llmman.provider/openai/gpt-5");
 }
 
 /// Every route that takes a generation body.

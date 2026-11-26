@@ -31,7 +31,7 @@ use crate::llama_release::LlamaPin;
 use crate::mediagen::server::GENERATION_BODY_LIMIT_BYTES;
 use crate::metrics::{self, UnloadReason};
 use crate::modelpack::{resolve_model, ModelPath};
-use crate::providers::{Wire, PLACEHOLDER_API_KEY};
+use crate::providers::Wire;
 use crate::storage::OciStore;
 
 mod aggregation;
@@ -53,6 +53,7 @@ pub mod runtime;
 mod sched;
 pub(crate) use sched::parse_keep_alive_str;
 mod search;
+mod sessions;
 mod shell;
 mod stream;
 mod types;
@@ -78,7 +79,7 @@ use config::{
     threads_from_env_or_host, tls_from_env, whole_prompt_batch, MAX_CTX_SHRINK_ATTEMPTS,
 };
 pub use config::{context_length_from_env, DEFAULT_CTX_SIZE};
-use gemini::{gemini_method, handle_pinned_gemini};
+use gemini::{gemini_method, handle_pinned_gemini, routed_model};
 use hybrid::resolve_hybrid_side;
 use ollama::{
     handle_blob_head, handle_blob_upload, handle_copy, handle_create, handle_delete, handle_embed,
@@ -1941,7 +1942,7 @@ fn client_api_key(headers: Option<&HeaderMap>) -> Option<String> {
     let headers = headers?;
     let usable = |k: &str| {
         let k = k.trim();
-        (!k.is_empty() && k != PLACEHOLDER_API_KEY).then(|| k.to_string())
+        (!k.is_empty() && !crate::providers::is_placeholder_key(k)).then(|| k.to_string())
     };
     let bearer = auth::bearer(headers).and_then(usable);
     // Each candidate is filtered before the choice between them, not
@@ -2077,8 +2078,22 @@ async fn resolve_remote_target(
     // network can reach, or a browser acting for another site. That is a
     // blast-radius bound, not authentication — see `daemon_key_spendable`.
     let trusted = daemon_key_spendable(state, headers);
-    let credential = match client_api_key(headers) {
-        Some(key) => Some(crate::credentials::Resolved::from_key(key, "request")),
+    // A launched agent presents a session token, not a key, because it can
+    // switch provider: the key is the one the session registered for this
+    // provider, and the token itself is never forwarded (see `sessions`).
+    let presented = client_api_key(headers);
+    let session = presented.as_deref().filter(|k| sessions::is_token(k));
+    let credential = match (presented.as_deref(), session) {
+        (Some(_), Some(token)) => sessions::key_for(token, &provider_id)
+            .map(|key| crate::credentials::Resolved::from_key(key, "session")),
+        (Some(key), None) => Some(crate::credentials::Resolved::from_key(
+            key.to_string(),
+            "request",
+        )),
+        (None, _) => None,
+    };
+    let credential = match credential {
+        Some(credential) => Some(credential),
         None if trusted => provider_credential(provider).await?,
         None => None,
     };
@@ -2089,8 +2104,25 @@ async fn resolve_remote_target(
         None => {
             return Err(AppError(
                 anyhow!(
-                    "no API key for provider {provider_id:?} — send it as an Authorization \
-                     header{}",
+                    "no API key for provider {provider_id:?} — {}{}",
+                    if session.is_some() {
+                        format!(
+                            "this llmman launch session holds none for it: {} where you ran \
+                             llmman launch, and launch again{}",
+                            crate::providers::key_hint(&provider.id, provider.key_env.as_deref()),
+                            if crate::daemon::reachable_only_locally() {
+                                String::new()
+                            } else {
+                                format!(
+                                    " (a launch registers only the key of the provider it starts \
+                                     on with a daemon the network can reach: start it with \
+                                     --provider {provider_id})"
+                                )
+                            }
+                        )
+                    } else {
+                        "send it as an Authorization header".to_string()
+                    },
                     if is_cross_site(headers) && !state.0.auth.enforced() {
                         ". This request came from another site, so llmman serve's own \
                          environment is deliberately not used"
@@ -3853,6 +3885,43 @@ struct ProviderModelResponse {
     /// catalog names no ceiling.
     #[serde(skip_serializing_if = "Option::is_none")]
     output: Option<u32>,
+    /// See [`crate::providers::Caps`]: whether it answers chat, takes
+    /// images in, and calls tools.
+    chat: bool,
+    vision: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<bool>,
+    /// See [`crate::providers::Model::released`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    released: Option<String>,
+}
+
+impl ProviderModelResponse {
+    /// A model of a provider defined in `llmman.conf`, known by its id alone.
+    fn bare(id: String) -> Self {
+        let caps = crate::providers::Caps::of_id(&id);
+        Self::of(id, None, None, None, caps)
+    }
+
+    fn of(
+        id: String,
+        thinking: Option<Vec<String>>,
+        context: Option<u64>,
+        output: Option<u32>,
+        caps: crate::providers::Caps,
+    ) -> Self {
+        Self {
+            id,
+            cost: None,
+            thinking,
+            context,
+            output,
+            chat: caps.chat,
+            vision: caps.vision,
+            tools: caps.tools,
+            released: None,
+        }
+    }
 }
 
 /// US dollars per million tokens, models.dev's own unit (see
@@ -3886,7 +3955,6 @@ impl ProviderResponse {
                 .models
                 .iter()
                 .map(|m| ProviderModelResponse {
-                    id: m.id.clone(),
                     cost: m.cost.as_ref().map(|c| ProviderCostResponse {
                         input: c.input,
                         output: c.output,
@@ -3894,9 +3962,14 @@ impl ProviderResponse {
                         cache_write: c.cache_write,
                         reasoning: c.reasoning,
                     }),
-                    thinking: m.thinking.clone(),
-                    context: m.max_context,
-                    output: m.max_output,
+                    released: m.released.clone(),
+                    ..ProviderModelResponse::of(
+                        m.id.clone(),
+                        m.thinking.clone(),
+                        m.max_context,
+                        m.max_output,
+                        m.caps,
+                    )
                 })
                 .collect(),
         }
@@ -3957,22 +4030,154 @@ async fn handle_llmman_provider(
     })?;
     let mut response = ProviderResponse::new(&state, provider);
     if provider.key_optional && provider.models.is_empty() {
+        // A provider defined in llmman.conf: its models come from the
+        // endpoint's own /v1/models, which names no window and no output
+        // ceiling.
         response.models = configured_provider_models(&state, provider)
             .await
             .into_iter()
-            // A provider defined in llmman.conf: its models come from
-            // the endpoint's own /v1/models, which names no window and
-            // no output ceiling.
-            .map(|id| ProviderModelResponse {
-                id,
-                cost: None,
-                thinking: None,
-                context: None,
-                output: None,
-            })
+            .map(ProviderModelResponse::bare)
             .collect();
     }
     Ok(Json(response))
+}
+
+/// `GET /llmman/models`: every model `llmman launch` can offer, in one answer: each stored model,
+/// and each provider with its models. Loads nothing; a configured provider's list is asked for only
+/// when not asked lately ([`configured_models_cached`]).
+#[derive(Serialize)]
+struct ModelsResponse {
+    local: Vec<ollama::LocalModelResponse>,
+    providers: Vec<ProviderResponse>,
+}
+
+async fn handle_llmman_models(
+    State(state): State<AppState>,
+) -> Result<impl IntoResponse, AppError> {
+    models_answer(&state, provider_catalog().await).await
+}
+
+/// [`handle_llmman_models`] for `catalog`, which may have failed: a machine with no catalog, no
+/// configured provider and no route out is answered with its stored models and no provider.
+async fn models_answer(
+    state: &AppState,
+    catalog: Result<Arc<crate::providers::Catalog>, AppError>,
+) -> Result<Json<ModelsResponse>, AppError> {
+    let catalog = catalog.unwrap_or_else(|e| {
+        eprintln!("[llmman] no provider catalog for the model list: {:#}", e.0);
+        Arc::default()
+    });
+    let local = ollama::local_models(state).await?;
+    let mut providers: Vec<ProviderResponse> = catalog
+        .iter()
+        .map(|p| ProviderResponse::new(state, p))
+        .collect();
+    // `providers` follows the catalog's order, row for row.
+    let configured: Vec<(usize, &crate::providers::Provider)> = catalog
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| p.key_optional && p.models.is_empty())
+        .collect();
+    let listed = futures::future::join_all(
+        configured
+            .iter()
+            .map(|(_, provider)| configured_models_cached(state, provider)),
+    )
+    .await;
+    for ((i, _), ids) in configured.into_iter().zip(listed) {
+        providers[i].models = ids.into_iter().map(ProviderModelResponse::bare).collect();
+    }
+    Ok(Json(ModelsResponse { local, providers }))
+}
+
+/// How long a configured provider's model list is reused: a launch should
+/// not wait on an endpoint that was just asked.
+const CONFIGURED_MODELS_TTL: Duration = Duration::from_secs(300);
+/// An endpoint that did not answer is left alone for less.
+const CONFIGURED_MODELS_RETRY: Duration = Duration::from_secs(60);
+
+/// What [`configured_provider_models`] last found for each provider, and when.
+static CONFIGURED_MODELS: LazyLock<StdMutex<ConfiguredModels>> =
+    LazyLock::new(|| StdMutex::new(HashMap::new()));
+
+/// The ids found for each provider, and when.
+type ConfiguredModels = HashMap<String, (Instant, Vec<String>)>;
+
+/// [`configured_provider_models`], not asked again within
+/// [`CONFIGURED_MODELS_TTL`] (an empty answer, [`CONFIGURED_MODELS_RETRY`]).
+async fn configured_models_cached(
+    state: &AppState,
+    provider: &crate::providers::Provider,
+) -> Vec<String> {
+    let fresh = |at: Instant, ids: &[String]| {
+        let ttl = if ids.is_empty() {
+            CONFIGURED_MODELS_RETRY
+        } else {
+            CONFIGURED_MODELS_TTL
+        };
+        at.elapsed() < ttl
+    };
+    if let Some((at, ids)) = CONFIGURED_MODELS.lock().unwrap().get(&provider.id) {
+        if fresh(*at, ids) {
+            return ids.clone();
+        }
+    }
+    let asked = Instant::now();
+    let ids = configured_provider_models(state, provider).await;
+    remember_configured_models(&provider.id, asked, &ids);
+    ids
+}
+
+/// Keeps `ids`, found by a fetch begun at `asked`, unless a fetch begun
+/// later already stored its own: a slower, older one must not replace it.
+fn remember_configured_models(provider: &str, asked: Instant, ids: &[String]) {
+    let mut held = CONFIGURED_MODELS.lock().unwrap();
+    if held.get(provider).is_none_or(|(at, _)| *at < asked) {
+        held.insert(provider.to_string(), (asked, ids.to_vec()));
+    }
+}
+
+/// `POST /llmman/sessions`: the keys of one `llmman launch`, by provider id.
+#[derive(Deserialize)]
+struct OpenSessionBody {
+    keys: HashMap<String, String>,
+}
+
+/// What opening a session answers: the token the agent sends instead of a key.
+#[derive(Debug, Serialize)]
+struct OpenSessionResponse {
+    token: String,
+}
+
+/// `POST /llmman/sessions` (see [`sessions`]). Refused from another site's
+/// page, which could otherwise churn out the sessions of real launches.
+async fn handle_open_session(
+    headers: HeaderMap,
+    Json(body): Json<OpenSessionBody>,
+) -> Result<(StatusCode, Json<OpenSessionResponse>), AppError> {
+    if is_cross_site(Some(&headers)) {
+        return Err(AppError(
+            anyhow!("sessions cannot be opened from another site's page"),
+            StatusCode::FORBIDDEN,
+        ));
+    }
+    let token = sessions::open(body.keys).map_err(|e| {
+        let status = if e.is::<sessions::Full>() {
+            StatusCode::SERVICE_UNAVAILABLE
+        } else {
+            StatusCode::BAD_REQUEST
+        };
+        AppError(e, status)
+    })?;
+    Ok((StatusCode::CREATED, Json(OpenSessionResponse { token })))
+}
+
+/// `DELETE /llmman/sessions`: closes the session whose token is the bearer.
+async fn handle_close_session(headers: HeaderMap) -> StatusCode {
+    match client_api_key(Some(&headers)) {
+        Some(token) if sessions::close(&token) => StatusCode::NO_CONTENT,
+        _ => StatusCode::NOT_FOUND,
+    }
 }
 
 /// `PUT /llmman/providers/:id/key`.
@@ -4342,15 +4547,17 @@ async fn record_prompt(State(state): State<AppState>, req: Request, next: Next) 
         let model = UrlPath::<(String, String)>::from_request_parts(&mut parts, &())
             .await
             .ok()
-            .filter(|UrlPath((_, path))| {
-                gemini_method(path).is_some_and(|(_, method)| method.generates())
-            })
-            .and_then(|UrlPath((encoded_model, _))| {
-                base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .and_then(|UrlPath((encoded_model, path))| {
+                let (path_model, method) = gemini_method(&path)?;
+                if !method.generates() {
+                    return None;
+                }
+                let pinned = base64::engine::general_purpose::URL_SAFE_NO_PAD
                     .decode(encoded_model)
                     .ok()
-            })
-            .and_then(|bytes| String::from_utf8(bytes).ok());
+                    .and_then(|bytes| String::from_utf8(bytes).ok())?;
+                Some(routed_model(pinned, path_model))
+            });
         let Some(model) = model else {
             return next.run(Request::from_parts(parts, body)).await;
         };
@@ -4829,6 +5036,13 @@ fn build_router(app_state: AppState, metrics_enabled: bool) -> Router {
         // llmman's own API — see handle_llmman_providers
         .route("/llmman/providers", get(handle_llmman_providers))
         .route("/llmman/providers/:id", get(handle_llmman_provider))
+        .route("/llmman/models", get(handle_llmman_models))
+        .route(
+            "/llmman/sessions",
+            post(handle_open_session)
+                .layer(DefaultBodyLimit::max(sessions::BODY_LIMIT_BYTES))
+                .delete(handle_close_session),
+        )
         .route(
             "/llmman/providers/:id/key",
             put(handle_set_provider_key).delete(handle_delete_provider_key),

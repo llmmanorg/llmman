@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 
 use super::common::write_json_merged;
+use super::models::{write_transient, ModelEntry, ModelList};
 use super::optimizer::Optimizer;
 use super::{
     exec_with_env, find_on_path, server, thinking_choices, xdg_dir, Thinking, WINDOWS_PATH_EXTS,
@@ -23,6 +24,7 @@ pub(super) fn launch_opencode(
     vision: bool,
     context_window: Option<u64>,
     max_output: Option<u32>,
+    models: &ModelList,
     extra_args: &[String],
     optimizer: Optimizer,
 ) -> anyhow::Result<()> {
@@ -50,7 +52,130 @@ pub(super) fn launch_opencode(
     if let Some(notice) = optimizer.notice("opencode") {
         eprintln!("{notice}");
     }
-    exec_with_env(&bin, extra_args, &[("OPENCODE_CONFIG_CONTENT", &config)])
+    let mut env = vec![("OPENCODE_CONFIG_CONTENT", config.as_str())];
+    let catalog = catalog_file(models)?;
+    if let Some(path) = &catalog {
+        env.push(("OPENCODE_CONFIG", path));
+    }
+    exec_with_env(&bin, extra_args, &env)
+}
+
+/// Writes [`opencode_catalog`] where opencode reads `OPENCODE_CONFIG` from, for a launch with
+/// something to switch to; returns the path for the environment (the list is far past what a
+/// variable holds).
+///
+/// opencode reads one file there, so a caller's own becomes the base of the file llmman writes
+/// ([`with_users_config`]) and theirs is never touched. One that cannot be used that way is left in
+/// place and the list is not offered.
+fn catalog_file(models: &ModelList) -> anyhow::Result<Option<String>> {
+    if !models.offers_choice() {
+        return Ok(None);
+    }
+    let catalog = opencode_catalog(models);
+    let text = match std::env::var_os("OPENCODE_CONFIG").filter(|v| !v.is_empty()) {
+        None => catalog,
+        Some(theirs) => match with_users_config(Path::new(&theirs), &catalog) {
+            Ok(text) => text,
+            Err(why) => {
+                eprintln!(
+                    "[llmman] opencode: OPENCODE_CONFIG {why}, so the model list is not \
+                     offered; fix or unset it to switch models inside opencode"
+                );
+                return Ok(None);
+            }
+        },
+    };
+    let dir = super::models::state_dir("opencode")?;
+    let path = write_transient(&dir, "models", "json", &text)?;
+    Ok(Some(path.to_string_lossy().into_owned()))
+}
+
+/// `json` without the commas before a closing `}` or `]` (outside strings),
+/// which opencode's config parser allows.
+fn strip_trailing_commas(json: &str) -> String {
+    let chars: Vec<char> = json.chars().collect();
+    let mut out = String::with_capacity(json.len());
+    let (mut in_string, mut escaped) = (false, false);
+    for (i, &c) in chars.iter().enumerate() {
+        if in_string {
+            in_string = !(c == '"' && !escaped);
+            escaped = c == '\\' && !escaped;
+        } else if c == '"' {
+            in_string = true;
+        } else if c == ',' {
+            let next = chars[i + 1..].iter().find(|c| !c.is_whitespace());
+            if matches!(next, Some('}' | ']')) {
+                continue;
+            }
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// The caller's own `OPENCODE_CONFIG` file with llmman's provider in it, as the text of one config;
+/// or why it cannot be: not a JSON object (comments and trailing commas are allowed), or it refers
+/// to files (`{file:...}`) or plugins by a path relative to it, which a copy elsewhere would break.
+/// Their own `ollama` provider is replaced.
+fn with_users_config(theirs: &Path, catalog: &str) -> Result<String, String> {
+    let text = std::fs::read_to_string(theirs)
+        .map_err(|e| format!("({}) cannot be read: {e}", theirs.display()))?;
+    if text.contains("{file:") {
+        return Err(format!(
+            "({}) refers to other files by relative path",
+            theirs.display()
+        ));
+    }
+    let cleaned = strip_trailing_commas(&super::common::strip_json_comments(
+        text.trim_start_matches('\u{feff}'),
+    ));
+    let config: serde_json::Value = serde_json::from_str(&cleaned)
+        .map_err(|e| format!("({}) is not JSON: {e}", theirs.display()))?;
+    let config = config
+        .as_object()
+        .ok_or_else(|| format!("({}) is not a JSON object", theirs.display()))?;
+    if config.get("provider").is_some_and(|p| !p.is_object()) {
+        return Err(format!(
+            "({}) has a `provider` that is not an object",
+            theirs.display()
+        ));
+    }
+    // A plugin named by a path is found beside the config, which a copy elsewhere is not.
+    let by_path = |entry: &serde_json::Value| {
+        let name = entry.as_array().and_then(|a| a.first()).unwrap_or(entry);
+        name.as_str().is_some_and(|n| n.starts_with('.'))
+    };
+    if config
+        .get("plugin")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|plugins| plugins.iter().any(by_path))
+    {
+        return Err(format!(
+            "({}) names a plugin by relative path",
+            theirs.display()
+        ));
+    }
+    // Raw values, which keep the order the catalog's variants were written
+    // in; a parsed `Value` would sort them.
+    type Raw = std::collections::BTreeMap<String, Box<serde_json::value::RawValue>>;
+    let raw = |text: &str| serde_json::from_str::<Raw>(text).expect("checked as an object");
+    let mut config = raw(&cleaned);
+    let mut provider = config
+        .get("provider")
+        .map(|p| raw(p.get()))
+        .unwrap_or_default();
+    let mut ours = raw(catalog);
+    let mut ours_provider = raw(ours
+        .remove("provider")
+        .expect("the catalog has a provider")
+        .get());
+    let ollama = ours_provider
+        .remove("ollama")
+        .expect("the catalog has ollama");
+    provider.insert("ollama".to_string(), ollama);
+    let provider = serde_json::value::to_raw_value(&provider).expect("raw values serialize");
+    config.insert("provider".to_string(), provider);
+    Ok(serde_json::to_string(&config).expect("raw values serialize"))
 }
 
 /// `config` (a JSON object) with the keys of `added` appended, so the order
@@ -102,6 +227,19 @@ fn major_version(output: &str) -> Option<u64> {
 pub(super) fn opencode_state_dir() -> anyhow::Result<PathBuf> {
     let home = crate::config::home_dir().context("no home directory")?;
     Ok(xdg_dir(&home, "XDG_STATE_HOME", ".local/state").join("opencode"))
+}
+
+/// The model opencode last ran on llmman's provider, from the recent list
+/// in its `model.json`.
+pub(super) fn remembered_model() -> Option<String> {
+    let text = std::fs::read_to_string(opencode_state_dir().ok()?.join("model.json")).ok()?;
+    let state: serde_json::Value = serde_json::from_str(&text).ok()?;
+    state["recent"]
+        .as_array()?
+        .iter()
+        .find(|m| m["providerID"] == "ollama")?["modelID"]
+        .as_str()
+        .map(str::to_string)
 }
 
 /// How opencode names `model` on llmman's provider.
@@ -206,9 +344,109 @@ fn opencode_output_reserve(context: u64) -> u64 {
     (context / 4).clamp(1, OPENCODE_OUTPUT_TOKEN_MAX)
 }
 
-/// The `OPENCODE_CONFIG_CONTENT` for `model` at `server`. Structs rather
-/// than `json!`, whose map sorts keys: opencode cycles variants in the
-/// order listed. No variants leaves the key out.
+/// An object with runtime keys, in the order given: serde's map sorts them,
+/// and opencode cycles variants in the order listed.
+fn entries<S: serde::ser::Serializer, V: serde::Serialize>(
+    entries: &[(&str, V)],
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    use serde::ser::SerializeMap;
+    let mut map = serializer.serialize_map(Some(entries.len()))?;
+    for (key, value) in entries {
+        map.serialize_entry(key, value)?;
+    }
+    map.end()
+}
+
+#[derive(serde::Serialize)]
+struct Config<'a> {
+    #[serde(rename = "$schema")]
+    schema: &'static str,
+    provider: Providers<'a>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
+}
+#[derive(serde::Serialize)]
+struct Providers<'a> {
+    ollama: Provider<'a>,
+}
+#[derive(serde::Serialize)]
+struct Provider<'a> {
+    npm: &'static str,
+    name: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    options: Option<Options<'a>>,
+    #[serde(serialize_with = "entries")]
+    models: &'a [(&'a str, Model<'a>)],
+}
+#[derive(serde::Serialize)]
+struct Options<'a> {
+    #[serde(rename = "baseURL")]
+    base_url: String,
+    #[serde(rename = "apiKey")]
+    api_key: &'a str,
+}
+#[derive(serde::Serialize)]
+struct Model<'a> {
+    name: &'a str,
+    #[serde(serialize_with = "entries", skip_serializing_if = "<[_]>::is_empty")]
+    variants: &'a [(&'a str, serde_json::Value)],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    options: Option<&'a serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    modalities: Option<Modalities>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    attachment: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    limit: Option<Limit>,
+}
+#[derive(serde::Serialize)]
+struct Modalities {
+    input: &'static [&'static str],
+    output: &'static [&'static str],
+}
+/// opencode's schema requires both fields once `limit` is present.
+#[derive(serde::Serialize)]
+struct Limit {
+    context: u64,
+    output: u64,
+}
+
+impl<'a> Model<'a> {
+    /// A model's record. Declares image input for a vision model so opencode attaches images.
+    ///
+    /// Without `limit`, opencode normalizes a config-defined model to `{context: 0, output: 0}` and
+    /// skips overflow detection for a 0 context (`session/overflow.ts`, `isOverflow`), so a session
+    /// never auto-compacts. Declared only when the window is known, rather than assert a guess; the
+    /// catalog's own output ceiling is used where there is one.
+    fn new(
+        name: &'a str,
+        variants: &'a [(&'a str, serde_json::Value)],
+        options: Option<&'a serde_json::Value>,
+        vision: bool,
+        context_window: Option<u64>,
+        max_output: Option<u32>,
+    ) -> Self {
+        Self {
+            name,
+            variants,
+            options,
+            modalities: vision.then_some(Modalities {
+                input: &["text", "image"],
+                output: &["text"],
+            }),
+            attachment: vision.then_some(true),
+            limit: context_window.map(|context| Limit {
+                context,
+                output: max_output.map_or_else(|| opencode_output_reserve(context), u64::from),
+            }),
+        }
+    }
+}
+
+/// The `OPENCODE_CONFIG_CONTENT` for `model` at `server`: the model the launch starts on, exactly
+/// (its `--variant` as options), which outranks its row in [`opencode_catalog`]. No variants leaves
+/// the key out.
 #[allow(clippy::too_many_arguments)]
 fn opencode_config(
     server: &str,
@@ -220,91 +458,10 @@ fn opencode_config(
     context_window: Option<u64>,
     max_output: Option<u32>,
 ) -> String {
-    use serde::ser::{SerializeMap, Serializer};
-
-    /// An object with runtime keys, in the order given.
-    fn entries<S: Serializer, V: serde::Serialize>(
-        entries: &[(&str, V)],
-        serializer: S,
-    ) -> Result<S::Ok, S::Error> {
-        let mut map = serializer.serialize_map(Some(entries.len()))?;
-        for (key, value) in entries {
-            map.serialize_entry(key, value)?;
-        }
-        map.end()
-    }
-
-    #[derive(serde::Serialize)]
-    struct Config<'a> {
-        #[serde(rename = "$schema")]
-        schema: &'static str,
-        provider: Providers<'a>,
-        model: String,
-    }
-    #[derive(serde::Serialize)]
-    struct Providers<'a> {
-        ollama: Provider<'a>,
-    }
-    #[derive(serde::Serialize)]
-    struct Provider<'a> {
-        npm: &'static str,
-        name: &'static str,
-        options: Options<'a>,
-        #[serde(serialize_with = "entries")]
-        models: [(&'a str, Model<'a>); 1],
-    }
-    #[derive(serde::Serialize)]
-    struct Options<'a> {
-        #[serde(rename = "baseURL")]
-        base_url: String,
-        #[serde(rename = "apiKey")]
-        api_key: &'a str,
-    }
-    #[derive(serde::Serialize)]
-    struct Model<'a> {
-        name: &'a str,
-        #[serde(serialize_with = "entries", skip_serializing_if = "<[_]>::is_empty")]
-        variants: &'a [(&'a str, serde_json::Value)],
-        #[serde(skip_serializing_if = "Option::is_none")]
-        options: Option<&'a serde_json::Value>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        modalities: Option<Modalities>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        attachment: Option<bool>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        limit: Option<Limit>,
-    }
-    #[derive(serde::Serialize)]
-    struct Modalities {
-        input: &'static [&'static str],
-        output: &'static [&'static str],
-    }
-    /// opencode's schema requires both fields once `limit` is present.
-    #[derive(serde::Serialize)]
-    struct Limit {
-        context: u64,
-        output: u64,
-    }
-
-    // Declare image input for a vision model so opencode will attach
-    // images; a text-only model gets neither key.
-    let modalities = vision.then_some(Modalities {
-        input: &["text", "image"],
-        output: &["text"],
-    });
-
-    // Without `limit`, opencode normalizes a config-defined model to
-    // `{context: 0, output: 0}` and then skips overflow detection
-    // entirely for a 0 context (`session/overflow.ts`, `isOverflow`), so
-    // a session never auto-compacts. Declared only when llmman knows the
-    // window; otherwise the key stays out rather than assert a guess.
-    let limit = context_window.map(|context| Limit {
-        context,
-        // The catalog's own ceiling wherever there is one; derived
-        // only for a local model, which has no catalog to name one.
-        output: max_output.map_or_else(|| opencode_output_reserve(context), u64::from),
-    });
-
+    let record = [(
+        model,
+        Model::new(model, variants, options, vision, context_window, max_output),
+    )];
     let config = Config {
         schema: "https://opencode.ai/config.json",
         provider: Providers {
@@ -314,26 +471,64 @@ fn opencode_config(
             ollama: Provider {
                 npm: "@ai-sdk/openai-compatible",
                 name: "llmman",
-                options: Options {
+                options: Some(Options {
                     base_url: format!("{server}/v1"),
                     api_key,
-                },
-                models: [(
-                    model,
-                    Model {
-                        name: model,
-                        variants,
-                        options,
-                        modalities,
-                        attachment: vision.then_some(true),
-                        limit,
-                    },
-                )],
+                }),
+                models: &record,
             },
         },
-        model: opencode_model_ref(model),
+        model: Some(opencode_model_ref(model)),
     };
     serde_json::to_string(&config).expect("opencode config serializes")
+}
+
+/// The file `OPENCODE_CONFIG` names: every model of the list keyed by the name the daemon routes,
+/// with variants, window, output ceiling and image input. No endpoint or key:
+/// `OPENCODE_CONFIG_CONTENT` carries those and opencode merges it over this.
+fn opencode_catalog(models: &ModelList) -> String {
+    let labels: Vec<String> = models.entries().iter().map(ModelEntry::label).collect();
+    let thinking: Vec<Thinking> = models
+        .entries()
+        .iter()
+        .map(|entry| Thinking::Listed(entry.variants()))
+        .collect();
+    let variants: Vec<Vec<(&str, serde_json::Value)>> = thinking
+        .iter()
+        .map(|thinking| opencode_variants(Some(thinking)))
+        .collect();
+    let records: Vec<(&str, Model)> = models
+        .entries()
+        .iter()
+        .zip(&labels)
+        .zip(&variants)
+        .map(|((entry, label), variants)| {
+            (
+                entry.reference.as_str(),
+                Model::new(
+                    label,
+                    variants,
+                    None,
+                    entry.vision,
+                    entry.context_window,
+                    entry.max_output,
+                ),
+            )
+        })
+        .collect();
+    let config = Config {
+        schema: "https://opencode.ai/config.json",
+        provider: Providers {
+            ollama: Provider {
+                npm: "@ai-sdk/openai-compatible",
+                name: "llmman",
+                options: None,
+                models: &records,
+            },
+        },
+        model: None,
+    };
+    serde_json::to_string(&config).expect("opencode catalog serializes")
 }
 
 #[cfg(test)]
@@ -341,6 +536,69 @@ mod tests {
     use super::super::PORTABLE_THINKING_LEVELS;
     use super::*;
     use crate::chat_template::ThinkingControls;
+
+    /// A caller's `OPENCODE_CONFIG` stays theirs: the file llmman writes is
+    /// theirs with the list in it, and theirs is not changed.
+    #[test]
+    fn a_callers_config_and_the_list_become_one_file() {
+        let dir = super::super::test_temp_dir("opencode-theirs");
+        let theirs = dir.join("opencode.json");
+        let original = r#"{
+          // mine
+          "theme": "tokyonight",
+          "provider": { "ollama": { "name": "old", "models": { "x": {} } }, "mine": { "name": "m" } },
+        }"#;
+        std::fs::write(&theirs, original).unwrap();
+        let list = ModelList::of(vec![
+            ModelEntry::unlisted("docker.io/ai/qwen3.5:0.8b"),
+            ModelEntry::unlisted("llmman.provider/alpha/agent"),
+        ]);
+        let text = with_users_config(&theirs, &opencode_catalog(&list)).unwrap();
+        let merged: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(merged["theme"], "tokyonight");
+        assert_eq!(merged["provider"]["mine"]["name"], "m");
+        assert_eq!(merged["provider"]["ollama"]["name"], "llmman");
+        let models = merged["provider"]["ollama"]["models"].as_object().unwrap();
+        assert!(models.contains_key("llmman.provider/alpha/agent"));
+        assert!(!models.contains_key("x"));
+        assert_eq!(std::fs::read_to_string(&theirs).unwrap(), original);
+
+        // One that does not parse, or that points at files beside it, is
+        // left as it is.
+        std::fs::write(&theirs, "{ not json").unwrap();
+        assert!(with_users_config(&theirs, &opencode_catalog(&list)).is_err());
+        std::fs::write(&theirs, r#"{"instructions":"{file:./rules.md}"}"#).unwrap();
+        let why = with_users_config(&theirs, &opencode_catalog(&list)).unwrap_err();
+        assert!(why.contains("relative path"), "{why}");
+        for plugin in [r#""./plugin.ts""#, r#"["../plugin.ts", {}]"#] {
+            std::fs::write(&theirs, format!(r#"{{"plugin":[{plugin}]}}"#)).unwrap();
+            let why = with_users_config(&theirs, &opencode_catalog(&list)).unwrap_err();
+            assert!(why.contains("plugin by relative path"), "{why}");
+        }
+        std::fs::write(&theirs, r#"{"plugin":["opencode-foo@1.0.0",["bar",{}]]}"#).unwrap();
+        assert!(with_users_config(&theirs, &opencode_catalog(&list)).is_ok());
+        std::fs::write(&theirs, "[1]").unwrap();
+        assert!(with_users_config(&theirs, &opencode_catalog(&list)).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The variants cycle in the order given, whether or not a caller's
+    /// config is merged in.
+    #[test]
+    fn a_merged_config_keeps_the_variant_order() {
+        let dir = super::super::test_temp_dir("opencode-order");
+        let theirs = dir.join("opencode.json");
+        std::fs::write(&theirs, "{}").unwrap();
+        let entry = ModelEntry {
+            thinking: Some(["none", "low", "medium", "high"].map(String::from).to_vec()),
+            ..ModelEntry::unlisted("llmman.provider/alpha/agent")
+        };
+        let list = ModelList::of(vec![entry]);
+        let text = with_users_config(&theirs, &opencode_catalog(&list)).unwrap();
+        let at = |name: &str| text.find(&format!("\"{name}\":")).unwrap();
+        assert!(at("none") < at("low") && at("low") < at("medium") && at("medium") < at("high"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// The config points at the daemon's `/v1` and lists the variants in
     /// the order given (a parsed `Value` would re-sort them).

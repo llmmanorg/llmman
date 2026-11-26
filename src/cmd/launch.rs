@@ -42,12 +42,15 @@ mod goose_desktop;
 mod grok;
 mod hdrm;
 mod hermes;
+mod keys;
 mod kimi;
+mod models;
 mod omp;
 mod openclaw;
 mod opencode;
 mod optimizer;
 mod pi;
+mod plan;
 mod qwen;
 mod sandbox;
 mod vibe;
@@ -66,12 +69,21 @@ pub struct LaunchArgs {
     #[arg(value_name = "INTEGRATION")]
     pub integration: Option<String>,
 
-    /// Model to use
+    /// Model to start on: a pulled model, or with --provider one of its
+    /// models. Without it, the agent starts on the provider's default model
+    /// (--provider alone: the newest tool-calling chat model priced at or
+    /// below the median of the provider's), else (neither flag) the model it last ran (read
+    /// for claude, codex, opencode, hermes and openclaw only), the pulled
+    /// model loaded now or pulled last, or a provider you have a key for.
+    /// Every model and variant stays available inside the agent, except in
+    /// copilot and Gemini CLI, which take one model.
     #[arg(long, short, value_name = "MODEL")]
     pub model: Option<String>,
 
-    /// Serve --model from this provider (openai, anthropic, openrouter, …)
-    /// instead of locally. Requires --model. See `llmman providers`.
+    /// Start on this provider's model (openai, anthropic, openrouter, …)
+    /// instead of a local one: --model, else its default, the newest
+    /// tool-calling model at or below the median price (said on stderr).
+    /// Its models are listed first in the agent. See `llmman providers`.
     #[arg(long, short = 'p', value_name = "PROVIDER")]
     pub provider: Option<String>,
 
@@ -179,15 +191,9 @@ pub fn run(args: &LaunchArgs) -> anyhow::Result<()> {
         );
     }
 
-    // Before either arm starts the daemon; see `check_model_flag`.
     let speech = std::env::var(goose_desktop::TRANSCRIPTION_MODEL_ENV).ok();
-    check_model_flag(
-        name,
-        args.model.as_deref(),
-        provider,
-        speech.as_deref(),
-        &args.extra_args,
-    )?;
+    // Before either arm starts the daemon; see `check_model_flag`.
+    check_model_flag(name, args.model.as_deref(), &args.extra_args);
     if name.eq_ignore_ascii_case("copilot")
         || name.eq_ignore_ascii_case("copilot-cli")
         || name.eq_ignore_ascii_case("droid")
@@ -232,137 +238,20 @@ pub fn run(args: &LaunchArgs) -> anyhow::Result<()> {
     if name.eq_ignore_ascii_case("docker-agent") {
         docker_agent::check_docker_agent_args(&args.extra_args)?;
     }
-    // Under `--provider` or an overflow pair, kimi is refused further on.
-    if name.eq_ignore_ascii_case("kimi") && provider.is_none() && overflow.is_none() {
+    if name.eq_ignore_ascii_case("kimi") && overflow.is_none() {
         kimi::check_kimi_args(args.model.as_deref(), &args.extra_args)?;
     }
     // Each launcher looks for its program only once it runs, which is
     // after the daemon has started and the model has been pulled: a
     // missing agent would otherwise cost a download first.
     check_installed(name)?;
-    // The model's thinking choices (see `opencode_variants`), from its
-    // template or the catalog; whether it takes images (see
-    // `dsh::write_dsh_settings`) and the trained context only a local model
-    // has, which `local_context_window` falls back on.
-    let mut thinking = None;
-    let mut vision = false;
-    let mut context_length = None;
-    // The window the daemon serves, for the integrations that declare
-    // one: the local model's, the hosted model's, or a pair's larger
-    // half, set by whichever arm below resolves the model. `None` when
-    // no side of it is known. See `launch`.
-    let context_window: Option<u64>;
-    // The catalog's reply ceiling, for the arms that have a catalog.
-    let mut max_output = None;
-    let (model, api_key) = match provider {
-        Some(provider) => {
-            check_provider_supported(name)?;
-            // The daemon first, before --provider is validated: the
-            // catalog belongs to `llmman serve` (see cmd::providers), so
-            // there is nothing to validate against until it runs. Nothing
-            // to preload either — a provider-routed model has nothing
-            // local to warm up — but it still has to be running, since it
-            // is what forwards upstream.
-            crate::daemon::ensure_server("")?;
-            let per_request = !PROVIDER_NEEDS_DAEMON_KEY.contains(&name.to_lowercase().as_str());
-            let hosted =
-                resolve_provider_model(provider, args.model.as_deref(), name, per_request)?;
-            thinking = hosted.thinking.map(Thinking::Listed);
-            // Nothing local is loaded here, so the catalog's limits are
-            // the only ones, and the ones the provider enforces.
-            context_window = hosted.context_window;
-            max_output = hosted.max_output;
-            (hosted.reference, hosted.api_key)
-        }
-        None => {
-            // resolve_ollama_api, not resolve: every integration this
-            // launches talks to serve's Ollama/OpenAI/Anthropic-compat
-            // surfaces, all of which resolve model names the same way
-            // (see ensure_model in cmd::serve), so a bare name here must
-            // match what the daemon resolves it to at request time.
-            // Fallible: it validates the raw reference first (see
-            // shortnames::validate_reference).
-            let model = args
-                .model
-                .as_deref()
-                .map(crate::shortnames::resolve_ollama_api)
-                .transpose()?
-                .unwrap_or_default();
-
-            // Ensure serve is running (start it in background if needed),
-            // preloading the requested model so the integration's first
-            // request finds it warm.
-            crate::daemon::ensure_server(&model)?;
-
-            // serve's preload above is fire-and-forget and only fires on
-            // a cold `serve` start (see run() in cmd/serve.rs) — if the
-            // daemon was already running from a previous invocation, a
-            // missing model would otherwise only surface as an opaque
-            // failure once the integration made its first request. Mirror
-            // `llmman run`'s behavior and pull it here instead,
-            // synchronously and with progress, before ever handing off to
-            // the integration.
-            if !model.is_empty() {
-                let info = crate::daemon::ensure_model_pulled(&model)?;
-                thinking = info.thinking_controls().map(Thinking::Template);
-                vision = info.vision();
-                context_length = info.context_length();
-            }
-            // Resolved once, and only for an integration that has
-            // somewhere to put it: reading the live window loads the
-            // model (see `local_context_window`), which every other
-            // launch would wait for and never use. That includes claude
-            // given another model, which drops the window.
-            let local_window = (declares_context_window(name)
-                && !model.is_empty()
-                && (!name.eq_ignore_ascii_case("claude")
-                    || claude::runs_model(&model, &args.extra_args)))
-            .then(|| local_context_window(&model, context_length))
-            .flatten();
-            match overflow {
-                // The hosted half is validated and keyed exactly as a
-                // bare --provider model would be, then paired with the
-                // local model just pulled.
-                Some((provider, hosted)) => {
-                    check_provider_supported(name)?;
-                    let per_request =
-                        !PROVIDER_NEEDS_DAEMON_KEY.contains(&name.to_lowercase().as_str());
-                    // The local half, which serves by default, keeps
-                    // its thinking choices.
-                    let remote = resolve_provider_model(provider, Some(hosted), name, per_request)?;
-                    context_window = pair_context_window(local_window, remote.context_window);
-                    // The pair's ceiling is the hosted half's: a local
-                    // backend caps no reply of its own.
-                    max_output = remote.max_output;
-                    (
-                        crate::hybrid::pair_with_local(&model, &remote.reference)?,
-                        remote.api_key,
-                    )
-                }
-                None => {
-                    // A `--provider` model is served by someone else, so
-                    // this is the only arm whose window is the local one
-                    // alone.
-                    context_window = local_window;
-                    (model, integration_key())
-                }
-            }
-        }
+    let plan = match overflow {
+        Some(pair) => plan::pair(name, args, pair)?,
+        None => plan::resolve(name, args, provider, speech.as_deref())?,
     };
-
-    let launched = launch(
-        name,
-        &model,
-        &api_key,
-        thinking.as_ref(),
-        variant,
-        vision,
-        context_window,
-        max_output,
-        &args.extra_args,
-        args.optimizer,
-    );
+    let launched = launch(name, &plan, variant, &args.extra_args, args.optimizer);
     hdrm::stop();
+    models::finish();
     launched
 }
 
@@ -417,46 +306,6 @@ fn integration_key() -> String {
 // Pre-flight
 // ---------------------------------------------------------------------------
 
-/// Integrations that cannot be launched without `--model`. Qwen Code has
-/// no notion of a missing model and sends its own built-in default
-/// (`qwen3.7-max` in 0.22.3), which the daemon would then try to pull.
-/// AGY needs an explicit model for its Gemini routing URL.
-/// dsh has no default of its own either — an empty `--model` would
-/// otherwise land a literal `"default"` in `agent-default-model.model`,
-/// which the first request then tries to resolve as a real model id.
-/// goose instead refuses with "Run 'goose configure' first", advice that
-/// does not apply to a launch llmman configures through the environment.
-/// goose-desktop keeps the same environment, so llmman still owns the
-/// provider and endpoint; only the model name would fall back to
-/// `goose configure`'s, and the daemon would be asked for that one.
-/// It alone may skip `--model`, for dictation: see `check_model_flag`.
-/// Grok Build and Cline have hosted defaults of their own; without an
-/// explicit local model they would send those ids to llmman's endpoint
-/// instead.
-/// docker-agent's "auto" selection takes the first cloud provider with a
-/// credential, then a local Docker Model Runner model, so without an
-/// explicit model the request never reaches llmman at all.
-/// OMP needs a model so the launcher can select the matching entry its
-/// Ollama discovery reads from llmman's `/api/tags`.
-/// Copilot's BYOK mode also requires an explicit model.
-/// Droid needs one to create and select its custom-model entry.
-/// Checked before `ensure_server`, so the refusal costs no daemon start.
-const MODEL_REQUIRED: &[&str] = &[
-    "qwen",
-    "dsh",
-    "agy",
-    "goose",
-    "goose-desktop",
-    "grok",
-    "cline",
-    "pi",
-    "omp",
-    "copilot",
-    "copilot-cli",
-    "droid",
-    "docker-agent",
-];
-
 /// Integrations whose launcher yields to a `--model` after `--`, and so
 /// warrant the warning below. qwen: `qwen::qwen_args` drops its own `--model`
 /// when the caller spelled one. goose: its model is `GOOSE_MODEL` in the
@@ -495,52 +344,22 @@ const MODEL_FLAG_FORWARDED: &[&str] = &[
     "droid",
 ];
 
-/// Refuses a launch of one of `MODEL_REQUIRED` without a model, under
-/// `--provider` too. A second `--model` after `--` is the caller's to
-/// win for the integrations in `MODEL_FLAG_FORWARDED`, but `run`
-/// resolves the top-level one and, locally, preloads it, so that gets
-/// said.
+/// Says so when a `--model` after `--` is the one an integration in
+/// `MODEL_FLAG_FORWARDED` will run, since `run` resolves the top-level one
+/// and, locally, preloads it.
 ///
-/// goose-desktop alone may skip `--model` when `speech_model`
-/// (`OPENAI_TRANSCRIPTION_MODEL`) is set: it then launches for dictation
-/// only. `--provider` still needs `--model`.
-fn check_model_flag(
-    integration: &str,
-    model: Option<&str>,
-    provider: Option<&str>,
-    speech_model: Option<&str>,
-    extra_args: &[String],
-) -> anyhow::Result<()> {
+/// No integration is refused for lacking a model any more: one that is not
+/// named is picked (see [`models::resolve_start`]).
+fn check_model_flag(integration: &str, model: Option<&str>, extra_args: &[String]) {
     let name = integration.to_lowercase();
     let model = model.map(str::trim).filter(|m| !m.is_empty());
-    let Some(model) = model else {
-        if MODEL_REQUIRED.contains(&name.as_str()) {
-            let dictation = name == "goose-desktop" && provider.is_none();
-            if dictation && speech_model.is_some_and(|s| !s.trim().is_empty()) {
-                return Ok(());
-            }
-            let with_provider = provider.map_or(String::new(), |p| format!(" --provider {p}"));
-            let or_dictate = if dictation {
-                format!(
-                    ", or set {}=<speech model> for dictation only",
-                    goose_desktop::TRANSCRIPTION_MODEL_ENV
-                )
-            } else {
-                String::new()
-            };
-            anyhow::bail!(
-                "{name} needs a model: llmman launch {name}{with_provider} --model <model>{or_dictate}"
+    if let Some(model) = model {
+        if has_forwarded_model_flag(&name, extra_args) {
+            eprintln!(
+                "[llmman] {name}: the --model after -- wins over --model {model}, the one llmman resolved"
             );
         }
-        // No resolved model for a forwarded one to win over.
-        return Ok(());
-    };
-    if has_forwarded_model_flag(&name, extra_args) {
-        eprintln!(
-            "[llmman] {name}: the --model after -- wins over --model {model}, the one llmman resolved"
-        );
     }
-    Ok(())
 }
 
 /// Whether this integration accepts a forwarded model flag. Copilot and
@@ -576,58 +395,31 @@ fn has_flag(extra_args: &[String], long: &str, short: Option<&str>) -> bool {
 // Providers
 // ---------------------------------------------------------------------------
 
-/// Integrations `--provider` cannot drive, and why.
-///
-/// Refusing is the same call the catalog filter makes — a
-/// combination llmman cannot actually drive is absent, not offered and
-/// then broken at the first request.
-const PROVIDER_UNSUPPORTED: &[(&str, &str)] = &[
-    (
-        "kimi",
-        "llmman has not verified it with a provider-routed model",
-    ),
-    // Its key variable feeds a native Google client, and llmman has not
-    // verified that GEMINI_BASE_URL still redirects it here. Getting that
-    // wrong sends someone's OpenRouter key to Google, which is a worse
-    // outcome than `--provider gemini` not working — the placeholder this
-    // used to pass was harmless either way, a real key is not.
-    (
-        "gemini",
-        "llmman cannot confirm it would send the key here rather than to Google",
-    ),
-    // openclaw::launch_openclaw passes --custom-model-id only through
-    // onboarding, which runs once. Every later launch reuses whatever
-    // openclaw.json already names, so the provider reference would never
-    // reach the daemon and the session would quietly run on the old model.
-    (
-        "openclaw",
-        "it only takes a model during first-run onboarding",
-    ),
-    // Grok Build refuses `-m` values absent from the custom endpoint's
-    // `/v1/models` catalog. llmman's endpoint lists stored local models,
-    // not the synthetic provider or hybrid routing refs, so one of those
-    // launches would fail before making its first request.
-    (
-        "grok",
-        "its model catalog cannot represent llmman's provider or hybrid routing reference",
-    ),
-    // OMP discovers the Ollama catalog from /api/tags. That endpoint lists
-    // stored models, not the synthetic provider or hybrid routing refs the
-    // daemon accepts at request time, and OMP rejects a model absent from the
-    // catalog before it sends a request.
-    (
-        "omp",
-        "its Ollama catalog cannot represent llmman's provider or hybrid routing reference",
-    ),
-];
-
 /// Integrations llmman configures through a file on disk. They take a
 /// model on every launch, so `--provider` works, but they cannot carry
 /// the key: writing a real one into `~/.hermes/config.yaml` would persist
 /// a credential, which this feature promises not to do. They rely on
 /// `llmman serve` having the variable itself — which it only uses for a
 /// daemon nobody else can reach (see `reachable_only_locally`).
-const PROVIDER_NEEDS_DAEMON_KEY: &[&str] = &["hermes", "cline", "pi"];
+const PROVIDER_NEEDS_DAEMON_KEY: &[&str] = &["hermes", "cline", "pi", "omp", "openclaw"];
+
+/// Integrations that cannot be offered a hosted model; `--provider` is refused for them. OMP 19.1.1
+/// stops at startup on a model id naming two vendors ("ambiguous class ... `amazon` and `openai`
+/// tie"), as a hosted model's routing reference often does. Gemini CLI and Kimi's Python CLI are
+/// not here: see their launchers.
+const STORED_ONLY: &[(&str, &str)] = &[(
+    "omp",
+    "omp stops at startup on a model id that names two vendors, as a hosted \
+     model's reference can (llmman.provider/amazon-bedrock/openai.gpt-5.4)",
+)];
+
+fn stored_only_reason(integration: &str) -> Option<&'static str> {
+    let name = integration.to_lowercase();
+    STORED_ONLY
+        .iter()
+        .find(|(id, _)| *id == name)
+        .map(|(_, why)| *why)
+}
 
 /// Integrations that declare a context window, and so are worth
 /// loading the model to read the real one back for. Keep in step with
@@ -642,7 +434,7 @@ fn declares_context_window(integration: &str) -> bool {
 
 fn check_provider_supported(integration: &str) -> anyhow::Result<()> {
     let name = integration.to_lowercase();
-    if let Some((_, why)) = PROVIDER_UNSUPPORTED.iter().find(|(id, _)| *id == name) {
+    if let Some(why) = stored_only_reason(&name) {
         anyhow::bail!(
             "--provider does not work with {name}: {why}\n\
              Run it against a locally served model, or use another integration."
@@ -680,16 +472,14 @@ fn check_provider_supported(integration: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// What [`resolve_provider_model`] resolves. Named fields rather than a
-/// tuple: three of these are `Option`s, which a caller can drop by
-/// destructuring past them without the compiler saying so.
+/// What [`resolve_provider_model`] resolves, for a hybrid pair's hosted half.
+/// Named fields rather than a tuple: three of these are `Option`s, which a
+/// caller can drop by destructuring past them without the compiler saying so.
 struct ResolvedProvider {
-    /// The hosted model's full reference, as the daemon routes on it.
+    /// The hosted model's full reference, as the daemon routes it.
     reference: String,
     /// The key the integration authenticates with.
     api_key: String,
-    /// The thinking levels the catalog lists (see [`Thinking::Listed`]).
-    thinking: Option<Vec<String>>,
     /// The window the catalog says this model holds.
     context_window: Option<u64>,
     /// The most the catalog says it will emit in one reply (see
@@ -697,16 +487,17 @@ struct ResolvedProvider {
     max_output: Option<u32>,
 }
 
-/// Validates `--provider`/`--model` against the running daemon's catalog
-/// (see [`crate::daemon::provider`]), resolving the reference the daemon
-/// routes on, the key `integration` authenticates with, and what the
-/// catalog says about the model — see [`ResolvedProvider`].
+/// Validates the hosted half of an `--overflow-provider` pair against the
+/// running daemon's catalog (see [`crate::daemon::provider`]), resolving the
+/// reference the daemon routes on, the key `integration` authenticates with,
+/// and what the catalog says about the model.
 ///
-/// `key_travels_per_request` is false for the integrations in
-/// [`PROVIDER_NEEDS_DAEMON_KEY`], which get the placeholder because they
-/// cannot carry a real key — so this shell having one is beside the
-/// point, and demanding it would reject a perfectly good daemon that has
-/// it while this shell does not.
+/// The key travels per request in the integration's own Authorization
+/// header, never to disk or a command line: a pair is one model, so there
+/// is nothing in the agent to switch to (a launch that offers a list hands
+/// out a session instead, see [`keys`]). The placeholder goes instead for
+/// the integrations in [`PROVIDER_NEEDS_DAEMON_KEY`], which cannot carry
+/// one, and whenever the daemon's key is the one that matters.
 ///
 /// Every check here is one the daemon would otherwise make at first
 /// request, by which point the integration has already taken over the
@@ -716,87 +507,25 @@ struct ResolvedProvider {
 /// inside someone else's TUI.
 fn resolve_provider_model(
     provider: &str,
-    model: Option<&str>,
+    model: &str,
     integration: &str,
-    key_travels_per_request: bool,
 ) -> anyhow::Result<ResolvedProvider> {
     // Asked of the daemon, not models.dev: it routes the request, so it
     // is the authority on whether this provider exists — and on whether
-    // *it* has the key, which this shell cannot see.
-    let model = model.map(str::trim).filter(|m| !m.is_empty());
-    // Sent so a catalog that predates the model is refreshed, not warned about.
-    let entry = daemon::provider(provider, model)?;
-
-    let model = model.ok_or_else(|| {
-        anyhow::anyhow!(
-            "--provider {provider} also needs --model\n\n{}",
-            providers::example_models(&entry.name, &entry.model_ids())
-        )
-    })?;
-
+    // *it* has the key, which this shell cannot see. The model is sent so a
+    // catalog that predates it is refreshed, not warned about.
+    let entry = daemon::provider(provider, Some(model))?;
     entry.warn_unlisted(model);
-
-    // Read here, not left to the daemon, so a missing key names the
-    // variable to set in llmman's own output. It travels per request in
-    // the integration's own Authorization header (see client_api_key in
-    // cmd::serve), never to disk or a command line. The placeholder goes
-    // instead whenever the daemon's key is the one that matters — an
-    // integration that cannot carry one, or a shell without one where
-    // the daemon has it — or when the provider takes none at all
-    // (`key_optional`): it is what tells serve the header is not a
-    // credential.
-    //
     // A daemon requiring a key takes that header for it, so the provider
     // key cannot travel: the daemon's is the only one, and an
     // authenticated caller may spend it.
-    let daemon_authenticates = crate::auth::client_key().is_some();
-    let key = if key_travels_per_request && !daemon_authenticates {
-        entry.client_key()
-    } else {
-        None
-    };
-    let key = match (key, key_travels_per_request) {
-        (Some(key), true) => key,
-        (_, false) => {
-            // Fatal, not a warning: this integration cannot carry a key,
-            // so the daemon's is the only one its first request can use,
-            // and `key_usable` is the daemon's own word on whether it
-            // would spend it. Warning and handing off would surface as a
-            // 401 inside someone else's TUI.
-            anyhow::ensure!(
-                entry.key_usable || entry.key_optional,
-                "{integration} is configured through a file, so it cannot send an API key: \
-                 llmman serve needs a key of its own, and must be bound to loopback (or \
-                 require an API key) to spend it.\n\
-                 Where the daemon runs, {}, then restart it.",
-                entry.key_hint()
-            );
-            integration_key()
-        }
-        (None, true) if entry.daemon_key_usable() => {
-            if !daemon_authenticates {
-                eprintln!(
-                    "[llmman] warning: no API key for {} here; using the key llmman serve has",
-                    entry.name
-                );
-            }
-            integration_key()
-        }
-        (None, true) if entry.key_optional => integration_key(),
-        (None, true) if daemon_authenticates => anyhow::bail!(
-            "llmman serve requires an API key, so {integration} sends that one and cannot \
-             also carry a key for {}: llmman serve needs a key of its own.\n\
-             Where the daemon runs, {}, then restart it.",
-            entry.name,
-            entry.key_hint()
-        ),
-        (None, true) => anyhow::bail!("no API key for {} — {}", entry.name, entry.key_hint()),
-    };
-
+    let key = (keys::carries_key(integration) && crate::auth::client_key().is_none())
+        .then(|| keys::key_here(&entry))
+        .flatten();
+    keys::check_start(integration, &entry, key.is_some())?;
     Ok(ResolvedProvider {
         reference: providers::format_remote_ref(provider, model),
-        api_key: key,
-        thinking: entry.thinking_levels(model),
+        api_key: key.unwrap_or_else(integration_key),
         context_window: entry.context_window(model),
         max_output: entry.max_output(model),
     })
@@ -1073,7 +802,7 @@ fn accepts_prompt(answer: &str) -> bool {
 /// Integrations that cannot carry a `--variant` to llmman, and why.
 const VARIANT_UNSUPPORTED: &[(&str, &str)] = &[
     ("kimi", "llmman does not set its thinking yet"),
-    ("openclaw", "it only takes settings at onboarding"),
+    ("openclaw", "llmman does not set its thinking yet"),
     (
         "droid",
         "Droid does not support reasoning effort for custom models",
@@ -1142,11 +871,10 @@ fn spell_variant<'a>(integration: &str, variant: &'a str) -> anyhow::Result<&'a 
     })
 }
 
-/// A `--variant` and the model's other levels, as the integration spells
-/// them, for those configured with the list.
+/// A `--variant` as the integration spells it, for those configured with
+/// the list (each row's own levels come from the row).
 struct Effort<'a> {
     default: &'a str,
-    levels: Vec<&'a str>,
 }
 
 /// The flags that start `integration` at `effort`; opencode, qwen and
@@ -1174,54 +902,53 @@ fn effort_args(integration: &str, effort: &str) -> Vec<String> {
 // Launch dispatcher
 // ---------------------------------------------------------------------------
 
-/// `api_key` is what the integration is told to authenticate with:
-/// [`providers::PLACEHOLDER_API_KEY`] for a locally-served model, or the
-/// real provider key under `--provider`.
+/// Starts `name` on what `plan` resolved. `plan.api_key` is what the
+/// integration is told to authenticate with: [`providers::PLACEHOLDER_API_KEY`]
+/// for a model the daemon serves itself, or a session token that stands
+/// for the provider keys this shell holds (see [`keys`]), so the agent can
+/// switch provider without any one key travelling to another provider.
 ///
-/// Passing the real one is what makes `--provider` work against a daemon
-/// that is *already running* — `ensure_server` reuses one, so a daemon
-/// started before the key was exported would otherwise never see it (see
-/// `client_api_key` in cmd::serve). Only the launchers that pass a key in
-/// the integration's environment can do this; the ones that go through a
-/// config file on disk keep the placeholder rather than persist a
-/// credential, and need the key in the daemon's own environment.
+/// Only the launchers that pass a credential in the integration's
+/// environment can carry it; the ones that go through a config file on
+/// disk keep the placeholder rather than persist one, and need the
+/// provider's key in the daemon's own environment.
 ///
-/// `context_window` is the window a request may fill, and the only
-/// context figure an integration is told: a local model's loaded one
-/// (see [`local_context_window`]), a `--provider` model's catalog one,
-/// or a pair's larger half (see [`pair_context_window`]); `None` when
-/// none of them is known. codex and kimi substitute a fallback for a
-/// `None`.
-#[allow(clippy::too_many_arguments)]
+/// `plan.context_window` is the window a request may fill, and the only
+/// context figure an integration is told: a local model's loaded one (see
+/// [`local_context_window`]), a provider model's catalog one, or a pair's
+/// larger half (see [`pair_context_window`]); `None` when none of them is
+/// known. codex and kimi substitute a fallback for a `None`.
 fn launch(
     name: &str,
-    model: &str,
-    api_key: &str,
-    thinking: Option<&Thinking>,
+    plan: &plan::Plan,
     variant: Option<&str>,
-    vision: bool,
-    context_window: Option<u64>,
-    max_output: Option<u32>,
     extra_args: &[String],
     optimizer: Optimizer,
 ) -> anyhow::Result<()> {
+    let plan::Plan {
+        model,
+        api_key,
+        thinking,
+        vision,
+        context_window,
+        max_output,
+        models,
+    } = plan;
+    let (model, api_key, vision) = (model.as_str(), api_key.as_str(), *vision);
+    let (context_window, max_output) = (*context_window, *max_output);
     let name = name.to_lowercase();
     // Unknown levels are a guess: add the one asked for, don't refuse it.
     let widened = variant
         .filter(|_| thinking.is_none())
         .map(unknown_levels_with);
-    let thinking = widened.as_ref().or(thinking);
+    let thinking = widened.as_ref().or(thinking.as_ref());
+    let models = with_widened_start(models, widened.as_ref());
+    let models = &*models;
     if let Some(variant) = variant {
         check_variant(model, thinking, variant)?;
     }
     let effort = variant.map(|v| spell_variant(&name, v)).transpose()?;
-    let listed = effort.map(|default| Effort {
-        default,
-        levels: thinking_choices(thinking)
-            .into_iter()
-            .filter_map(|c| spell_variant(&name, c).ok())
-            .collect(),
-    });
+    let listed = effort.map(|default| Effort { default });
     let extra_args = &[
         effort.map_or_else(Vec::new, |e| effort_args(&name, e)),
         extra_args.to_vec(),
@@ -1234,7 +961,14 @@ fn launch(
             .and_then(Thinking::template)
             .is_some_and(|t| t.thinks);
     match name.as_str() {
-        "claude" => claude::launch_claude(model, api_key, context_window, extra_args, optimizer),
+        "claude" => claude::launch_claude(
+            model,
+            api_key,
+            context_window,
+            models,
+            extra_args,
+            optimizer,
+        ),
         "opencode" => opencode::launch_opencode(
             model,
             api_key,
@@ -1243,35 +977,29 @@ fn launch(
             vision,
             context_window,
             max_output,
+            models,
             extra_args,
             optimizer,
         ),
-        "codex" => codex::launch_codex(
-            model,
-            api_key,
-            vision,
-            context_window,
-            extra_args,
-            optimizer,
-        ),
-        "pi" => pi::launch_pi(model, reasons, vision, context_window, extra_args),
-        "omp" => omp::launch_omp(model, reasons, vision, context_window, extra_args),
-        "cline" => cline::launch_cline(model, extra_args),
-        "aider" => aider::launch_aider(model, api_key, extra_args),
-        "copilot" | "copilot-cli" => copilot::launch_copilot(model, api_key, extra_args),
-        "droid" => droid::launch_droid(model, api_key, vision, max_output, extra_args),
-        "kimi" => kimi::launch_kimi(model, api_key, context_window, extra_args),
-        "gemini" => gemini::launch_gemini(model, api_key, extra_args),
-        "agy" => agy::launch_agy(model, api_key, extra_args),
-        "hermes" => hermes::launch_hermes(model, vision, extra_args),
-        "openclaw" => openclaw::launch_openclaw(model, context_window, extra_args),
-        "qwen" => qwen::launch_qwen(model, api_key, vision, listed.as_ref(), extra_args),
-        "dsh" => dsh::launch_dsh(model, api_key, vision, listed.as_ref(), extra_args),
-        "goose" => goose::launch_goose(model, api_key, extra_args),
-        "goose-desktop" => goose_desktop::launch_goose_desktop(model, api_key, extra_args),
-        "grok" => grok::launch_grok(model, api_key, listed.as_ref(), extra_args),
-        "docker-agent" => docker_agent::launch_docker_agent(model, api_key, extra_args),
-        "vibe" => vibe::launch_vibe(model, api_key, context_window, extra_args),
+        "codex" => codex::launch_codex(model, api_key, models, extra_args, optimizer),
+        "pi" => pi::launch_pi(model, reasons, vision, context_window, models, extra_args),
+        "omp" => omp::launch_omp(model, reasons, vision, context_window, models, extra_args),
+        "cline" => cline::launch_cline(model, models, extra_args),
+        "aider" => aider::launch_aider(model, api_key, models, extra_args),
+        "copilot" | "copilot-cli" => copilot::launch_copilot(model, api_key, models, extra_args),
+        "droid" => droid::launch_droid(model, api_key, vision, max_output, models, extra_args),
+        "kimi" => kimi::launch_kimi(model, api_key, context_window, models, extra_args),
+        "gemini" => gemini::launch_gemini(model, api_key, models, extra_args),
+        "agy" => agy::launch_agy(model, api_key, models, extra_args),
+        "hermes" => hermes::launch_hermes(model, vision, models, extra_args),
+        "openclaw" => openclaw::launch_openclaw(model, models, extra_args),
+        "qwen" => qwen::launch_qwen(model, api_key, vision, listed.as_ref(), models, extra_args),
+        "dsh" => dsh::launch_dsh(model, api_key, vision, listed.as_ref(), models, extra_args),
+        "goose" => goose::launch_goose(model, api_key, models, extra_args),
+        "goose-desktop" => goose_desktop::launch_goose_desktop(model, api_key, models, extra_args),
+        "grok" => grok::launch_grok(model, api_key, listed.as_ref(), models, extra_args),
+        "docker-agent" => docker_agent::launch_docker_agent(model, api_key, models, extra_args),
+        "vibe" => vibe::launch_vibe(model, api_key, context_window, models, extra_args),
         other => Err(unknown_integration(other)),
     }
 }
@@ -1297,7 +1025,11 @@ fn unknown_integration(name: &str) -> anyhow::Error {
 
 /// Integrations whose launcher writes their configuration to files
 /// under the home directory, rather than handing it over in the
-/// environment and arguments alone.
+/// environment and arguments alone. (An integration that writes a file
+/// only for a list to switch among, such as goose, vibe, kimi or aider,
+/// is not one: with nothing to switch to it writes none, which is what
+/// `--sandbox openshell` is given. Gemini CLI reads its base URL only
+/// under a login saved in its home, so it cannot run there at all.)
 const CONFIGURED_BY_FILE: &[&str] = &[
     "agy",
     "cline",
@@ -1305,6 +1037,7 @@ const CONFIGURED_BY_FILE: &[&str] = &[
     "docker-agent",
     "dsh",
     "droid",
+    "gemini",
     "grok",
     "hermes",
     "omp",
@@ -1344,7 +1077,7 @@ fn sandbox_state(name: &str) -> anyhow::Result<Vec<sandbox::State>> {
             Dir(env_dir("GH_CONFIG_DIR").unwrap_or_else(|| config.join("gh"))),
         ],
         "droid" => vec![Dir(droid::droid_home()?)],
-        "kimi" => vec![Dir(home.join(".kimi"))],
+        "kimi" => vec![Dir(kimi::kimi_share_dir()?), Dir(kimi::kimi_code_home()?)],
         "vibe" => vec![Dir(
             env_dir("VIBE_HOME").unwrap_or_else(|| home.join(".vibe"))
         )],
@@ -1368,6 +1101,12 @@ fn sandbox_state(name: &str) -> anyhow::Result<Vec<sandbox::State>> {
                 Dir(data.join("goose")),
                 Dir(state.join("goose")),
             ];
+            // Where goose finds its custom providers, which `GOOSE_PATH_ROOT`
+            // or Windows move.
+            let providers = Dir(goose::goose_config_dir()?);
+            if !dirs.contains(&providers) {
+                dirs.push(providers);
+            }
             if name == "goose-desktop" {
                 dirs.push(Dir(goose_desktop::goose_desktop_user_data(&home, &config)));
                 // macOS keeps the app's preferences outside `userData`,
@@ -1405,6 +1144,14 @@ fn node_user_profile() -> Option<PathBuf> {
 /// `$var`, else `default` under `home`.
 fn xdg_dir(home: &Path, var: &str, default: &str) -> PathBuf {
     env_dir(var).unwrap_or_else(|| home.join(default))
+}
+
+/// `$var`, else `default` under the home directory (looked up only then).
+fn env_dir_or_home(var: &str, default: &str) -> anyhow::Result<PathBuf> {
+    match env_dir(var) {
+        Some(dir) => Ok(dir),
+        None => Ok(dirs::home_dir().context("no home directory")?.join(default)),
+    }
 }
 
 /// The thinking choices a model offers an integration, in cycle order.
@@ -1457,6 +1204,24 @@ fn unknown_levels_with(variant: &str) -> Thinking {
         .map(String::from)
         .collect();
     Thinking::Listed(levels)
+}
+
+/// `models`, with the starting row's thinking choices replaced by `widened`
+/// when it has none of its own, so an adapter reading the row agrees with
+/// the effort the launch starts at.
+fn with_widened_start<'a>(
+    models: &'a models::ModelList,
+    widened: Option<&Thinking>,
+) -> std::borrow::Cow<'a, models::ModelList> {
+    let Some(widened) = widened else {
+        return std::borrow::Cow::Borrowed(models);
+    };
+    if models.start().is_none_or(|start| start.thinking.is_some()) {
+        return std::borrow::Cow::Borrowed(models);
+    }
+    let mut entries = models.entries().to_vec();
+    entries[0].thinking = Some(widened.choices().into_iter().map(String::from).collect());
+    std::borrow::Cow::Owned(models::ModelList::of(entries))
 }
 
 /// The window the daemon serves for `model`, read back from the loaded
@@ -1534,7 +1299,87 @@ fn exec_with_env_removing(
 ) -> anyhow::Result<()> {
     let code = run_with_env_removing(bin, args, extra_env, remove_env);
     hdrm::stop();
+    models::finish();
     std::process::exit(code?);
+}
+
+/// The agent's process id while it runs, which a SIGTERM to this process
+/// is passed on to.
+#[cfg(unix)]
+static AGENT_PID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+/// Whether a SIGTERM arrived, for one that comes before the agent starts.
+#[cfg(unix)]
+static TERMINATED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Keeps this process alive through a Ctrl-C or closed terminal, which reach the agent too, so it
+/// can remove the launch's files and key session afterwards ([`models::finish`]). A SIGTERM, which
+/// reaches only this process, is passed on ([`wait_for_agent`]). Handlers, not `SIG_IGN`: a handler
+/// resets on exec, so the agent keeps the default behaviour.
+#[cfg(unix)]
+fn outlive_interrupts() {
+    extern "C" fn outlive(_: libc::c_int) {}
+    for (signal, handler) in [
+        (libc::SIGINT, outlive as extern "C" fn(libc::c_int)),
+        (libc::SIGHUP, outlive),
+        (libc::SIGTERM, pass_terminate_on),
+    ] {
+        // SAFETY: the handlers only touch atomics and call kill(2).
+        unsafe { libc::signal(signal, handler as libc::sighandler_t) };
+    }
+}
+
+/// The SIGTERM handler: passes it on to the agent, if one runs.
+#[cfg(unix)]
+extern "C" fn pass_terminate_on(_: libc::c_int) {
+    use std::sync::atomic::Ordering::SeqCst;
+    TERMINATED.store(true, SeqCst);
+    let pid = AGENT_PID.load(SeqCst);
+    if pid > 0 {
+        // SAFETY: kill(2) is async-signal-safe.
+        unsafe { libc::kill(pid, libc::SIGTERM) };
+    }
+}
+
+/// Windows: tokio's listener installs a console control handler that answers "handled" while a
+/// listener exists, which keeps the process alive when Ctrl-C reaches the agent on the same
+/// console. One is kept for the life of the process and never polled; registering needs no runtime.
+#[cfg(windows)]
+fn outlive_interrupts() {
+    static LISTENER: std::sync::Mutex<Option<tokio::signal::windows::CtrlC>> =
+        std::sync::Mutex::new(None);
+    let mut listener = LISTENER.lock().unwrap_or_else(|e| e.into_inner());
+    if listener.is_none() {
+        match tokio::signal::windows::ctrl_c() {
+            Ok(registered) => *listener = Some(registered),
+            Err(e) => eprintln!(
+                "[llmman] warning: could not register a Ctrl-C handler ({e}): Ctrl-C will end \
+                 llmman before it removes its launch files and closes its key session"
+            ),
+        }
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn outlive_interrupts() {}
+
+/// Runs `cmd` to its end, and, on Unix, passes a SIGTERM to this process
+/// on to it (see [`outlive_interrupts`]).
+fn wait_for_agent(cmd: &mut Command) -> std::io::Result<std::process::ExitStatus> {
+    let mut child = cmd.spawn()?;
+    #[cfg(unix)]
+    {
+        use std::sync::atomic::Ordering::SeqCst;
+        let pid = child.id() as libc::pid_t;
+        AGENT_PID.store(pid, SeqCst);
+        if TERMINATED.load(SeqCst) {
+            // SAFETY: `pid` is the child this call spawned and has not reaped.
+            unsafe { libc::kill(pid, libc::SIGTERM) };
+        }
+    }
+    let status = child.wait();
+    #[cfg(unix)]
+    AGENT_PID.store(0, std::sync::atomic::Ordering::SeqCst);
+    status
 }
 
 /// Runs the integration — in the `--sandbox`, when there is one — and
@@ -1549,6 +1394,7 @@ fn run_with_env_removing(
     extra_env: &[(&str, &str)],
     remove_env: &[&str],
 ) -> anyhow::Result<i32> {
+    outlive_interrupts();
     // The inherited environment, overlaid with OLLAMA_HOST and the
     // integration's variables, later ones winning.
     let mut overlay = vec![("OLLAMA_HOST".to_string(), server())];
@@ -1571,9 +1417,8 @@ fn run_with_env_removing(
         cmd.env_remove(name);
     }
 
-    let status = cmd
-        .status()
-        .with_context(|| format!("failed to run {}", bin.display()))?;
+    let status =
+        wait_for_agent(&mut cmd).with_context(|| format!("failed to run {}", bin.display()))?;
     Ok(status.code().unwrap_or(1))
 }
 
@@ -1595,6 +1440,29 @@ mod tests {
         assert!(check_installed("not-an-integration").is_ok());
     }
 
+    /// A SIGTERM to llmman reaches the agent, and llmman waits for it.
+    #[cfg(unix)]
+    #[test]
+    fn a_sigterm_is_passed_on_to_the_agent_and_waited_for() {
+        use std::os::unix::process::ExitStatusExt;
+        use std::sync::atomic::Ordering::SeqCst;
+        let waiter = std::thread::spawn(|| {
+            let mut cmd = Command::new("sleep");
+            cmd.arg("60");
+            wait_for_agent(&mut cmd).unwrap()
+        });
+        let start = std::time::Instant::now();
+        while AGENT_PID.load(SeqCst) == 0 {
+            assert!(start.elapsed().as_secs() < 10, "no agent started");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        pass_terminate_on(libc::SIGTERM);
+        let status = waiter.join().unwrap();
+        TERMINATED.store(false, SeqCst);
+        assert_eq!(status.signal(), Some(libc::SIGTERM));
+        assert_eq!(AGENT_PID.load(SeqCst), 0);
+    }
+
     #[test]
     fn agy_is_listed_as_an_integration() {
         let agy = INTEGRATIONS.iter().find(|i| i.name == "agy").unwrap();
@@ -1606,10 +1474,18 @@ mod tests {
         let copilot = INTEGRATIONS.iter().find(|i| i.name == "copilot").unwrap();
         assert_eq!(copilot.binary, "copilot");
         for id in ["copilot", "copilot-cli"] {
-            assert!(MODEL_REQUIRED.contains(&id));
             assert!(MODEL_FLAG_FORWARDED.contains(&id));
-            assert!(!PROVIDER_UNSUPPORTED.iter().any(|(name, _)| *name == id));
             assert_eq!(effort_args(id, "high"), ["--reasoning-effort", "high"]);
+        }
+    }
+
+    #[test]
+    fn omp_alone_is_refused_a_provider_and_offered_the_pulled_models_only() {
+        let refused = check_provider_supported("omp").unwrap_err().to_string();
+        assert!(refused.contains("two vendors"), "{refused}");
+        assert!(stored_only_reason("OMP").is_some());
+        for id in ["kimi", "gemini", "grok", "pi", "openclaw", "droid"] {
+            assert!(stored_only_reason(id).is_none(), "{id}");
         }
     }
 
@@ -1617,35 +1493,20 @@ mod tests {
     fn droid_is_a_file_configured_model_required_integration() {
         let droid = INTEGRATIONS.iter().find(|i| i.name == "droid").unwrap();
         assert_eq!(droid.binary, "droid");
-        assert!(MODEL_REQUIRED.contains(&"droid"));
         assert!(MODEL_FLAG_FORWARDED.contains(&"droid"));
         assert!(CONFIGURED_BY_FILE.contains(&"droid"));
         assert!(check_provider_supported("droid").is_ok());
         assert!(VARIANT_UNSUPPORTED.iter().any(|(name, _)| *name == "droid"));
     }
 
-    /// Every integration `--provider` refuses must be one `launch`
-    /// actually dispatches, or the refusal is for a name nobody can type
-    /// and the real one is still silently broken.
+    /// Every integration that depends on the daemon holding the key must
+    /// be a real one: a name nobody can type protects nobody.
     #[test]
-    fn every_provider_unsupported_integration_is_a_real_one() {
-        for (id, why) in PROVIDER_UNSUPPORTED {
-            assert!(integration(id).is_some(), "{id} is not an integration");
-            assert!(!why.is_empty(), "{id} has no reason");
-            assert!(check_provider_supported(id).is_err(), "{id} was accepted");
-            // Case-insensitively, the way `launch` dispatches.
-            assert!(check_provider_supported(&id.to_uppercase()).is_err());
-        }
-        // Same for the ones that depend on the daemon holding the key:
-        // a name nobody can type protects nobody.
+    fn every_daemon_key_integration_is_a_real_one() {
         for id in PROVIDER_NEEDS_DAEMON_KEY {
             assert!(
                 INTEGRATIONS.iter().any(|i| i.name == *id),
                 "{id} is not an integration"
-            );
-            assert!(
-                !PROVIDER_UNSUPPORTED.iter().any(|(u, _)| u == id),
-                "{id} is both refused outright and expected to work"
             );
         }
     }
@@ -1739,37 +1600,24 @@ mod tests {
         }
     }
 
-    /// Every integration `check_model_flag` holds to a model must be one
-    /// `launch` dispatches; it is refused without one, under `--provider`
-    /// too, and a `--model` after `--` is let through.
+    /// No integration is refused for lacking a model: `check_model_flag`
+    /// only says when a `--model` after `--` wins, and only for the
+    /// launchers that yield to it.
     #[test]
-    fn model_required_integrations_are_refused_without_a_model() {
-        let none: Vec<String> = vec![];
-        for id in MODEL_REQUIRED {
-            assert!(integration(id).is_some(), "{id} is not an integration");
-            assert!(check_model_flag(id, None, None, None, &none).is_err());
-            assert!(check_model_flag(id, Some(" "), None, None, &none).is_err());
-            assert!(check_model_flag(&id.to_uppercase(), None, None, None, &none).is_err());
-            let err = check_model_flag(id, None, Some("openrouter"), None, &none).unwrap_err();
-            assert!(
-                err.to_string().contains("--provider openrouter --model"),
-                "{err}"
-            );
-            assert!(check_model_flag(id, Some("m"), None, None, &none).is_ok());
-            let forwarded = vec!["--model".to_string(), "theirs".to_string()];
-            assert!(check_model_flag(id, Some("m"), None, None, &forwarded).is_ok());
+    fn a_missing_model_is_no_longer_refused() {
+        let forwarded = vec!["--model".to_string(), "theirs".to_string()];
+        for i in INTEGRATIONS {
+            check_model_flag(i.name, None, &[]);
+            check_model_flag(i.name, Some(" "), &forwarded);
+            check_model_flag(&i.name.to_uppercase(), Some("m"), &forwarded);
         }
-        assert!(check_model_flag("claude", None, None, None, &none).is_ok());
         // The "yours wins" warning is only claimed for launchers that
         // actually yield to it; dsh has no `--model` flag to yield to.
         for id in MODEL_FLAG_FORWARDED {
             assert!(integration(id).is_some(), "{id} is not an integration");
         }
         assert!(!MODEL_FLAG_FORWARDED.contains(&"dsh"));
-        // claude yields without requiring a model, so the warning must not
-        // depend on `MODEL_REQUIRED`.
         assert!(MODEL_FLAG_FORWARDED.contains(&"claude"));
-        assert!(!MODEL_REQUIRED.contains(&"claude"));
     }
 
     /// goose carries the key in its own environment, so `--provider`
@@ -1854,52 +1702,21 @@ mod tests {
         assert!(!CONFIGURED_BY_FILE.contains(&"goose-desktop"));
         // It has no --model of its own to yield to.
         assert!(!MODEL_FLAG_FORWARDED.contains(&"goose-desktop"));
-        // Needs a model, bar the dictation-only launch below.
-        assert!(MODEL_REQUIRED.contains(&"goose-desktop"));
     }
 
     #[test]
-    fn goose_desktop_launches_without_a_model_only_for_dictation() {
-        let none: Vec<String> = vec![];
-        let speech = Some("hf.co/ggml-org/Voxtral-Mini-3B-2507-GGUF:Q4_K_M");
-        for id in ["goose-desktop", "GOOSE-DESKTOP"] {
-            assert!(check_model_flag(id, None, None, speech, &none).is_ok());
-            assert!(check_model_flag(id, Some("m"), None, speech, &none).is_ok());
-            for blank in [None, Some(""), Some(" \t\n")] {
-                let err = check_model_flag(id, None, None, blank, &none).unwrap_err();
-                assert!(err
-                    .to_string()
-                    .contains("--model <model>, or set OPENAI_TRANSCRIPTION_MODEL="));
-            }
-            let err = check_model_flag(id, None, Some("openrouter"), speech, &none).unwrap_err();
-            assert!(err
-                .to_string()
-                .contains("--provider openrouter --model <model>"));
-            assert!(!err.to_string().contains("OPENAI_TRANSCRIPTION_MODEL"));
-        }
-        // No other integration, the goose CLI included, is let off.
-        for id in MODEL_REQUIRED.iter().filter(|id| **id != "goose-desktop") {
-            assert!(check_model_flag(id, None, None, speech, &none).is_err());
-        }
-    }
-
-    #[test]
-    fn cline_is_model_required_and_supports_provider_routes() {
+    fn cline_supports_provider_routes() {
         assert!(INTEGRATIONS.iter().any(|i| i.name == "cline"));
-        assert!(MODEL_REQUIRED.contains(&"cline"));
         assert!(MODEL_FLAG_FORWARDED.contains(&"cline"));
-        assert!(!PROVIDER_UNSUPPORTED.iter().any(|(id, _)| *id == "cline"));
         assert!(PROVIDER_NEEDS_DAEMON_KEY.contains(&"cline"));
         assert!(check_provider_supported("cline").is_ok());
     }
 
     #[test]
-    fn grok_is_model_required_and_refuses_unrepresentable_provider_routes() {
+    fn grok_takes_provider_routes() {
         assert!(INTEGRATIONS.iter().any(|i| i.name == "grok"));
-        assert!(MODEL_REQUIRED.contains(&"grok"));
         assert!(MODEL_FLAG_FORWARDED.contains(&"grok"));
-        let error = check_provider_supported("grok").unwrap_err().to_string();
-        assert!(error.contains("model catalog"), "{error}");
+        assert!(check_provider_supported("grok").is_ok());
         assert!(!PROVIDER_NEEDS_DAEMON_KEY.contains(&"grok"));
     }
 
@@ -2033,7 +1850,6 @@ mod tests {
     #[test]
     fn dsh_is_a_real_integration_and_not_on_a_provider_refusal_list() {
         assert!(INTEGRATIONS.iter().any(|i| i.name == "dsh"));
-        assert!(!PROVIDER_UNSUPPORTED.iter().any(|(id, _)| *id == "dsh"));
         assert!(!PROVIDER_NEEDS_DAEMON_KEY.contains(&"dsh"));
     }
 
@@ -2042,7 +1858,7 @@ mod tests {
     // -----------------------------------------------------------------
 
     /// Needs a model, but carries its key in the environment, so it is on
-    /// neither `PROVIDER_UNSUPPORTED` nor `PROVIDER_NEEDS_DAEMON_KEY` —
+    /// not on `PROVIDER_NEEDS_DAEMON_KEY` —
     /// and not on `MODEL_FLAG_FORWARDED` either, since a forwarded
     /// `--model` is refused rather than obeyed.
     #[test]
@@ -2052,7 +1868,6 @@ mod tests {
             .find(|i| i.name == "docker-agent")
             .expect("docker-agent is not an integration");
         assert_eq!(entry.binary, "docker-agent");
-        assert!(MODEL_REQUIRED.contains(&"docker-agent"));
         assert!(!MODEL_FLAG_FORWARDED.contains(&"docker-agent"));
         assert!(check_provider_supported("docker-agent").is_ok());
         assert!(!PROVIDER_NEEDS_DAEMON_KEY.contains(&"docker-agent"));
@@ -2072,6 +1887,40 @@ mod tests {
     }
 
     // -- --variant ---------------------------------------------------------
+
+    /// The widened levels reach the starting row, so dsh's default effort is
+    /// among the efforts it advertises and Grok's metadata agrees with `--effort`.
+    #[test]
+    fn unknown_levels_with_a_variant_widen_the_starting_row() {
+        let list = models::ModelList::of(vec![
+            models::ModelEntry::unlisted("m"),
+            models::ModelEntry::unlisted("other"),
+        ]);
+        assert_eq!(list.start().unwrap().thinking, None);
+        let widened = unknown_levels_with("xhigh");
+        let out = with_widened_start(&list, Some(&widened));
+        let start = out.start().unwrap();
+        assert!(
+            start
+                .thinking
+                .as_ref()
+                .unwrap()
+                .iter()
+                .any(|l| l == "xhigh"),
+            "{:?}",
+            start.thinking
+        );
+        assert_eq!(start.variants(), widened.choices());
+        assert_eq!(out.entries()[1], list.entries()[1]);
+        // Nothing widened, or levels already known: the list is untouched.
+        assert_eq!(*with_widened_start(&list, None), list);
+        let known = models::ModelEntry {
+            thinking: Some(vec!["low".into()]),
+            ..models::ModelEntry::unlisted("m")
+        };
+        let known = models::ModelList::of(vec![known]);
+        assert_eq!(*with_widened_start(&known, Some(&widened)), known);
+    }
 
     /// A model with unknown levels (`None`) takes any effort level, and
     /// opencode finds it among its variants; one with known levels still
@@ -2230,6 +2079,30 @@ mod tests {
         .args;
         let err = run(&args).unwrap_err().to_string();
         assert!(err.contains("openshell cannot run opencode"), "{err}");
+    }
+
+    /// Gemini CLI reads its base URL only under a login saved in its home,
+    /// which OpenShell never receives.
+    #[cfg(not(windows))]
+    #[test]
+    fn gemini_is_refused_where_the_sandbox_gets_no_files() {
+        #[derive(clap::Parser)]
+        struct Cli {
+            #[command(flatten)]
+            args: LaunchArgs,
+        }
+        let args = <Cli as clap::Parser>::try_parse_from([
+            "l",
+            "gemini",
+            "--sandbox",
+            "openshell",
+            "--model",
+            "m",
+        ])
+        .unwrap()
+        .args;
+        let err = run(&args).unwrap_err().to_string();
+        assert!(err.contains("openshell cannot run gemini"), "{err}");
     }
 
     /// A bare `--sandbox` is `--sandbox sbx`, and a named one is kept.
