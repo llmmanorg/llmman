@@ -863,3 +863,51 @@ fn clients_reach_a_serve_on_port_0_while_it_holds_its_record() {
     );
     assert!(started.elapsed() < std::time::Duration::from_secs(30));
 }
+
+#[cfg(unix)]
+#[test]
+fn clients_name_the_record_of_a_port_0_serve_from_an_earlier_version() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let home = tempfile::tempdir().unwrap();
+    let data_dir = home.path().join(".local/share/llmman");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    // An earlier version's daemon holds the port lock and its record, both
+    // readable by everyone.
+    let hold = |name: &str| {
+        let path = data_dir.join(name);
+        std::fs::write(&path, "").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        file.lock().unwrap();
+        file
+    };
+    let _lock = hold("serve-127.0.0.1-0.lock");
+    let _record = hold("serve-127.0.0.1-0-47811.port");
+
+    let pull = ["pull", "hf.co/nobody/nothing-GGUF:Q4_0"];
+    for (args, no_autostart) in [(&["ps"][..], false), (&pull, false), (&pull, true)] {
+        let mut cmd = llmman();
+        cmd.env_clear()
+            .env("HOME", home.path())
+            .env("PATH", "/usr/bin:/bin")
+            .env("LLMMAN_HOST", "127.0.0.1:0")
+            .args(args);
+        if no_autostart {
+            cmd.env("LLMMAN_NO_AUTOSTART", "1");
+        }
+        let out = cmd.output().unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        // The client's own words: a daemon it started would also name the
+        // record, but only after its holder wait.
+        assert!(
+            !out.status.success()
+                && stderr.contains(
+                    "an llmman serve is running for this LLMMAN_HOST, but clients ignore its \
+                     record"
+                )
+                && stderr.contains("serve-127.0.0.1-0-47811.port"),
+            "{args:?}: {stderr}"
+        );
+    }
+}

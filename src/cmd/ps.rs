@@ -58,12 +58,14 @@ struct PsModel {
 /// precondition, since if there's no daemon there's nothing running to list.
 pub fn run(args: &PsArgs) -> anyhow::Result<()> {
     if !crate::daemon::server_alive() {
+        crate::daemon::check_legacy_port_record()?;
         anyhow::bail!(
             "llmman serve is not running (nothing is loaded) — start it with `llmman serve`"
         );
     }
 
-    let resp: PsResponse = crate::daemon::get_json("/api/ps")?;
+    let origin = crate::daemon::server();
+    let resp: PsResponse = crate::daemon::get_json_at(&origin, "/api/ps")?;
     let mut models: Vec<_> = resp
         .models
         .into_iter()
@@ -164,10 +166,7 @@ pub fn run(args: &PsArgs) -> anyhow::Result<()> {
     }
     // On stderr, so the table stays as scripts expect.
     if crate::daemon::os_picks_port() {
-        eprintln!(
-            "[llmman] llmman serve is on {}, the port the OS picked",
-            crate::daemon::server()
-        );
+        eprintln!("[llmman] llmman serve is on {origin}, the port the OS picked");
     }
     crate::pager::emit("ps", &out, !args.no_pager)
 }
