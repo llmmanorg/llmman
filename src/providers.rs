@@ -64,7 +64,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::Context;
@@ -268,6 +268,27 @@ pub const REMOTE_PREFIX: &str = "llmman.provider/";
 /// `cmd::serve` must never forward it to a real provider.
 pub const PLACEHOLDER_API_KEY: &str = "llmman";
 
+/// The other stand-ins clients send for "no key": hermes substitutes
+/// `no-key-required` for a placeholder of ours, and an Ollama client says
+/// `ollama-local`. Like [`PLACEHOLDER_API_KEY`] they are no credential, and
+/// forwarding one to a provider is a certain 401 and a key-shaped string
+/// sent where it means nothing.
+pub fn is_placeholder_key(key: &str) -> bool {
+    matches!(
+        key,
+        PLACEHOLDER_API_KEY | "no-key-required" | "ollama-local"
+    )
+}
+
+/// What every session token starts with, so a request's key is told from a
+/// session without a lookup and a token is never taken for a provider's key.
+pub const SESSION_TOKEN_PREFIX: &str = "llmman-session-";
+
+/// Whether `value` is a launch session's token rather than a provider's key.
+pub fn is_session_token(value: &str) -> bool {
+    value.starts_with(SESSION_TOKEN_PREFIX)
+}
+
 /// Encodes `provider` + `model` into the single reference that travels in
 /// a request's `"model"` field. Inverse of [`split_remote_ref`].
 pub fn format_remote_ref(provider: &str, model: &str) -> String {
@@ -350,6 +371,131 @@ pub struct Model {
     /// [`thinking_levels_of`]). Empty for a model that does not reason;
     /// `None` where the catalog does not say.
     pub thinking: Option<Vec<String>>,
+    /// What the catalog says the model is and takes; see [`Caps`].
+    pub caps: Caps,
+    /// models.dev's `release_date`, `YYYY-MM-DD` or `YYYY-MM`; `None` where
+    /// the catalog (or a cache that predates the field) has none.
+    pub released: Option<String>,
+}
+
+/// What models.dev says a model is and takes. The default is what a model
+/// the catalog says nothing about gets: a chat model, text only.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Caps {
+    /// Whether it answers chat, as opposed to producing embeddings,
+    /// images, video or speech, transcribing audio or reranking: models.dev's
+    /// `type`, else its output modalities. A realtime model speaks a
+    /// socket protocol, not chat completions, so it is not one either.
+    pub chat: bool,
+    /// Whether it takes images in (`modalities.input`).
+    pub vision: bool,
+    /// models.dev's `tool_call`; `None` where it says nothing.
+    pub tools: Option<bool>,
+}
+
+impl Default for Caps {
+    fn default() -> Self {
+        Self {
+            chat: true,
+            vision: false,
+            tools: None,
+        }
+    }
+}
+
+impl Caps {
+    /// What a model known by its id alone is taken for (a provider defined
+    /// in `llmman.conf`, whose `/v1/models` says nothing else): a chat
+    /// model unless its id names another kind, as embedding, speech,
+    /// transcription, image and video models and rerankers do.
+    pub fn of_id(id: &str) -> Self {
+        let id = id.to_ascii_lowercase();
+        let other = [
+            "embed",
+            "whisper",
+            "transcri",
+            "tts",
+            "speech",
+            "image",
+            "video",
+            "rerank",
+            "moderation",
+            "dall-e",
+            "sora",
+        ]
+        .iter()
+        .any(|word| id.contains(word));
+        Self {
+            chat: !other,
+            ..Self::default()
+        }
+    }
+}
+
+/// What [`default_model`] looks at in one chat model.
+#[derive(Debug, Clone, Copy)]
+pub struct Candidate<'a> {
+    pub id: &'a str,
+    /// models.dev's `tool_call`; `None` where it says nothing.
+    pub tools: Option<bool>,
+    /// Dollars per million input tokens; `None` where there is no price.
+    pub input_price: Option<f64>,
+    /// `release_date` (`YYYY-MM-DD` or `YYYY-MM`, which compare as text).
+    pub released: Option<&'a str>,
+}
+
+/// The model a provider starts on when only `--provider` is given, the one
+/// place that rule lives. Of `models` (a provider's chat models, in the
+/// catalog's order): among those that call tools (else those not said to be
+/// unable to), the most recently released of the ones priced at or below the
+/// median input price. A model with no price stays eligible, one with no
+/// date counts as the oldest, and a tie goes to the greater id. Where no
+/// candidate has a date or a price (a provider from `llmman.conf`), the
+/// first one.
+pub fn default_model<T>(
+    models: impl IntoIterator<Item = T>,
+    view: impl for<'a> Fn(&'a T) -> Candidate<'a>,
+) -> Option<T> {
+    let models: Vec<T> = models.into_iter().collect();
+    let calls_tools = |want: fn(Option<bool>) -> bool| {
+        models
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| want(view(m).tools))
+            .map(|(i, _)| i)
+            .collect::<Vec<_>>()
+    };
+    let mut pool = calls_tools(|tools| tools == Some(true));
+    if pool.is_empty() {
+        pool = calls_tools(|tools| tools != Some(false));
+    }
+    let mut prices: Vec<f64> = pool
+        .iter()
+        .filter_map(|&i| view(&models[i]).input_price)
+        .collect();
+    let dated = pool.iter().any(|&i| view(&models[i]).released.is_some());
+    let best = if prices.is_empty() && !dated {
+        pool.first().copied()
+    } else {
+        prices.sort_by(f64::total_cmp);
+        let median = match prices.len() {
+            0 => f64::INFINITY,
+            n if n % 2 == 1 => prices[n / 2],
+            n => (prices[n / 2 - 1] + prices[n / 2]) / 2.0,
+        };
+        pool.iter()
+            .copied()
+            .filter(|&i| {
+                view(&models[i])
+                    .input_price
+                    .is_none_or(|price| price <= median)
+            })
+            .max_by(|&a, &b| {
+                let (a, b) = (view(&models[a]), view(&models[b]));
+                (a.released, a.id).cmp(&(b.released, b.id))
+            })
+    };
+    models.into_iter().nth(best?)
 }
 
 /// US dollars per million tokens — models.dev's own unit, unconverted so
@@ -584,6 +730,47 @@ pub fn key_for(id: &str, var: Option<&str>) -> Option<String> {
         return None;
     }
     resolve_key(from_env, crate::config::provider_api_key(id).as_deref())
+}
+
+/// The variable that holds `id`'s key, as this process itself knows it and
+/// not as a daemon says: `llmman.conf`, else a built-in endpoint, else the
+/// catalog this process holds or has cached on disk (whatever its age).
+/// Nothing is fetched. `None` where it cannot place `id`; `Some(None)` where
+/// it can and the provider names no variable.
+///
+/// A daemon's own `key_env` names the variable only to its own client, and
+/// a client that reads whatever a daemon names would hand it any secret
+/// in its environment.
+pub fn own_key_env(id: &str) -> Option<Option<String>> {
+    if let Some(conf) = crate::config::configured_providers()
+        .iter()
+        .find(|p| p.id == id)
+    {
+        return Some(conf.key_env.clone());
+    }
+    if let Some(var) = login_only_key_env(id) {
+        return Some(Some(var.to_string()));
+    }
+    if let Some(builtin) = BUILTIN_ENDPOINTS.iter().find(|b| b.id == id) {
+        return Some(Some(builtin.key_env.to_string()));
+    }
+    own_catalog()?.get(id).map(|p| p.key_env.clone())
+}
+
+/// The catalog this process holds, else the one cached on disk, read once.
+fn own_catalog() -> Option<Arc<Catalog>> {
+    static CACHED: OnceLock<Option<Arc<Catalog>>> = OnceLock::new();
+    if let Some((_, _, Ok(held))) = CATALOG.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+        return Some(held.clone());
+    }
+    CACHED
+        .get_or_init(|| {
+            let raw = std::fs::read(cache_path()?).ok()?;
+            Catalog::from_json_with(&raw, &Sources::live())
+                .ok()
+                .map(Arc::new)
+        })
+        .clone()
 }
 
 /// Whether a stored login or a key command/file outranks `llmman.conf`'s
@@ -942,6 +1129,55 @@ struct RawModel {
     /// `[{"type": "effort", "values": ["low", "high"]}]`.
     #[serde(default)]
     reasoning_options: Option<serde_json::Value>,
+    /// Untyped for the same reason; `input` and `output` are read.
+    #[serde(default)]
+    modalities: Option<serde_json::Value>,
+    /// Untyped for the same reason: `image`, `embedding`, `speech`, `chat`, ...
+    #[serde(default, rename = "type")]
+    kind: Option<serde_json::Value>,
+    #[serde(default)]
+    tool_call: Option<serde_json::Value>,
+    /// Untyped for the same reason; read as a string.
+    #[serde(default)]
+    release_date: Option<serde_json::Value>,
+}
+
+/// [`Caps`] from a models.dev entry. A model without a `type` and without
+/// modalities is taken for a chat model; so is one that takes text in and
+/// gives text out.
+fn caps_of(raw: &RawModel) -> Caps {
+    let modalities = |side: &str| -> Option<Vec<&str>> {
+        Some(
+            raw.modalities
+                .as_ref()?
+                .get(side)?
+                .as_array()?
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .collect(),
+        )
+    };
+    let chat_type = match raw.kind.as_ref().and_then(serde_json::Value::as_str) {
+        None | Some("chat") => true,
+        Some(_) => false,
+    };
+    let text_in = modalities("input").is_none_or(|m| m.contains(&"text"));
+    let text_out = modalities("output").is_none_or(|m| m.contains(&"text"));
+    Caps {
+        chat: chat_type && text_in && text_out,
+        vision: modalities("input").is_some_and(|m| m.contains(&"image")),
+        tools: raw.tool_call.as_ref().and_then(serde_json::Value::as_bool),
+    }
+}
+
+/// A models.dev `release_date`, or `None` unless it is a non-blank string.
+fn released_of(raw: &RawModel) -> Option<String> {
+    raw.release_date
+        .as_ref()
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|date| !date.is_empty())
+        .map(str::to_string)
 }
 
 /// A models.dev `limit.output` as a token count, or `None` unless it is
@@ -1250,6 +1486,8 @@ fn models_of(
                 thinking: thinking_levels_of(&model, wire, max_output),
                 max_context: model.limit.as_ref().and_then(max_context_of),
                 max_output,
+                caps: caps_of(&model),
+                released: released_of(&model),
                 id,
             }
         })
@@ -1830,6 +2068,20 @@ mod tests {
     /// Every builtin must name a plausible HTTPS endpoint and a key
     /// variable — a typo here would surface only as a confusing runtime
     /// failure against a real provider.
+    /// What a client reads a key from is its own knowledge of the provider.
+    #[test]
+    fn a_client_ties_a_provider_to_its_variable_without_a_daemon() {
+        assert_eq!(
+            own_key_env("anthropic"),
+            Some(Some("ANTHROPIC_API_KEY".to_string()))
+        );
+        assert_eq!(
+            own_key_env("github-copilot"),
+            Some(Some("COPILOT_GITHUB_TOKEN".to_string()))
+        );
+        assert_eq!(own_key_env("no-such-provider-for-llmman-tests"), None);
+    }
+
     #[test]
     fn builtin_endpoints_are_well_formed_and_unique() {
         let mut seen = std::collections::BTreeSet::new();
@@ -2085,6 +2337,8 @@ mod tests {
                     max_output: None,
                     max_context: None,
                     thinking: None,
+                    caps: Caps::default(),
+                    released: None,
                 },
                 Model {
                     id: "z-model".into(),
@@ -2093,7 +2347,99 @@ mod tests {
                     // The fixture's `limit.context`, now carried too.
                     max_context: Some(200_000),
                     thinking: None,
+                    caps: Caps::default(),
+                    released: None,
                 },
+            ]
+        );
+    }
+
+    fn candidates(rows: &[(&str, Option<f64>, Option<&str>)]) -> Option<String> {
+        default_model(rows, |&&(id, input_price, released)| Candidate {
+            id,
+            tools: Some(true),
+            input_price,
+            released,
+        })
+        .map(|row| row.0.to_string())
+    }
+
+    #[test]
+    fn the_default_model_is_the_newest_at_or_below_the_median_price() {
+        // Median of 1, 2, 3, 4 is 2.5: the 3 and the 4 are out.
+        let rows = [
+            ("new-dear", Some(4.0), Some("2026-10-01")),
+            ("new-mid", Some(3.0), Some("2026-09-01")),
+            ("pick", Some(2.0), Some("2026-06-01")),
+            ("old-cheap", Some(1.0), Some("2025-01-01")),
+        ];
+        assert_eq!(candidates(&rows).as_deref(), Some("pick"));
+        // No price stays eligible; no date is the oldest; a tie takes the greater id.
+        let rows = [
+            ("a", None, None),
+            ("b", Some(1.0), Some("2026-01")),
+            ("c", Some(1.0), Some("2026-01")),
+            ("d", None, Some("2025-12-31")),
+        ];
+        assert_eq!(candidates(&rows).as_deref(), Some("c"));
+        assert_eq!(
+            candidates(&[("x", None, None), ("y", None, Some("2020-01-01"))]).as_deref(),
+            Some("y")
+        );
+        // Neither dates nor prices: the first listed, as before.
+        assert_eq!(
+            candidates(&[("m", None, None), ("z", None, None)]).as_deref(),
+            Some("m")
+        );
+        assert_eq!(candidates(&[]), None);
+    }
+
+    #[test]
+    fn the_default_model_prefers_tool_callers_and_then_those_not_said_to_lack_them() {
+        type Row = (&'static str, Option<bool>, Option<&'static str>);
+        fn view<'a>(row: &'a &Row) -> Candidate<'a> {
+            Candidate {
+                id: row.0,
+                tools: row.1,
+                input_price: None,
+                released: row.2,
+            }
+        }
+        let rows: [Row; 3] = [
+            ("no-tools", Some(false), Some("2026-12-01")),
+            ("unknown", None, Some("2026-01-01")),
+            ("tools", Some(true), Some("2025-01-01")),
+        ];
+        assert_eq!(default_model(&rows, view).map(|r| r.0), Some("tools"));
+        assert_eq!(
+            default_model(&rows[..2], view).map(|r| r.0),
+            Some("unknown")
+        );
+        assert_eq!(default_model(&rows[..1], view), None);
+    }
+
+    #[test]
+    fn a_models_release_date_is_read_and_a_missing_one_is_none() {
+        let catalog = catalog_from(
+            r#"{ "p": { "id": "p", "name": "P", "api": "https://p.example/v1",
+                "npm": "@ai-sdk/openai-compatible", "env": ["P_API_KEY"],
+                "models": { "dated": { "release_date": "2026-04" }, "blank": { "release_date": " " },
+                            "odd": { "release_date": 5 }, "none": {} } } }"#,
+        );
+        let released: Vec<_> = catalog
+            .get("p")
+            .unwrap()
+            .models
+            .iter()
+            .map(|m| (m.id.as_str(), m.released.as_deref()))
+            .collect();
+        assert_eq!(
+            released,
+            [
+                ("blank", None),
+                ("dated", Some("2026-04")),
+                ("none", None),
+                ("odd", None)
             ]
         );
     }

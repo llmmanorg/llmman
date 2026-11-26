@@ -14,7 +14,7 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use futures::StreamExt;
 use reqwest::Client;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio::time::{sleep, Duration, Instant};
 
 use super::backend::*;
@@ -134,12 +134,25 @@ pub(super) struct ModelFacts {
     /// A projector that generates audio on a model without one is text to
     /// speech only.
     has_chat_template: bool,
+    /// The chat template renders a request's `tools`.
+    tools: bool,
+    /// The template's thinking choices (see
+    /// [`crate::chat_template::ThinkingControls::choices`]); `None` without a template.
+    thinking: Option<Vec<&'static str>>,
 }
 
 impl ModelFacts {
     /// The `details` object both lists carry.
     fn details(&self) -> OllamaModelDetails {
         self.header.clone().details(self.format.clone())
+    }
+
+    /// Whether it generates text. An embedding, decision, speech, image or
+    /// video model replaces `completion` in its capabilities.
+    fn chats(&self) -> bool {
+        self.capabilities
+            .iter()
+            .any(|c| c == crate::modelpack::CAPABILITY_COMPLETION)
     }
 
     /// The trained context, `meta.n_ctx_train` on `/v1/models`.
@@ -249,18 +262,30 @@ pub(super) fn listed_model_facts(
             };
             let gguf = crate::modelpack::gguf_info(store_path, cache_path, &manifest);
             let projector = crate::modelpack::projector_info(store_path, cache_path, &manifest);
+            let template = match &gguf {
+                Some(info) => info.str("tokenizer.chat_template").map(str::to_string),
+                None => crate::modelpack::chat_template(store, store_path, cache_path, &manifest),
+            };
+            let caps = crate::modelpack::with_projector_caps(
+                crate::modelpack::capabilities(store, &manifest),
+                projector.as_ref(),
+            );
+            let tools = crate::modelpack::model_capabilities(
+                caps.clone(),
+                gguf.as_ref(),
+                template.as_deref(),
+            )
+            .iter()
+            .any(|c| c == crate::modelpack::CAPABILITY_TOOLS);
             let facts = Arc::new(ModelFacts {
+                tools,
+                thinking: template
+                    .as_deref()
+                    .map(|t| crate::chat_template::thinking_controls(t).choices()),
                 format: served_format(store, &manifest),
                 header: HeaderDetails::read(gguf.as_ref(), &manifest),
                 context_length: gguf.as_ref().and_then(crate::gguf::Info::context_length),
-                capabilities: crate::modelpack::model_capabilities(
-                    crate::modelpack::with_projector_caps(
-                        crate::modelpack::capabilities(store, &manifest),
-                        projector.as_ref(),
-                    ),
-                    gguf.as_ref(),
-                    None,
-                ),
+                capabilities: crate::modelpack::model_capabilities(caps, gguf.as_ref(), None),
                 architecture: gguf
                     .as_ref()
                     .and_then(|info| info.architecture())
@@ -340,6 +365,80 @@ pub(super) async fn handle_tags(
         }
     }
     Ok(Json(OllamaTagsResponse { models }))
+}
+
+/// One stored model in `GET /llmman/models`: what an agent offered every
+/// model needs to list it, without a request per model.
+#[derive(Debug, Serialize)]
+pub(super) struct LocalModelResponse {
+    /// As `/api/tags` names it, which every route resolves.
+    name: String,
+    /// Whether it generates text.
+    chat: bool,
+    vision: bool,
+    tools: bool,
+    /// The window a load would serve, else the trained one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    context: Option<u64>,
+    /// The template's thinking choices; absent without a template.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking: Option<Vec<&'static str>>,
+    /// Whether it is loaded now. Absent when not, or when the daemon was
+    /// busy loading another model and did not wait to find out.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    loaded: bool,
+    /// When it was pulled or last re-pulled, in seconds since the epoch.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pulled: Option<u64>,
+}
+
+/// Every stored model, as [`LocalModelResponse`]s. Loads nothing.
+pub(super) async fn local_models(state: &AppState) -> Result<Vec<LocalModelResponse>, AppError> {
+    let (store_path, cache_path) = (state.0.store_path.clone(), state.0.cache_path.clone());
+    let rows = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+        let store = OciStore::open(&store_path)?;
+        let list = store.list()?;
+        let facts = listed_model_facts(&store, &store_path, &cache_path, &list);
+        Ok(list.into_iter().zip(facts).collect::<Vec<_>>())
+    })
+    .await
+    .context("list models task panicked")??;
+    let user_sizes_slots = llama_sets_slot_context(&extra_args_from_env(LLAMA_ARGS_VAR), true);
+    let gguf_engine = gguf_engine_from_env();
+    // A load holds the manager for as long as it takes; a launch does not
+    // wait for it to learn what is loaded.
+    let loaded: HashSet<String> = state
+        .0
+        .manager
+        .try_lock()
+        .map(|mgr| mgr.running.values().map(|m| m.digest.clone()).collect())
+        .unwrap_or_default();
+    Ok(rows
+        .into_iter()
+        .map(|(img, facts)| LocalModelResponse {
+            loaded: loaded.contains(&img.digest),
+            pulled: img
+                .modified_at
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs()),
+            name: img.reference,
+            chat: facts.chats(),
+            vision: facts
+                .capabilities
+                .iter()
+                .any(|c| c == crate::modelpack::CAPABILITY_VISION),
+            tools: facts.tools,
+            context: (!user_sizes_slots)
+                .then(|| {
+                    facts
+                        .starting_context_window(state, gguf_engine)
+                        .map(u64::from)
+                })
+                .flatten()
+                .or(facts.context_length()),
+            thinking: facts.thinking.clone(),
+        })
+        .collect())
 }
 
 /// The subset of a [`RunningModel`](super::RunningModel) `handle_ps` needs, cloned out while

@@ -6,23 +6,35 @@ use anyhow::Context;
 use toml_edit::{value, DocumentMut, Item, Table};
 
 use super::common::write_if_changed;
+use super::models::{write_transient, ModelEntry, ModelList};
 use super::optimizer::Optimizer;
 use super::{exec_with_env, find_on_path, server};
 
 /// codex: write the `llmman` profile overlay (`~/.codex/llmman.config.toml`,
 /// a provider named `llmman` at our /v1 endpoint), then run codex with
-/// `--profile llmman` and `api_key` as OPENAI_API_KEY.
+/// `--profile llmman`, `api_key` as OPENAI_API_KEY and, for a launch with a
+/// model, a catalog of the list (`-c model_catalog_json=`), which codex
+/// shows in `/model` with each model's reasoning levels.
 pub(super) fn launch_codex(
     model: &str,
     api_key: &str,
-    vision: bool,
-    context_window: Option<u64>,
+    models: &ModelList,
     extra_args: &[String],
     optimizer: Optimizer,
 ) -> anyhow::Result<()> {
     let added = optimizer.addition("codex")?;
     // Write codex config
-    write_codex_config(model, vision, context_window, extra_args)?;
+    write_codex_config(extra_args)?;
+    let catalog = if models.is_empty() {
+        None
+    } else {
+        Some(write_transient(
+            &codex_dir()?,
+            "models",
+            "json",
+            &codex_model_catalog(models),
+        )?)
+    };
 
     // Regression: this used to pass a bare PathBuf::from("codex") straight
     // to exec_with_env instead of resolving it via find_on_path like every
@@ -43,6 +55,9 @@ pub(super) fn launch_codex(
     }
     // codex profile flag
     args.extend(["--profile".to_string(), "llmman".to_string()]);
+    if let Some(catalog) = &catalog {
+        args.extend(["-c".to_string(), catalog_override(catalog)]);
+    }
     args.extend_from_slice(extra_args);
     args.splice(0..0, added.args.iter().cloned());
 
@@ -50,6 +65,13 @@ pub(super) fn launch_codex(
         eprintln!("{notice}");
     }
     exec_with_env(&bin, &args, &[("OPENAI_API_KEY", api_key)])
+}
+
+/// The model codex last ran: `model` in its config.
+pub(super) fn remembered_model() -> Option<String> {
+    let text = std::fs::read_to_string(codex_dir().ok()?.join("config.toml")).ok()?;
+    let doc: DocumentMut = text.parse().ok()?;
+    doc.get("model")?.as_str().map(str::to_string)
 }
 
 const KEY: &str = "developer_instructions";
@@ -62,6 +84,11 @@ fn config_override(key: &str, text: &str) -> String {
 /// The `-c` value that sets codex's `developer_instructions` to `text`.
 pub(super) fn developer_instructions(text: &str) -> String {
     config_override(KEY, text)
+}
+
+/// The `-c` value that points codex's model catalog at `path`.
+fn catalog_override(path: &Path) -> String {
+    config_override("model_catalog_json", &path.display().to_string())
 }
 
 /// The `-c` value that points the `llmman` provider at `server`.
@@ -110,12 +137,7 @@ pub(super) fn cvmn_conflict(extra_args: &[String]) -> Option<&'static str> {
 /// leftover copy of that table is stripped from `config.toml` first, then
 /// the real settings are (re)written to the profile overlay file codex
 /// actually reads.
-fn write_codex_config(
-    model: &str,
-    vision: bool,
-    context_window: Option<u64>,
-    extra_args: &[String],
-) -> anyhow::Result<()> {
+fn write_codex_config(extra_args: &[String]) -> anyhow::Result<()> {
     let config_dir = codex_dir()?;
     std::fs::create_dir_all(&config_dir)?;
 
@@ -132,20 +154,8 @@ fn write_codex_config(
         }
     }
 
-    // Without a model there is nothing to describe; codex keeps its defaults.
-    let catalog_path = config_dir.join("llmman-model.json");
-    let catalog = (!model.is_empty()).then(|| {
-        let context_window = codex_context_window(context_window);
-        write_if_changed(
-            &catalog_path,
-            &codex_model_catalog(model, vision, context_window),
-        )
-        .map(|()| catalog_path.clone())
-    });
-    let catalog = catalog.transpose()?;
-
     let profile_path = config_dir.join("llmman.config.toml");
-    let profile = codex_profile(&server(), catalog.as_deref());
+    let profile = codex_profile(&server(), None);
     let existing = std::fs::read_to_string(&profile_path).ok();
     let overlay = codex_overlay(
         existing.as_deref(),
@@ -256,31 +266,56 @@ pub(super) fn codex_dir() -> anyhow::Result<PathBuf> {
         .join(".codex"))
 }
 
-/// The catalog's `context_window` where `launch` resolved none at all;
-/// ollama's fallback too.
+/// The catalog's `context_window` for a model whose window is unknown;
+/// ollama's fallback too. codex's catalog cannot omit the field, so it
+/// guesses where every other integration stays quiet.
 pub(super) const CODEX_FALLBACK_CONTEXT_WINDOW: u64 = 128_000;
 
-/// What codex compacts against: the window `launch` resolved — live from
-/// the loaded runner, and a hybrid pair's larger half — else
-/// [`CODEX_FALLBACK_CONTEXT_WINDOW`]. codex's catalog cannot omit the
-/// field, so it guesses where every other integration stays quiet.
-fn codex_context_window(window: Option<u64>) -> u64 {
-    window.unwrap_or(CODEX_FALLBACK_CONTEXT_WINDOW)
+/// The `model_catalog_json` for the list, one entry per model. The other
+/// fields are ones codex requires, valued as ollama's `buildCodexModelEntry`
+/// does.
+fn codex_model_catalog(models: &ModelList) -> String {
+    let entries: Vec<serde_json::Value> = models.entries().iter().map(codex_model_entry).collect();
+    serde_json::to_string_pretty(&serde_json::json!({ "models": entries }))
+        .expect("codex catalog serializes")
+        + "\n"
 }
 
-/// The `model_catalog_json` for `model`, declaring its image input in
-/// `input_modalities`. The other fields are ones codex requires, valued
-/// as ollama's `buildCodexModelEntry` does.
-fn codex_model_catalog(model: &str, vision: bool, context_window: u64) -> String {
-    let input: &[&str] = if vision {
+/// What codex calls a variant, if it has one: `none`, `minimal`, `low`,
+/// `medium`, `high`, `xhigh`; `max` is none of them, and a switch-only
+/// template's `thinking` is `medium` (see `spell_variant`).
+fn codex_reasoning_levels(entry: &ModelEntry) -> Vec<&'static str> {
+    let mut levels: Vec<&'static str> = Vec::new();
+    for variant in entry.variants() {
+        let spelled = super::spell_variant("codex", &variant).ok().and_then(|l| {
+            ["none", "minimal", "low", "medium", "high", "xhigh"]
+                .into_iter()
+                .find(|c| *c == l)
+        });
+        if let Some(level) = spelled.filter(|l| !levels.contains(l)) {
+            levels.push(level);
+        }
+    }
+    levels
+}
+
+/// One model's catalog entry: its plain id as `display_name`, its window,
+/// its image input and its reasoning levels as presets.
+fn codex_model_entry(entry: &ModelEntry) -> serde_json::Value {
+    let input: &[&str] = if entry.vision {
         &["text", "image"]
     } else {
         &["text"]
     };
-    let entry = serde_json::json!({
-        "slug": model,
-        "display_name": model,
-        "context_window": context_window,
+    let levels = codex_reasoning_levels(entry);
+    let presets: Vec<serde_json::Value> = levels
+        .iter()
+        .map(|level| serde_json::json!({ "effort": level, "description": level }))
+        .collect();
+    let mut model = serde_json::json!({
+        "slug": entry.reference,
+        "display_name": entry.id,
+        "context_window": entry.context_window.unwrap_or(CODEX_FALLBACK_CONTEXT_WINDOW),
         "shell_type": "default",
         "visibility": "list",
         "supported_in_api": true,
@@ -292,11 +327,16 @@ fn codex_model_catalog(model: &str, vision: bool, context_window: u64) -> String
         "default_verbosity": "low",
         "supports_parallel_tool_calls": false,
         "supports_reasoning_summaries": false,
-        "supported_reasoning_levels": [],
+        "supported_reasoning_levels": presets,
         "experimental_supported_tools": [],
     });
-    let catalog = serde_json::json!({ "models": [entry] });
-    serde_json::to_string_pretty(&catalog).expect("codex catalog serializes") + "\n"
+    if let Some(default) = ["medium", "high", "low"]
+        .into_iter()
+        .find(|l| levels.contains(l))
+    {
+        model["default_reasoning_level"] = default.into();
+    }
+    model
 }
 
 /// The contents of `~/.codex/llmman.config.toml`: a provider of llmman's
@@ -626,18 +666,57 @@ model = \"gpt-5\"
         );
     }
 
+    fn row(reference: &str, window: Option<u64>, vision: bool, thinking: &[&str]) -> ModelEntry {
+        ModelEntry {
+            context_window: window,
+            vision,
+            thinking: Some(thinking.iter().map(|t| t.to_string()).collect()),
+            ..ModelEntry::unlisted(reference)
+        }
+    }
+
     #[test]
-    fn codex_model_catalog_declares_image_input_only_for_a_vision_model() {
+    fn the_catalog_has_every_row_with_its_plain_id_window_image_input_and_levels() {
+        let models = ModelList::of(vec![
+            row("docker.io/ai/m", Some(32768), true, &["none", "thinking"]),
+            row(
+                "llmman.provider/p/gpt",
+                None,
+                false,
+                &["low", "high", "max"],
+            ),
+            row("llmman.provider/p/plain", Some(8192), false, &[]),
+        ]);
         let catalog: serde_json::Value =
-            serde_json::from_str(&codex_model_catalog("m", true, 32768)).expect("valid JSON");
-        let entry = &catalog["models"][0];
+            serde_json::from_str(&codex_model_catalog(&models)).expect("valid JSON");
+        let rows = catalog["models"].as_array().unwrap();
+        assert_eq!(rows.len(), 3);
+        let entry = &rows[0];
         assert_eq!(
             entry["input_modalities"],
             serde_json::json!(["text", "image"])
         );
-        assert_eq!(entry["slug"], "m");
+        assert_eq!(entry["slug"], "docker.io/ai/m");
         assert_eq!(entry["display_name"], "m");
         assert_eq!(entry["context_window"], 32768);
+        // A switch-only template's `thinking` is codex's `medium`.
+        let efforts = |row: &serde_json::Value| -> Vec<String> {
+            row["supported_reasoning_levels"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|l| l["effort"].as_str().unwrap().to_string())
+                .collect()
+        };
+        assert_eq!(efforts(entry), ["none", "medium"]);
+        assert_eq!(entry["default_reasoning_level"], "medium");
+        // `max` is not a codex level; no window is codex's fallback.
+        assert_eq!(efforts(&rows[1]), ["low", "high"]);
+        assert_eq!(rows[1]["display_name"], "gpt");
+        assert_eq!(rows[1]["context_window"], CODEX_FALLBACK_CONTEXT_WINDOW);
+        assert_eq!(rows[1]["input_modalities"], serde_json::json!(["text"]));
+        assert!(efforts(&rows[2]).is_empty());
+        assert!(rows[2].get("default_reasoning_level").is_none());
         // Fields codex requires of an entry.
         for key in [
             "context_window",
@@ -650,27 +729,24 @@ model = \"gpt-5\"
             "supported_reasoning_levels",
             "experimental_supported_tools",
         ] {
-            assert!(entry.get(key).is_some(), "missing {key}");
+            for row in rows {
+                assert!(row.get(key).is_some(), "missing {key}");
+            }
         }
-
-        let text_only: serde_json::Value =
-            serde_json::from_str(&codex_model_catalog("m", false, 32768)).expect("valid JSON");
-        assert_eq!(
-            text_only["models"][0]["input_modalities"],
-            serde_json::json!(["text"])
-        );
     }
 
-    /// codex takes the window `launch` resolved, like every other
-    /// integration; it differs only in having to name one when there is
-    /// none. What that window is made of — live, env, trained, a pair's
-    /// larger half — is `served_context_window`'s and
-    /// `pair_context_window`'s own business, tested there.
     #[test]
-    fn codex_context_window_falls_back_only_when_there_is_no_window() {
-        assert_eq!(codex_context_window(Some(16384)), 16384);
-        assert_eq!(codex_context_window(Some(1 << 20)), 1 << 20);
-        assert_eq!(codex_context_window(None), CODEX_FALLBACK_CONTEXT_WINDOW);
+    fn the_catalog_is_passed_by_path_and_holds_no_credential() {
+        let path = PathBuf::from("/home/we\"ird/.codex/llmman-models-1.json");
+        let over = catalog_override(&path);
+        assert!(over.starts_with("model_catalog_json="), "{over}");
+        let value: toml::Value = over
+            .replacen("model_catalog_json=", "x=", 1)
+            .parse()
+            .unwrap();
+        assert_eq!(value["x"].as_str(), Some(path.to_str().unwrap()));
+        let models = ModelList::of(vec![row("m", None, false, &[])]);
+        assert!(!codex_model_catalog(&models).contains("key"));
     }
 
     #[test]

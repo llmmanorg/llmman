@@ -92,6 +92,23 @@ pub(super) fn write_if_changed(path: &Path, contents: &str) -> anyhow::Result<()
     std::fs::write(path, contents).with_context(|| format!("write {}", path.display()))
 }
 
+/// The text of `path`, or `None` when there is no such file.
+pub(super) fn read_if_exists(path: &Path) -> anyhow::Result<Option<String>> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Ok(Some(text)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e).with_context(|| format!("read {}", path.display())),
+    }
+}
+
+/// Writes `contents` to `path` atomically, making its directory first.
+pub(super) fn write_atomic_in_dir(path: &Path, contents: &[u8]) -> anyhow::Result<()> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+    }
+    crate::fsutil::write_atomic(path, contents).with_context(|| format!("write {}", path.display()))
+}
+
 pub(super) fn write_yaml_merged(
     path: &Path,
     label: &str,
@@ -208,11 +225,7 @@ fn write_structured_merged(
     should_backup: impl FnOnce(&str, &Path) -> bool,
     merge: impl FnOnce(&serde_json::Value) -> serde_json::Value,
 ) -> anyhow::Result<()> {
-    let raw = match std::fs::read_to_string(path) {
-        Ok(raw) => Some(raw),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-        Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
-    };
+    let raw = read_if_exists(path)?;
     let existing = match raw.as_deref().map(str::trim) {
         None | Some("") => serde_json::json!({}),
         Some(text) => match parse(text) {
@@ -248,7 +261,7 @@ fn write_structured_merged(
 /// `//` and `/* */` comments outside strings replaced by spaces, so a
 /// parse error still points at the right place; what `strip-json-comments`
 /// does for Qwen Code before `JSON.parse`.
-fn strip_json_comments(raw: &str) -> String {
+pub(super) fn strip_json_comments(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
     let mut chars = raw.chars().peekable();
     let mut in_string = false;
@@ -351,57 +364,6 @@ pub(super) fn pi_model_entry(
         entry["contextWindow"] = serde_json::json!(context);
     }
     entry
-}
-
-/// Merge one model into a named provider while retaining unrelated providers,
-/// provider options, and models. OMP also retains unowned fields on the
-/// matching model; Pi rebuilds its matching entry from daemon metadata.
-pub(super) fn provider_models_merged(
-    existing: &serde_json::Value,
-    provider_name: &str,
-    entry: &serde_json::Value,
-    preserve_existing_model_fields: bool,
-    configure: impl FnOnce(&mut serde_json::Map<String, serde_json::Value>),
-) -> serde_json::Value {
-    let mut root = existing.clone();
-    let Some(root_map) = root.as_object_mut() else {
-        return serde_json::json!({});
-    };
-    let provider = object_under(object_under(root_map, "providers"), provider_name);
-    let old_models = provider
-        .get("models")
-        .and_then(serde_json::Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    let mut replaced = false;
-    let mut models = Vec::with_capacity(old_models.len() + 1);
-    for old in old_models {
-        if old.get("id") != entry.get("id") {
-            models.push(old);
-            continue;
-        }
-        if replaced {
-            continue;
-        }
-        let mut merged = if preserve_existing_model_fields {
-            old
-        } else {
-            serde_json::json!({})
-        };
-        if let (Some(merged), Some(update)) = (merged.as_object_mut(), entry.as_object()) {
-            merged.extend(update.clone());
-        } else {
-            merged = entry.clone();
-        }
-        models.push(merged);
-        replaced = true;
-    }
-    if !replaced {
-        models.push(entry.clone());
-    }
-    configure(provider);
-    provider.insert("models".into(), serde_json::json!(models));
-    root
 }
 
 #[cfg(test)]

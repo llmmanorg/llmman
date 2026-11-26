@@ -238,7 +238,7 @@ pub(super) fn from_chat_request(req: &Value, default_max_tokens: u32) -> anyhow:
     // Thinking forbids sampling overrides.
     if out
         .pointer("/thinking/type")
-        .is_some_and(|t| t != "disabled")
+        .is_some_and(|t| t != "disabled" && t != "between_tools")
     {
         if let Some(o) = out.as_object_mut() {
             o.remove("temperature");
@@ -260,12 +260,21 @@ fn adaptive_thinker(model: &str) -> bool {
 /// Adaptive thinking at `effort`, with the summarized text 4.7+ omit by
 /// default. `minimal` is `low`; `xhigh` is `high` on 4.6, which lacks it;
 /// an unknown level is the model's default. `none` is `disabled`, or
-/// `low` on Fable and Mythos, which always think.
+/// `low` on Fable and Mythos, which always think. Sonnet 5 and later
+/// refuse `disabled`: they never think before answering, and
+/// `between_tools` (the short notes between tool calls still come back
+/// as thinking blocks) is how thinking is turned off there.
 fn adaptive_thinking(model: &str, effort: &str, out: &mut Value) {
     let lower = model.to_ascii_lowercase();
     let always_thinks = lower.contains("fable") || lower.contains("mythos");
     if effort == "none" && !always_thinks {
-        out["thinking"] = json!({ "type": "disabled" });
+        let between_tools = lower.contains("sonnet") && claude_version(model) >= Some((5, 0));
+        let kind = if between_tools {
+            "between_tools"
+        } else {
+            "disabled"
+        };
+        out["thinking"] = json!({ "type": kind });
         return;
     }
     out["thinking"] = json!({ "type": "adaptive", "display": "summarized" });
@@ -2040,9 +2049,34 @@ mod tests {
         assert_eq!(unknown["thinking"]["type"], "adaptive");
         assert!(unknown.get("output_config").is_none(), "{unknown}");
 
-        let off = with("claude-sonnet-5", "none");
-        assert_eq!(off["thinking"], json!({ "type": "disabled" }));
-        assert_eq!(off["temperature"], 0.1);
+        for model in ["claude-sonnet-5", "claude-sonnet-5-5", "claude-sonnet-6"] {
+            let off = with(model, "none");
+            assert_eq!(
+                off["thinking"],
+                json!({ "type": "between_tools" }),
+                "{model}"
+            );
+            assert!(off.get("output_config").is_none(), "{model} {off}");
+            assert_eq!(off["temperature"], 0.1, "{model}");
+            assert!(!manual_thinking(&off), "{model}");
+        }
+        for model in [
+            "claude-opus-5",
+            "claude-haiku-5-5",
+            "claude-opus-4-7",
+            "claude-sonnet-4-6",
+            "claude-sonnet-4-5-20250929",
+            "claude-sonnet",
+            "claude-3-5-sonnet-20241022",
+        ] {
+            let off = with(model, "none");
+            if adaptive_thinker(model) {
+                assert_eq!(off["thinking"], json!({ "type": "disabled" }), "{model}");
+            } else {
+                assert!(off.get("thinking").is_none(), "{model} {off}");
+            }
+            assert!(!manual_thinking(&off), "{model}");
+        }
         for model in ["claude-fable-5-1", "claude-mythos-preview"] {
             let least = with(model, "none");
             assert_eq!(least["thinking"]["type"], "adaptive", "{model}");

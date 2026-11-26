@@ -565,6 +565,16 @@ pub(super) fn gemini_method(path: &str) -> Option<(&str, GeminiMethod)> {
 
 // -- Gemini /gemini/<model>/v1beta/models/... ------------------------------
 
+/// The model a pinned request is served by: the one AGY names in the path when it is a llmman
+/// reference (`llmman.provider/...`, `docker.io/ai/...`), else the pinned one. Google's own names
+/// have no `/`, so hard-coded auxiliary models stay on the pinned model.
+pub(super) fn routed_model(pinned: String, path_model: &str) -> String {
+    match path_model.strip_prefix("v1beta/models/") {
+        Some(named) if named.contains('/') => named.to_string(),
+        _ => pinned,
+    }
+}
+
 /// AGY appends its own model name to `GOOGLE_GEMINI_BASE_URL`, including
 /// separate hard-coded models for title/planning work. The first path segment
 /// instead carries the model selected by `llmman launch agy`, encoded so OCI
@@ -582,12 +592,13 @@ pub(super) async fn handle_pinned_gemini(
     let selected_model = String::from_utf8(model_bytes)
         .map_err(|_| AppError::status(StatusCode::BAD_REQUEST, "invalid AGY model route"))?;
 
-    let Some((_, method)) = gemini_method(&gemini_path) else {
+    let Some((path_model, method)) = gemini_method(&gemini_path) else {
         return Err(AppError::status(
             StatusCode::NOT_FOUND,
             "AGY endpoint supports streamGenerateContent, generateContent and countTokens only",
         ));
     };
+    let selected_model = routed_model(selected_model, path_model);
     // `countTokens` may wrap the request in `generateContentRequest`.
     let mut body = body;
     if let Some(inner) = body
@@ -1127,6 +1138,26 @@ mod tests {
                 assert_eq!(requests[0]["messages"], requests[1]["messages"]);
                 assert_eq!(requests[1]["temperature"], 0.25);
             }
+        }
+    }
+
+    #[test]
+    fn a_llmman_reference_in_the_path_is_routed_and_google_names_stay_pinned() {
+        let pinned = || "docker.io/ai/qwen3.5:0.8b".to_string();
+        assert_eq!(
+            routed_model(pinned(), "v1beta/models/llmman.provider/openai/gpt-5"),
+            "llmman.provider/openai/gpt-5"
+        );
+        assert_eq!(
+            routed_model(pinned(), "v1beta/models/docker.io/ai/smollm2:135m"),
+            "docker.io/ai/smollm2:135m"
+        );
+        for path in [
+            "v1beta/models/gemini-3.1-pro-preview",
+            "other/x",
+            "v1beta/models/m",
+        ] {
+            assert_eq!(routed_model(pinned(), path), pinned(), "{path}");
         }
     }
 

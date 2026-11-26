@@ -5,11 +5,12 @@
 //! provider. Most of this file decides whether an instance holds that
 //! lock, and offers to quit it.
 
+use super::models::ModelList;
 use std::path::{Path, PathBuf};
 #[cfg(any(windows, test))]
 use std::process::Command;
 
-use super::goose::goose_env;
+use super::goose::{goose_env, goose_session_env};
 use super::sandbox;
 use super::{accepts_prompt, env_dir, exec_with_env, find_on_path, find_on_path_unless, server};
 
@@ -56,6 +57,7 @@ pub(super) fn goose_desktop_env<'a>(
 pub(super) fn launch_goose_desktop(
     model: &str,
     api_key: &str,
+    models: &ModelList,
     extra_args: &[String],
 ) -> anyhow::Result<()> {
     let bin = find_goose_desktop().ok_or_else(goose_desktop_missing)?;
@@ -88,11 +90,18 @@ pub(super) fn launch_goose_desktop(
     let host = server();
     let speech = std::env::var(TRANSCRIPTION_MODEL_ENV).ok();
     let speech = speech.as_deref().filter(|_| sandbox::active());
-    exec_with_env(
-        &bin,
-        extra_args,
-        &goose_desktop_env(model, api_key, &host, speech),
-    )
+    // The desktop app drives the same goose, so it reads the same provider
+    // file; dictation alone, or one model, has none.
+    let env = if !models.offers_choice() {
+        goose_desktop_env(model, api_key, &host, speech)
+    } else {
+        let mut env = goose_session_env(model, api_key, models, &host);
+        // Dictation reads these whatever the chat provider is.
+        env.extend([("OPENAI_API_KEY", api_key), ("OPENAI_HOST", host.as_str())]);
+        env.extend(speech.map(|m| (TRANSCRIPTION_MODEL_ENV, m)));
+        env
+    };
+    exec_with_env(&bin, extra_args, &env)
 }
 
 /// What a probe for a running Goose Desktop found.
