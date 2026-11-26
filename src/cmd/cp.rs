@@ -21,6 +21,13 @@ pub struct CpArgs {
 /// to match ollama's naming for anyone coming from there, not because the
 /// underlying operation differs at all.
 pub fn run(args: &CpArgs) -> anyhow::Result<()> {
+    let mounted = crate::cmd::serve::mounted::MountedModels::lenient_from_env();
+    if let Some(msg) = mounted.refusal(&args.source, "copied") {
+        anyhow::bail!("{msg}");
+    }
+    if let Some(msg) = mounted.refusal(&args.destination, "replaced by a copy") {
+        anyhow::bail!("{msg}");
+    }
     // Both via resolve_ollama_api, before touching the store: SOURCE to
     // match how it's stored, DESTINATION to be stored the way run/rm/show
     // look it up (a bare `mine:v1` becomes `docker.io/ai/mine:v1`).

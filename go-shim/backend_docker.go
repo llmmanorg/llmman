@@ -845,6 +845,7 @@ func pullToLayout(ctx context.Context, ref, layoutDir string) error {
 			shortDigest = shortDigest[:12]
 		}
 		if blobExists(layoutDir, layer) {
+			touchBlob(blobPath(layoutDir, layer.Digest))
 			fmt.Fprintf(prog, "Cached   %s\n", shortDigest)
 			continue
 		}

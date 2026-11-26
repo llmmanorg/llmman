@@ -17,6 +17,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
+use crate::fsutil::retry_fs;
+
 const COMPLETE_SENTINEL: &str = ".llmman-complete";
 
 /// Whether the version directory at `dir` finished installing.
@@ -75,8 +77,9 @@ fn ensure_in<T>(
         return Ok(found);
     }
     if dest.exists() {
-        std::fs::remove_dir_all(dest)
-            .with_context(|| format!("remove partial install {}", dest.display()))?;
+        retry_fs("remove partial install", dest, || {
+            std::fs::remove_dir_all(dest)
+        })?;
     }
     std::fs::create_dir_all(dest).with_context(|| format!("create {}", dest.display()))?;
     let out = install(dest)?;
@@ -111,14 +114,23 @@ fn prune_others(root: &Path, keep: &Path) {
         {
             continue;
         }
-        match std::fs::remove_dir_all(&path) {
+        match retry_fs("remove superseded", &path, || {
+            std::fs::remove_dir_all(&path)
+        }) {
             Ok(()) => eprintln!("[llmman] removed superseded {}", path.display()),
-            Err(e) => eprintln!(
-                "[llmman] warning: could not remove superseded {}: {e}",
-                path.display()
-            ),
+            Err(e) => eprintln!("[llmman] warning: could not {e:#}"),
         }
     }
+}
+
+/// Never truncates: on Windows the lock is mandatory, so truncating a file
+/// another process holds fails (os error 33) instead of waiting at `lock`.
+fn open_lock_file(path: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(path)
 }
 
 /// An exclusive advisory lock on `<root>/.lock`, released on drop.
@@ -138,8 +150,7 @@ impl InstallLock {
     pub(crate) fn acquire_noting(root: &Path, waiting: &str) -> Result<InstallLock> {
         std::fs::create_dir_all(root).with_context(|| format!("create {}", root.display()))?;
         let path = root.join(".lock");
-        let file =
-            std::fs::File::create(&path).with_context(|| format!("create {}", path.display()))?;
+        let file = open_lock_file(&path).with_context(|| format!("open {}", path.display()))?;
         match file.try_lock() {
             Ok(()) => {}
             Err(std::fs::TryLockError::WouldBlock) => {
@@ -241,10 +252,49 @@ mod tests {
     }
 
     #[test]
+    fn acquiring_the_lock_keeps_the_lock_files_contents() {
+        let root = temp_root("lock-keeps");
+        std::fs::write(root.join(".lock"), b"held by pid 42").unwrap();
+        drop(InstallLock::acquire(&root, "test").unwrap());
+        assert_eq!(
+            std::fs::read(root.join(".lock")).unwrap(),
+            b"held by pid 42"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_second_acquire_waits_for_the_first_to_drop() {
+        let root = temp_root("lock-waits");
+        let first = InstallLock::acquire(&root, "test").unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn({
+            let root = root.clone();
+            move || {
+                let second = InstallLock::acquire(&root, "test").unwrap();
+                tx.send(()).unwrap();
+                drop(second);
+            }
+        });
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(200))
+                .is_err(),
+            "the second acquire did not wait"
+        );
+        drop(first);
+        // A child another test forked holds a copy of the descriptor, and
+        // so the lock, until it execs.
+        rx.recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the second acquire never got the lock");
+        waiter.join().unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn lock_is_exclusive_until_dropped() {
         let root = temp_root("lock");
         let first = InstallLock::acquire(&root, "test").unwrap();
-        let probe = std::fs::File::create(root.join(".lock")).unwrap();
+        let probe = open_lock_file(&root.join(".lock")).unwrap();
         assert!(matches!(
             probe.try_lock(),
             Err(std::fs::TryLockError::WouldBlock)

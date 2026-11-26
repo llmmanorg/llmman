@@ -10,6 +10,20 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// pid does the same across processes.
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+/// Sets `path`'s mtime.
+pub fn set_mtime(path: &Path, when: std::time::SystemTime) -> std::io::Result<()> {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)?
+        .set_modified(when)
+}
+
+/// Sets `path`'s mtime to now, ignoring failure. A reused blob is touched so
+/// a sweep's grace window and `rm`'s reclaim see it as used just now.
+pub fn touch(path: &Path) {
+    let _ = set_mtime(path, std::time::SystemTime::now());
+}
+
 /// Writes `bytes` to `path` through a temp file beside it and a rename,
 /// so a reader sees the old file or the new one and not a partial one;
 /// the temp name carries the pid and a counter, so no two writers share
@@ -267,6 +281,102 @@ pub fn sha256_of_file(path: &Path) -> anyhow::Result<String> {
     sha256_of_reader(&mut file).with_context(|| format!("hash {}", path.display()))
 }
 
+/// Windows `ERROR_ACCESS_DENIED`, `ERROR_SHARING_VIOLATION` and
+/// `ERROR_LOCK_VIOLATION`: another process (antivirus, an indexer) is
+/// holding the file, and lets go soon.
+fn is_sharing_error_code(code: i32) -> bool {
+    matches!(code, 5 | 32 | 33)
+}
+
+/// [`is_transient_fs_error`] with the platform given, for tests.
+fn is_transient_on(windows: bool, e: &std::io::Error) -> bool {
+    windows && e.raw_os_error().is_some_and(is_sharing_error_code)
+}
+
+/// Whether `e` is a Windows sharing or lock violation. Never true
+/// elsewhere, where the same numbers are unrelated (`EIO`, `EPIPE`, `EDOM`).
+pub fn is_transient_fs_error(e: &std::io::Error) -> bool {
+    is_transient_on(cfg!(windows), e)
+}
+
+const FS_ATTEMPTS: u32 = 5;
+/// Doubles per retry: 100, 200, 400 and 800 ms, 1.5 s in all.
+const FS_RETRY_BASE: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Runs `op` up to [`FS_ATTEMPTS`] times, waiting between tries while it
+/// fails with an [`is_transient_fs_error`]. Other errors return at once.
+pub fn retry_transient<T>(op: impl FnMut() -> std::io::Result<T>) -> std::io::Result<T> {
+    retry_with(op, is_transient_fs_error, FS_RETRY_BASE)
+}
+
+fn retry_with<T, E>(
+    mut op: impl FnMut() -> Result<T, E>,
+    transient: impl Fn(&E) -> bool,
+    base: std::time::Duration,
+) -> Result<T, E> {
+    let mut wait = base;
+    for _ in 1..FS_ATTEMPTS {
+        match op() {
+            Err(e) if transient(&e) => {
+                std::thread::sleep(wait);
+                wait *= 2;
+            }
+            done => return done,
+        }
+    }
+    op()
+}
+
+/// [`retry_transient`] for a restartable operation reporting an
+/// [`anyhow::Error`], such as unpacking an archive.
+pub fn retry_transient_op<T>(op: impl FnMut() -> anyhow::Result<T>) -> anyhow::Result<T> {
+    retry_with(
+        op,
+        |e| io_errors(e).any(is_transient_fs_error),
+        FS_RETRY_BASE,
+    )
+}
+
+const HELD_HINT: &str = "another process (antivirus, a running llama-server) may be holding it; \
+                         close it or wait a moment and run the command again";
+
+/// Every `io::Error` in `e`'s chain, including a `ZipError::Io`'s (zip's
+/// `source` skips past it).
+fn io_errors(e: &anyhow::Error) -> impl Iterator<Item = &std::io::Error> {
+    e.chain().filter_map(|cause| {
+        cause.downcast_ref::<std::io::Error>().or_else(|| {
+            match cause.downcast_ref::<zip::result::ZipError>() {
+                Some(zip::result::ZipError::Io(io)) => Some(io),
+                _ => None,
+            }
+        })
+    })
+}
+
+/// `e` with context naming `action` and `path`, plus a hint to close
+/// whatever holds the path if `e` is an [`is_transient_fs_error`].
+pub fn fs_error(action: &str, path: &Path, e: impl Into<anyhow::Error>) -> anyhow::Error {
+    fs_error_on(cfg!(windows), action, path, e.into())
+}
+
+fn fs_error_on(windows: bool, action: &str, path: &Path, e: anyhow::Error) -> anyhow::Error {
+    let held = if io_errors(&e).any(|io| is_transient_on(windows, io)) {
+        format!(" ({HELD_HINT})")
+    } else {
+        String::new()
+    };
+    e.context(format!("{action} {}{held}", path.display()))
+}
+
+/// [`retry_transient`] for one filesystem call, failing as an [`fs_error`].
+pub fn retry_fs<T>(
+    action: &str,
+    path: &Path,
+    op: impl FnMut() -> std::io::Result<T>,
+) -> anyhow::Result<T> {
+    retry_transient(op).map_err(|e| fs_error(action, path, e))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -282,6 +392,96 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    fn os_error(code: i32) -> std::io::Error {
+        std::io::Error::from_raw_os_error(code)
+    }
+
+    #[test]
+    fn sharing_errors_are_transient_only_on_windows() {
+        for code in [5, 32, 33] {
+            assert!(is_transient_on(true, &os_error(code)), "{code}");
+            assert!(!is_transient_on(false, &os_error(code)), "{code}");
+        }
+        for code in [2, 3, 31, 34, 145] {
+            assert!(!is_transient_on(true, &os_error(code)), "{code}");
+        }
+        let no_code = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
+        assert!(!is_transient_on(true, &no_code));
+        assert_eq!(
+            is_transient_fs_error(&os_error(32)),
+            cfg!(windows),
+            "the runtime check follows the platform"
+        );
+    }
+
+    /// Calls `op` with the attempt count (from 1) through the retry loop,
+    /// with sharing errors transient and no real waiting.
+    fn run(
+        op: impl Fn(u32) -> std::io::Result<&'static str>,
+    ) -> (std::io::Result<&'static str>, u32) {
+        let calls = std::cell::Cell::new(0);
+        let got = retry_with(
+            || {
+                calls.set(calls.get() + 1);
+                op(calls.get())
+            },
+            |e| is_transient_on(true, e),
+            std::time::Duration::from_millis(1),
+        );
+        (got, calls.get())
+    }
+
+    #[test]
+    fn retry_transient_retries_only_transient_errors_and_stops_at_the_limit() {
+        let (got, calls) = run(|n| if n < 4 { Err(os_error(32)) } else { Ok("done") });
+        assert_eq!((got.unwrap(), calls), ("done", 4));
+
+        let (got, calls) = run(|_| Err(os_error(33)));
+        assert_eq!(got.unwrap_err().raw_os_error(), Some(33));
+        assert_eq!(calls, FS_ATTEMPTS);
+
+        let (got, calls) = run(|_| Err(os_error(2)));
+        assert!(got.is_err());
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn retry_fs_passes_success_through_on_every_platform() {
+        let dir = temp_dir("retry-fs");
+        let file = dir.join("f");
+        std::fs::write(&file, b"x").unwrap();
+        retry_fs("remove", &file, || std::fs::remove_file(&file)).unwrap();
+        assert!(!file.exists());
+        let err = retry_fs("remove", &file, || std::fs::remove_file(&file)).unwrap_err();
+        assert!(format!("{err:#}").contains(&file.display().to_string()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_held_path_error_names_the_path_and_what_to_do() {
+        let path = Path::new("C:\\llmman\\llama.cpp\\b1\\cuda-12");
+        let message =
+            |windows, e: anyhow::Error| format!("{:#}", fs_error_on(windows, "remove", path, e));
+
+        let held = message(true, os_error(5).into());
+        for needle in [
+            "remove",
+            &path.display().to_string(),
+            "another process",
+            "antivirus",
+            "llama-server",
+            "run the command again",
+        ] {
+            assert!(held.contains(needle), "{needle}: {held}");
+        }
+        let zipped = message(true, zip::result::ZipError::Io(os_error(32)).into());
+        assert!(zipped.contains("another process"), "{zipped}");
+
+        let plain = message(false, os_error(5).into());
+        assert!(plain.contains(&path.display().to_string()), "{plain}");
+        assert!(!plain.contains("another process"), "{plain}");
     }
 
     #[test]

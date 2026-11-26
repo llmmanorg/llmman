@@ -166,9 +166,12 @@ fn is_diffusers_manifest(manifest: &crate::storage::oci::Manifest) -> bool {
 /// "mmproj", the de facto convention GGUF repos use, since there's no
 /// media-type or metadata distinction to key off instead.
 fn is_mmproj_layer(l: &crate::storage::oci::Descriptor) -> bool {
-    layer_filepath(l)
-        .map(|p| p.to_lowercase().contains("mmproj"))
-        .unwrap_or(false)
+    layer_filepath(l).is_some_and(is_mmproj_name)
+}
+
+/// Whether a GGUF file name, in any case, is a companion projector's.
+fn is_mmproj_name(name: &str) -> bool {
+    name.to_lowercase().contains("mmproj")
 }
 
 // gguf_architecture/gguf_context_length_override (a GGUF metadata reader
@@ -505,7 +508,7 @@ pub fn chat_template(
             .str("tokenizer.chat_template")
             .map(str::to_string);
     }
-    let file = |name: &str| {
+    checkout_chat_template(|name| {
         manifest
             .layers
             .iter()
@@ -515,7 +518,17 @@ pub fn chat_template(
                     .is_some_and(|f| f == name)
             })
             .and_then(|l| read_layer_text(store, l).ok())
-    };
+    })
+}
+
+/// The checkout chat template of a model directory on disk.
+pub fn dir_chat_template(dir: &Path) -> Option<String> {
+    checkout_chat_template(|name| std::fs::read_to_string(dir.join(name)).ok())
+}
+
+/// A checkout's `chat_template.jinja`, else `tokenizer_config.json`'s
+/// `chat_template`, from `file` (a file's text by name).
+fn checkout_chat_template(file: impl Fn(&str) -> Option<String>) -> Option<String> {
     if let Some(jinja) = file("chat_template.jinja") {
         return Some(jinja);
     }
@@ -827,6 +840,64 @@ pub fn resolve_model(
     })
 }
 
+/// The `.gguf` files at the root of `dir`, by name.
+fn root_ggufs(dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
+    let mut ggufs: Vec<PathBuf> = std::fs::read_dir(dir)
+        .with_context(|| format!("read model directory {}", dir.display()))?
+        .filter_map(Result::ok)
+        .filter(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .to_lowercase()
+                .ends_with(".gguf")
+        })
+        .map(|e| e.path())
+        .filter(|p| p.is_file())
+        .collect();
+    ggufs.sort();
+    Ok(ggufs)
+}
+
+fn is_mmproj_path(p: &Path) -> bool {
+    p.file_name()
+        .is_some_and(|n| is_mmproj_name(&n.to_string_lossy()))
+}
+
+/// [`gguf_shard_count`] of a model directory.
+pub fn dir_gguf_shard_count(dir: &Path) -> usize {
+    let ggufs = root_ggufs(dir).unwrap_or_default();
+    match ggufs.iter().filter(|p| !is_mmproj_path(p)).count() {
+        0 => ggufs.len(),
+        weights => weights,
+    }
+}
+
+/// What a model directory on disk is served as, as [`resolve_model`] says of a
+/// stored one: a root `.gguf` (first non-`mmproj` is the model, first `mmproj`
+/// its projector), else a root `config.json` as safetensors. A Diffusers
+/// pipeline is refused: the media backend loads it from the store.
+pub fn resolve_model_dir(dir: &Path) -> anyhow::Result<ModelPath> {
+    let ggufs = root_ggufs(dir)?;
+    if let Some(primary) = ggufs.iter().find(|p| !is_mmproj_path(p)).or(ggufs.first()) {
+        let mmproj = ggufs.iter().find(|p| is_mmproj_path(p) && *p != primary);
+        return Ok(ModelPath::Gguf(primary.clone(), mmproj.cloned()));
+    }
+    if dir.join(DIFFUSERS_MODEL_INDEX).is_file() {
+        anyhow::bail!(
+            "{} is a Diffusers pipeline ({DIFFUSERS_MODEL_INDEX}); a mounted directory can serve \
+             a safetensors or GGUF model, and a pipeline only from the store",
+            dir.display()
+        );
+    }
+    if dir.join("config.json").is_file() {
+        return Ok(ModelPath::SafeTensors(dir.to_path_buf()));
+    }
+    anyhow::bail!(
+        "{} holds no model: expected config.json (safetensors) or a .gguf file at its root",
+        dir.display()
+    )
+}
+
 /// The model directory of an extracted checkout: the parent of the
 /// shallowest `config.json` or `model_index.json` (a Diffusers repo has a
 /// `config.json` per component, so "first in layer order" is wrong), else
@@ -1088,6 +1159,95 @@ mod tests {
         // SafeTensors (vllm/mlx) has no equivalent separate-projector-file
         // convention.
         assert_eq!(ModelPath::SafeTensors(PathBuf::from("/x")).mmproj(), None);
+    }
+
+    fn model_dir(files: &[&str]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        for f in files {
+            std::fs::write(dir.path().join(f), b"x").unwrap();
+        }
+        dir
+    }
+
+    #[test]
+    fn a_directory_with_a_root_config_json_is_a_safetensors_model() {
+        let dir = model_dir(&["config.json", "model-00001-of-00002.safetensors"]);
+        match resolve_model_dir(dir.path()).unwrap() {
+            ModelPath::SafeTensors(p) => assert_eq!(p, dir.path()),
+            other => panic!("served as {}", other.format()),
+        }
+    }
+
+    #[test]
+    fn a_directory_gguf_is_the_first_file_that_is_not_the_projector() {
+        let dir = model_dir(&[
+            "mmproj-F16.gguf",
+            "m-00002-of-00002.gguf",
+            "m-00001-of-00002.gguf",
+        ]);
+        match resolve_model_dir(dir.path()).unwrap() {
+            ModelPath::Gguf(p, mmproj) => {
+                assert_eq!(p, dir.path().join("m-00001-of-00002.gguf"));
+                assert_eq!(mmproj, Some(dir.path().join("mmproj-F16.gguf")));
+            }
+            other => panic!("served as {}", other.format()),
+        }
+    }
+
+    #[test]
+    fn a_directory_gguf_outranks_config_json_as_a_stored_one_does() {
+        let dir = model_dir(&["config.json", "m.Q4_K_M.gguf"]);
+        assert_eq!(resolve_model_dir(dir.path()).unwrap().format(), "gguf");
+    }
+
+    #[test]
+    fn a_directory_counts_its_gguf_shards_as_a_manifest_does() {
+        let count = |files: &[&str]| dir_gguf_shard_count(model_dir(files).path());
+        assert_eq!(
+            count(&[
+                "m-00001-of-00002.gguf",
+                "m-00002-of-00002.gguf",
+                "mmproj.gguf"
+            ]),
+            2
+        );
+        assert_eq!(count(&["m.gguf", "mmproj.gguf"]), 1);
+        assert_eq!(count(&["mmproj.gguf"]), 1);
+        assert_eq!(count(&["config.json"]), 0);
+    }
+
+    #[test]
+    fn a_directory_chat_template_is_read_as_a_checkouts_is() {
+        let dir = model_dir(&[]);
+        assert_eq!(dir_chat_template(dir.path()), None);
+        std::fs::write(
+            dir.path().join("tokenizer_config.json"),
+            br#"{"chat_template": "from config"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            dir_chat_template(dir.path()).as_deref(),
+            Some("from config")
+        );
+        std::fs::write(dir.path().join("chat_template.jinja"), "from jinja").unwrap();
+        assert_eq!(dir_chat_template(dir.path()).as_deref(), Some("from jinja"));
+    }
+
+    #[test]
+    fn a_directory_without_a_model_or_with_a_pipeline_is_refused() {
+        let empty = model_dir(&["README.md"]);
+        let err = resolve_model_dir(empty.path()).err().unwrap().to_string();
+        assert!(err.contains("holds no model"), "{err}");
+
+        let pipeline = model_dir(&["model_index.json", "config.json"]);
+        let err = resolve_model_dir(pipeline.path())
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(err.contains("Diffusers pipeline"), "{err}");
+
+        let missing = empty.path().join("nope");
+        assert!(resolve_model_dir(&missing).is_err());
     }
 
     fn descriptor(digest: &str, filepath: &str) -> crate::storage::oci::Descriptor {

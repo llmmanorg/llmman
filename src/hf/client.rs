@@ -55,24 +55,17 @@ impl HttpStatusError {
 /// well short of that instead.
 const RETRY_AFTER_CAP: Duration = Duration::from_secs(5 * 60);
 
-/// Parses a `Retry-After` header's delay-seconds form (e.g.
-/// `Retry-After: 30`). Returns `None` if absent, negative, or malformed.
-/// Doesn't parse the HTTP-date form — `huggingface_hub`'s own
-/// `_parse_retry_after` doesn't either, and every 429 seen from
-/// huggingface.co uses delay-seconds. Caps the result so an absurd
-/// header value can't produce an unreasonable sleep.
+/// A header value that is a non-negative whole number of seconds (the
+/// `Retry-After` delay form); `None` for anything else. Not capped.
+pub fn parse_delay_seconds(value: &str) -> Option<Duration> {
+    value.trim().parse::<u64>().ok().map(Duration::from_secs)
+}
+
+/// The `Retry-After` header's delay, capped at [`RETRY_AFTER_CAP`] so an
+/// absurd value can't produce an unreasonable sleep.
 fn parse_retry_after(headers: &HeaderMap) -> Option<Duration> {
-    let secs: i64 = headers
-        .get(reqwest::header::RETRY_AFTER)?
-        .to_str()
-        .ok()?
-        .trim()
-        .parse()
-        .ok()?;
-    if secs < 0 {
-        return None;
-    }
-    Some(Duration::from_secs(secs as u64).min(RETRY_AFTER_CAP))
+    let value = headers.get(reqwest::header::RETRY_AFTER)?.to_str().ok()?;
+    Some(parse_delay_seconds(value)?.min(RETRY_AFTER_CAP))
 }
 
 /// True for permanent HTTP client errors (no point retrying).

@@ -18,7 +18,7 @@ use super::backend::{
 };
 use super::hybrid::{request_pin, send_with_hybrid_fallback};
 use super::messages::content_text;
-use super::ollama::{is_embedding_overflow, listed_model_facts, truncate_embedding};
+use super::ollama::{is_embedding_overflow, listed_rows, truncate_embedding};
 use super::refusal::{explain_missing_route, unsupported_on_wire};
 use super::relay::{
     proxy, proxy_buffered, proxy_rewriting_model, relay, relay_chat_upstream,
@@ -35,19 +35,16 @@ use super::{
     LoadOptions, Target, Task, CHAT_COMPLETIONS_ROUTE,
 };
 use crate::ordered::Ordered;
-use crate::storage::OciStore;
 
 pub(super) async fn handle_openai_models(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, AppError> {
     let (store_path, cache_path) = (state.0.store_path.clone(), state.0.cache_path.clone());
+    let mounted = state.0.mounted.clone();
     // Off the worker: an uncached header is blocking reads.
     let rows = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-        let store = OciStore::open(&store_path)?;
-        let list = store.list()?;
-        let facts = listed_model_facts(&store, &store_path, &cache_path, &list);
-        Ok(list.into_iter().zip(facts).collect::<Vec<_>>())
+        listed_rows(&store_path, &cache_path, &mounted)
     })
     .await
     .context("list models task panicked")??;
