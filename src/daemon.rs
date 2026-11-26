@@ -977,6 +977,16 @@ fn bail_if_exited(
     child: &mut std::process::Child,
     log_path: Option<&std::path::Path>,
 ) -> anyhow::Result<()> {
+    check_child_startup(child, log_path, server_alive)
+}
+
+/// Probe only after observing an exited child, including when another
+/// caller won the bind. The injected probe makes that ordering testable.
+fn check_child_startup(
+    child: &mut std::process::Child,
+    log_path: Option<&std::path::Path>,
+    server_alive: impl FnOnce() -> bool,
+) -> anyhow::Result<()> {
     let pid = child.id();
     let Some(status) = child.try_wait().context("wait on llmman serve")? else {
         return Ok(());
@@ -1994,6 +2004,30 @@ fn encode_path_segment(segment: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[test]
+    fn an_exited_startup_child_reuses_a_competing_listener() {
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args(["-c", "exit 1"]);
+        detach(&mut cmd);
+        let mut child = cmd.spawn().unwrap();
+        assert!(!child.wait().unwrap().success());
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let probed = std::cell::Cell::new(false);
+        check_child_startup(&mut child, None, || {
+            probed.set(true);
+            std::net::TcpStream::connect(addr).is_ok()
+        })
+        .unwrap();
+        assert!(probed.get(), "an exited child must recheck the listener");
+
+        drop(listener);
+        let err = check_child_startup(&mut child, None, || false).unwrap_err();
+        assert!(err.to_string().contains("exited during startup"));
+    }
+
     use super::*;
 
     #[test]
