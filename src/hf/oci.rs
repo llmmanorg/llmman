@@ -267,6 +267,7 @@ pub fn write_blob(layout_dir: &Path, media_type: &str, data: &[u8]) -> Result<De
     let dest = dir.join(digest.trim_start_matches("sha256:"));
     if let Ok(m) = std::fs::metadata(&dest) {
         if m.len() as usize == data.len() {
+            crate::fsutil::touch(&dest);
             return Ok(Descriptor {
                 media_type: media_type.to_string(),
                 digest,
@@ -346,12 +347,7 @@ pub fn write_blob_from_file(
     // directly) is what keeps a concurrent writer of the same digest
     // from ever seeing a half-written blob at its final path.
     if dest.exists() {
-        // Reused: refresh its age so a concurrent sweep's grace window
-        // covers it until the caller's manifest or tag lands.
-        let _ = std::fs::OpenOptions::new()
-            .write(true)
-            .open(&dest)
-            .and_then(|f| f.set_modified(std::time::SystemTime::now()));
+        crate::fsutil::touch(&dest);
     } else {
         match std::fs::rename(&staged, &dest) {
             Ok(()) => {}
@@ -553,6 +549,20 @@ mod tests {
         assert_eq!(desc.size, 11);
         assert!(blob_exists(&dir, &desc));
         assert_eq!(read_blob(&dir, &desc.digest).unwrap(), b"hello world");
+    }
+
+    #[test]
+    fn rewriting_a_stored_blob_refreshes_its_age() {
+        let dir = tempfile();
+        let desc = write_blob(&dir, "text/plain", b"manifest").unwrap();
+        let path = digest_to_path(&dir, &desc.digest).unwrap();
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 60 * 60);
+        crate::fsutil::set_mtime(&path, old).unwrap();
+
+        write_blob(&dir, "text/plain", b"manifest").unwrap();
+
+        let age = std::fs::metadata(&path).unwrap().modified().unwrap();
+        assert!(age.elapsed().unwrap() < std::time::Duration::from_secs(60));
     }
 
     #[test]
