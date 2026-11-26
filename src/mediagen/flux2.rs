@@ -16,7 +16,7 @@ use super::ffi::{Api, Tensor};
 use super::flux_vae;
 use super::qwen3_text::Qwen3Text;
 use super::weights::{Index, LoadOpts, Weights};
-use super::{dump, GenParams, Mt19937, Output};
+use super::{dump, GenParams, Output};
 
 /// The distilled [klein] checkpoints: 4 steps, no guidance; the base ones
 /// (`*-base-*` files) are sampled for longer with guidance.
@@ -92,28 +92,34 @@ impl Hparams {
 
 /// `compute_empirical_mu` of the FLUX.2 sampler: the time shift for
 /// `seq_len` image tokens and `steps` steps.
-fn empirical_mu(seq_len: i64, steps: usize) -> f64 {
-    let (a1, b1, a2, b2) = (8.73809524e-05, 1.89833333, 0.00016927, 0.45666666);
-    let s = seq_len as f64;
+fn empirical_mu(seq_len: i64, steps: usize) -> f32 {
+    let (a1, b1, a2, b2) = (
+        8.738_095e-5_f32,
+        1.898_333_3_f32,
+        0.000_169_27_f32,
+        0.456_666_66_f32,
+    );
+    let s = seq_len as f32;
     if seq_len > 4300 {
         return a2 * s + b2;
     }
     let m200 = a2 * s + b2;
     let m10 = a1 * s + b1;
     let a = (m200 - m10) / 190.0;
-    a * steps as f64 + (m200 - 200.0 * a)
+    a * steps as f32 + (m200 - 200.0 * a)
 }
 
-/// `[steps]` sigmas from 1, time-shifted by [`empirical_mu`], then 0.
+/// `[steps]` sigmas from 1, time-shifted by [`empirical_mu`], then 0: sd.cpp's
+/// Flux2 scheduler, in f32 like it.
 fn sigmas(steps: usize, seq_len: i64) -> Vec<f32> {
     let mu = empirical_mu(seq_len, steps).exp();
     (0..steps)
         .map(|i| {
-            let t = 1.0 - i as f64 / steps as f64;
+            let t = 1.0 - i as f32 / steps as f32;
             if t >= 1.0 {
                 1.0
             } else {
-                (mu / (mu + (1.0 / t - 1.0))) as f32
+                mu / (mu + (1.0 / t - 1.0))
             }
         })
         .chain([0.0])
@@ -193,12 +199,15 @@ pub fn check_size(p: &GenParams, flash: bool) -> Result<(i64, i64)> {
     if w > MAX_PIXELS / h {
         bail!("FLUX.2 generates at most 2048x2048 pixels, got {w}x{h}");
     }
+    for f in &p.ref_images {
+        check_reference(f)?;
+    }
     let tokens = PROMPT_TOKENS as i64
         + (w / SCALE) * (h / SCALE)
         + p.ref_images
             .iter()
             .map(|f| {
-                let (rw, rh) = ref_size(f.width, f.height);
+                let (rw, rh) = ref_size(f.width, f.height, w, h);
                 (rw / SCALE) * (rh / SCALE)
             })
             .sum::<i64>();
@@ -216,21 +225,36 @@ pub fn check_size(p: &GenParams, flash: bool) -> Result<(i64, i64)> {
     Ok((w, h))
 }
 
-/// A reference image's size for encoding: within [`MAX_REF_PIXELS`],
-/// sides rounded down to multiples of 16, aspect kept.
-fn ref_size(w: i64, h: i64) -> (i64, i64) {
-    let scale = ((MAX_REF_PIXELS as f64) / (w * h) as f64).sqrt().min(1.0);
-    let fit = |v: i64| ((v as f64 * scale) as i64 / SCALE * SCALE).max(SCALE);
-    let (mut w, mut h) = (fit(w), fit(h));
-    // a side raised to SCALE can push the area over: trim the longer one
-    while w * h > MAX_REF_PIXELS {
-        if w >= h {
-            w -= SCALE;
+/// A reference image's pixels match its size.
+fn check_reference(f: &super::Frames) -> Result<()> {
+    if f.width <= 0 || f.height <= 0 || f.rgb.len() as i64 != f.width * f.height * 3 {
+        bail!(
+            "reference image: bad size {}x{} or pixel buffer",
+            f.width,
+            f.height
+        );
+    }
+    Ok(())
+}
+
+/// A reference image's size for encoding, as stable-diffusion.cpp's server
+/// picks it: the output's area up to [`MAX_REF_PIXELS`], aspect kept, sides
+/// rounded to multiples of 16.
+fn ref_size(w: i64, h: i64, out_w: i64, out_h: i64) -> (i64, i64) {
+    let pixels = MAX_REF_PIXELS.min(out_w * out_h);
+    let side = (pixels as f64 * w as f64 / h as f64).sqrt();
+    let r = |v: f64| ((v / SCALE as f64).round() as i64 * SCALE).max(SCALE);
+    let (mut rw, mut rh) = (r(side), r(side * h as f64 / w as f64));
+    // only extreme aspect ratios, a side raised to 16, round far over: trim
+    // (outputs are at least 16x16, so this stops by 16x16)
+    while rw * rh > pixels * 5 / 4 {
+        if rw >= rh {
+            rw -= SCALE;
         } else {
-            h -= SCALE;
+            rh -= SCALE;
         }
     }
-    (w, h)
+    (rw, rh)
 }
 
 pub struct Model {
@@ -558,22 +582,29 @@ impl Model {
     /// A reference image as transformer tokens `[h*w][in_channels]` with
     /// `(h, w)`: resized, encoded (the posterior's mean), packed 2x2 and
     /// batch-normalized, as the sampled latents are before decoding.
-    fn reference(&self, be: &Backend, f: &super::Frames) -> Result<(Vec<f32>, i64, i64)> {
+    fn reference(
+        &self,
+        be: &Backend,
+        f: &super::Frames,
+        out_w: i64,
+        out_h: i64,
+    ) -> Result<(Vec<f32>, i64, i64)> {
         let t0 = Instant::now();
-        let (w, h) = ref_size(f.width, f.height);
-        let img = image::RgbImage::from_raw(f.width as u32, f.height as u32, f.rgb.clone())
-            .ok_or_else(|| anyhow!("reference image: bad pixel buffer"))?;
-        let img = if (w, h) == (f.width, f.height) {
-            img
-        } else {
-            image::imageops::resize(
-                &img,
-                w as u32,
-                h as u32,
-                image::imageops::FilterType::Lanczos3,
-            )
-        };
-        let z = flux_vae::encode(&self.vae, be, img.as_raw(), h, w)?;
+        check_reference(f)?;
+        let (w, h) = ref_size(f.width, f.height, out_w, out_h);
+        // as sd-server: [0, 1] floats stretched to the size, then [-1, 1]
+        let rgb: Vec<f32> = super::encode::resize_bilinear(
+            |i| f.rgb[i] as f32 / 255.0,
+            f.width as usize,
+            f.height as usize,
+            3,
+            w as usize,
+            h as usize,
+        )
+        .into_iter()
+        .map(|v| v * 2.0 - 1.0)
+        .collect();
+        let z = flux_vae::encode_f32(&self.vae, be, &rgb, h, w)?;
         let (lh, lw) = (h / SCALE, w / SCALE);
         let c = self.hp.in_channels as usize;
         let n = (lh * lw) as usize;
@@ -694,7 +725,7 @@ impl Model {
         let refs = p
             .ref_images
             .iter()
-            .map(|f| self.reference(be, f))
+            .map(|f| self.reference(be, f, w, h))
             .collect::<Result<Vec<_>>>()?;
         be.release_compute()?;
 
@@ -704,8 +735,8 @@ impl Model {
         let seed = p.seed.unwrap_or_else(super::rand_seed);
         let mut noise = vec![0f32; c * n];
         if !super::cosmos3::noise_from_env("MEDIAGEN_NOISE", &mut noise)? {
-            let mut rng = Mt19937::new(seed);
-            noise.iter_mut().for_each(|v| *v = rng.normal());
+            // stable-diffusion.cpp's default noise: the same seed, the same image
+            noise = super::philox_randn(seed as u64, noise.len());
         }
         dump("noise", &noise);
         let mut x = to_tokens(&noise, c, n);
@@ -807,17 +838,20 @@ mod tests {
             width: 1024,
             height: 1024,
             n_frames: 1,
-            ..Default::default()
+            rgb: vec![0; 1024 * 1024 * 3],
         });
         assert!(check_size(&p, false).is_err());
         assert!(check_size(&p, true).is_ok());
+        // a reference whose pixels don't match its size is refused, not sized
+        p.ref_images[0].height = 0;
+        assert!(check_size(&p, true).is_err());
     }
 
     #[test]
     fn sigmas_follow_the_empirical_shift() {
         // diffusers' compute_empirical_mu(4096, 4) = 2.29118, then
         // FlowMatchEulerDiscreteScheduler's exponential time shift
-        assert!((empirical_mu(4096, 4) - 2.291180).abs() < 1e-5);
+        assert!((empirical_mu(4096, 4) - 2.291_18).abs() < 1e-5);
         let want = [1.0, 0.967384, 0.908144, 0.767200, 0.0];
         let s = sigmas(4, 4096);
         assert_eq!(s.len(), want.len());
@@ -853,14 +887,17 @@ mod tests {
     }
 
     #[test]
-    fn references_fit_the_pixel_budget_in_multiples_of_16() {
-        assert_eq!(ref_size(512, 512), (512, 512));
-        assert_eq!(ref_size(500, 300), (496, 288));
-        let (w, h) = ref_size(4000, 3000);
-        assert!(w * h <= MAX_REF_PIXELS && w % 16 == 0 && h % 16 == 0);
-        assert_eq!(ref_size(8, 8), (16, 16));
-        // a side raised to 16 does not lift the area over the budget
-        let (w, h) = ref_size(8, 81920);
-        assert!(w * h <= MAX_REF_PIXELS && (w, h) == (16, 65536));
+    fn references_take_the_output_area_like_sd_cpp() {
+        // up to the output's area, down to 1024x1024, rounded to 16
+        assert_eq!(ref_size(512, 512, 1024, 1024), (1024, 1024));
+        assert_eq!(ref_size(840, 465, 640, 640), (864, 480));
+        assert_eq!(ref_size(4000, 3000, 2048, 2048), (1184, 880));
+        assert_eq!(ref_size(500, 300, 512, 512), (656, 400));
+        // extreme aspect ratios stay within the output's area
+        let (w, h) = ref_size(8, 4096, 2048, 2048);
+        assert!(w * h <= MAX_REF_PIXELS * 5 / 4 && w % 16 == 0 && h % 16 == 0);
+        let (w, h) = ref_size(4096, 8, 64, 64);
+        assert!(w * h <= 64 * 64 * 5 / 4 && w % 16 == 0 && h % 16 == 0);
+        assert_eq!(ref_size(4096, 1, 16, 16), (16, 16));
     }
 }

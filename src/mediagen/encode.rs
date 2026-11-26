@@ -178,6 +178,61 @@ pub fn image_dimensions(bytes: &[u8]) -> Result<(u32, u32)> {
         .context("reading the image size (PNG or JPEG)")
 }
 
+/// stable-diffusion.cpp's `tensor::interpolate(mode = "bilinear")` of an
+/// interleaved `[h][w][ch]` image to `nw x nh`: PyTorch's half-pixel
+/// bilinear without antialiasing, edges clamped, summed in f64. Reference
+/// images go through it so they reach the VAE as sd.cpp's do. `px(i)` is the
+/// input's value `i`, read only at the taps the output needs.
+pub fn resize_bilinear(
+    px: impl Fn(usize) -> f32,
+    w: usize,
+    h: usize,
+    ch: usize,
+    nw: usize,
+    nh: usize,
+) -> Vec<f32> {
+    // per output index: (input index, weight) pairs
+    let taps = |input: usize, output: usize| -> Vec<Vec<(usize, f64)>> {
+        let scale = input as f64 / output as f64;
+        (0..output)
+            .map(|o| {
+                let center = (o as f64 + 0.5) * scale - 0.5;
+                let mut t: Vec<(usize, f64)> = ((center - 1.0).ceil() as i64
+                    ..=(center + 1.0).floor() as i64)
+                    .filter_map(|i| {
+                        let wt = 1.0 - (center - i as f64).abs();
+                        (wt > 0.0 && (center - i as f64).abs() < 1.0)
+                            .then(|| (i.clamp(0, input as i64 - 1) as usize, wt))
+                    })
+                    .collect();
+                if t.is_empty() {
+                    t.push((
+                        ((center + 0.5).floor() as i64).clamp(0, input as i64 - 1) as usize,
+                        1.0,
+                    ));
+                }
+                t
+            })
+            .collect()
+    };
+    let (xs, ys) = (taps(w, nw), taps(h, nh));
+    let mut out = vec![0f32; nw * nh * ch];
+    for (y, yt) in ys.iter().enumerate() {
+        for (x, xt) in xs.iter().enumerate() {
+            for c in 0..ch {
+                let mut v = 0f64;
+                for &(iy, wy) in yt {
+                    for &(ix, wx) in xt {
+                        v += px((iy * w + ix) * ch + c) as f64 * wx * wy;
+                    }
+                }
+                out[(y * nw + x) * ch + c] = v as f32;
+            }
+        }
+    }
+    out
+}
+
 /// A PNG/JPEG (or a data URL) as one RGB frame.
 pub fn decode_image(bytes: &[u8]) -> Result<super::Frames> {
     let img = image::load_from_memory(bytes)
@@ -261,6 +316,22 @@ pub fn decode_video(bytes: &[u8]) -> Result<super::Frames> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resize_bilinear_matches_torch_half_pixel() {
+        // torch.nn.functional.interpolate([[0, 1, 2, 3]], size=2/6, mode="linear")
+        let row = [0.0, 1.0, 2.0, 3.0];
+        assert_eq!(resize_bilinear(|i| row[i], 4, 1, 1, 2, 1), [0.5, 2.5]);
+        let up = resize_bilinear(|i| row[i], 4, 1, 1, 6, 1);
+        let want = [0.0, 0.5, 1.1666667, 1.8333333, 2.5, 3.0];
+        assert!(
+            up.iter().zip(want).all(|(a, b)| (a - b).abs() < 1e-6),
+            "{up:?}"
+        );
+        // same size: unchanged; channels stay apart
+        let px = [0.1, 0.9, 0.2, 0.8, 0.3, 0.7, 0.4, 0.6];
+        assert_eq!(resize_bilinear(|i| px[i], 2, 2, 2, 2, 2), px);
+    }
 
     #[test]
     fn png_has_valid_signature_and_chunks() {

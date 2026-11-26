@@ -344,6 +344,56 @@ impl Mt19937 {
     }
 }
 
+/// `n` standard normal samples from stable-diffusion.cpp's default `cuda`
+/// RNG (Philox 4x32-10 with a Box-Muller sine, A1111's imitation of
+/// `torch.randn` on CUDA), drawn as one call: the image models start from
+/// the same noise as sd.cpp for the same seed.
+pub(super) fn philox_randn(seed: u64, n: usize) -> Vec<f32> {
+    const M: [u32; 2] = [0xD251_1F53, 0xCD9E_8D57];
+    const W: [u32; 2] = [0x9E37_79B9, 0xBB67_AE85];
+    const INV: f32 = 2.328_306_4e-10;
+    const INV_2PI: f32 = 2.328_306_4e-10 * 6.283_185_5;
+    (0..n)
+        .map(|i| {
+            // counter (offset 0, 0, i, 0), key the seed's two halves
+            let mut c = [0u32, 0, i as u32, 0];
+            let (mut k0, mut k1) = (seed as u32, (seed >> 32) as u32);
+            for round in 0..10 {
+                if round > 0 {
+                    k0 = k0.wrapping_add(W[0]);
+                    k1 = k1.wrapping_add(W[1]);
+                }
+                let v1 = c[0] as u64 * M[0] as u64;
+                let v2 = c[2] as u64 * M[1] as u64;
+                c = [
+                    (v2 >> 32) as u32 ^ c[1] ^ k0,
+                    v2 as u32,
+                    (v1 >> 32) as u32 ^ c[3] ^ k1,
+                    v1 as u32,
+                ];
+            }
+            // C++ compilers contract `x * a + b` into one fma on arm64
+            let u = (c[0] as f32).mul_add(INV, INV / 2.0);
+            let v = (c[1] as f32).mul_add(INV_2PI, INV_2PI / 2.0);
+            box_muller(u, v)
+        })
+        .collect()
+}
+
+/// sd.cpp's `sqrt(-2.0f * log(u))` and `s * sin(v)` on floats: libc++
+/// (macOS) has float overloads of `log` and `sin`, libstdc++ (Linux)
+/// resolves them to the double functions. Either way `s` is a float.
+#[cfg(target_os = "macos")]
+fn box_muller(u: f32, v: f32) -> f32 {
+    (-2.0 * u.ln()).sqrt() * v.sin()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn box_muller(u: f32, v: f32) -> f32 {
+    let s = (-2.0 * (u as f64).ln()).sqrt() as f32;
+    (s as f64 * (v as f64).sin()) as f32
+}
+
 impl Context {
     pub fn init(api: &'static Api, p: &ContextParams) -> Result<Context> {
         if qwen_image::is_pipeline_index(&p.model) {
@@ -933,6 +983,37 @@ mod tests {
             v = r.next_u32();
         }
         assert_eq!(v, 4123659995);
+    }
+
+    #[test]
+    fn philox_randn_matches_stable_diffusion_cpp() {
+        // sd.cpp `make_rng("cuda", seed = 42)`, `randn_like` of 262144 values,
+        // built on Linux (libstdc++) and on macOS (libc++)
+        let v = philox_randn(42, 262_144);
+        let bits = |x: f32| x.to_bits();
+        assert_eq!(bits(v[0]), u32::from_le_bytes([0xe2, 0xac, 0x46, 0x3e]));
+        assert_eq!(bits(v[1]), u32::from_le_bytes([0xf3, 0x53, 0x0a, 0x40]));
+        // the last bit of some values depends on the C++ library (see
+        // box_muller); only Linux and macOS have verified goldens
+        let (v2, v3) = if cfg!(target_os = "macos") {
+            ([0x09, 0x2e, 0x30, 0xbe], [0x00, 0x5c, 0x59, 0x3f])
+        } else {
+            ([0x08, 0x2e, 0x30, 0xbe], [0x01, 0x5c, 0x59, 0x3f])
+        };
+        let (v2, v3) = (u32::from_le_bytes(v2), u32::from_le_bytes(v3));
+        if cfg!(any(target_os = "linux", target_os = "macos")) {
+            assert_eq!((bits(v[2]), bits(v[3])), (v2, v3));
+        } else {
+            assert!(bits(v[2]).abs_diff(v2) <= 1 && bits(v[3]).abs_diff(v3) <= 1);
+        }
+        assert_eq!(
+            bits(v[100_000]),
+            u32::from_le_bytes([0x6e, 0xb3, 0x90, 0x3f])
+        );
+        assert_eq!(
+            bits(v[262_143]),
+            u32::from_le_bytes([0x48, 0xa2, 0xe8, 0x3f])
+        );
     }
 
     #[test]

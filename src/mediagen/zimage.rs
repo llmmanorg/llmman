@@ -19,11 +19,11 @@ use super::ffi::{Api, Tensor};
 use super::flux_vae;
 use super::ltx::text::TextEncoder;
 use super::weights::{Index, LoadOpts, Weights};
-use super::{dump, GenParams, Mt19937, Output};
+use super::{dump, GenParams, Output};
 
-/// Z-Image-Turbo defaults: 8 transformer evaluations (diffusers'
-/// `num_inference_steps=9`, whose last step is from 0 to 0), no guidance, 1024x1024.
-pub const DEFAULT_STEPS: i32 = 8;
+/// Z-Image-Turbo defaults: 9 steps (as diffusers and stable-diffusion.cpp),
+/// no guidance, 1024x1024.
+pub const DEFAULT_STEPS: i32 = 9;
 pub const DEFAULT_SIZE: i64 = 1024;
 /// The largest image (2048x2048, 16384 tokens): attention over the joint
 /// sequence grows with its square.
@@ -136,12 +136,22 @@ fn dit_name(n: &str) -> Option<String> {
     Some(s)
 }
 
-/// `n + 1` sigmas from 1 to 0, shifted: `n` steps.
+/// stable-diffusion.cpp's discrete flow schedule in f32: timesteps `t` from
+/// 999 down to 0, each at sigma `shift((t + 1) / 1000)` with [`SHIFT`], then
+/// 0. A step count gives the same sigmas in both, from 1 down to 0.003.
 fn sigmas(n: usize) -> Vec<f32> {
-    let shift = |s: f64| SHIFT * s / (1.0 + (SHIFT - 1.0) * s);
-    (0..=n)
-        .map(|i| shift(1.0 - i as f64 / n as f64) as f32)
-        .collect()
+    let sigma = |t: f32| {
+        let (a, x) = (SHIFT as f32, (t + 1.0) / 1000.0);
+        a * x / (1.0 + (a - 1.0) * x)
+    };
+    let mut s: Vec<f32> = if n == 1 {
+        vec![sigma(999.0)]
+    } else {
+        let step = 999.0f32 / (n - 1) as f32;
+        (0..n).map(|i| sigma(999.0 - step * i as f32)).collect()
+    };
+    s.push(0.0);
+    s
 }
 
 fn pad_to(n: i64, m: i64) -> i64 {
@@ -601,12 +611,12 @@ impl Model {
         let seed = p.seed.unwrap_or_else(super::rand_seed);
         let mut noise = vec![0f32; (c * lh * lw) as usize];
         if !super::cosmos3::noise_from_env("MEDIAGEN_NOISE", &mut noise)? {
-            let mut rng = Mt19937::new(seed);
-            noise.iter_mut().for_each(|v| *v = rng.normal());
+            // stable-diffusion.cpp's default noise: the same seed, the same image
+            noise = super::philox_randn(seed as u64, noise.len());
         }
         dump("noise", &noise);
-        let mut x = patchify(&noise, c, lh, lw);
         let sig = sigmas(steps as usize);
+        let mut x = patchify(&noise, c, lh, lw);
         eprintln!(
             "[llmman] mediagen: generating {w}x{h}, {} tokens, {steps} steps, cfg {cfg:.1}, seed {seed}",
             ph * pw
@@ -683,15 +693,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn sigmas_are_shifted_and_end_at_zero() {
-        let s = sigmas(8);
-        assert_eq!(s.len(), 9);
-        assert_eq!(s[0], 1.0);
-        assert_eq!(s[8], 0.0);
-        assert!(s.windows(2).all(|w| w[0] > w[1]));
-        // shift 3 at s = 0.5: 1.5 / 2
-        let mid = sigmas(2)[1];
-        assert!((mid - 0.75).abs() < 1e-6);
+    fn sigmas_follow_sd_cpp_discrete_flow() {
+        // sd.cpp's z_image sigmas for 9 steps (dumped from its DGL program)
+        let want: [f32; 10] = [
+            1.0,
+            0.9545951,
+            0.90012,
+            0.8335554,
+            0.7503749,
+            0.643469,
+            0.50099903,
+            0.30167764,
+            0.002994012,
+            0.0,
+        ];
+        assert_eq!(sigmas(9), want);
     }
 
     #[test]
