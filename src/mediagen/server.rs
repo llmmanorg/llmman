@@ -149,16 +149,21 @@ fn common_params(body: &Value, default_size: (i64, i64)) -> Result<GenParams, Er
 }
 
 /// The reference images of `/v1/images/generations`, still encoded:
-/// `image` (one) or `images` (a list), each PNG or JPEG as base64 or a data URL.
-fn reference_items(body: &Value) -> Result<Vec<Value>, Error> {
-    let items: Vec<Value> = match (body.get("image"), body.get("images")) {
+/// `image` (one) or `images` (a list), each PNG or JPEG as base64 or a data URL,
+/// with the field it came in (`image` or `images[i]`) for errors.
+fn reference_items(body: &Value) -> Result<Vec<(String, Value)>, Error> {
+    let items: Vec<(String, Value)> = match (body.get("image"), body.get("images")) {
         (Some(_), Some(_)) => {
             return Err(Error::Invalid(
                 "pass \"image\" or \"images\", not both".into(),
             ))
         }
-        (Some(v), None) => vec![v.clone()],
-        (None, Some(Value::Array(a))) => a.clone(),
+        (Some(v), None) => vec![("image".into(), v.clone())],
+        (None, Some(Value::Array(a))) => a
+            .iter()
+            .enumerate()
+            .map(|(i, v)| (format!("images[{i}]"), v.clone()))
+            .collect(),
         (None, Some(_)) => return Err(Error::Invalid("\"images\" must be a list".into())),
         (None, None) => Vec::new(),
     };
@@ -173,10 +178,11 @@ fn reference_items(body: &Value) -> Result<Vec<Value>, Error> {
 /// [`reference_items`] decoded, after their headers pass the size limits:
 /// [`MAX_DIM`] a side (resizing allocates a row of the source width) and
 /// [`MAX_REFERENCE_PIXELS`] together. CPU-bound: run it off the async runtime.
-fn decode_references(items: Vec<Value>) -> Result<Vec<super::Frames>, Error> {
+fn decode_references(items: Vec<(String, Value)>) -> Result<Vec<super::Frames>, Error> {
+    // by value: each base64 string is freed once decoded
     let encoded = items
-        .iter()
-        .map(|v| decode_b64(v, "images"))
+        .into_iter()
+        .map(|(k, v)| decode_b64(&v, &k))
         .collect::<Result<Vec<_>, Error>>()?;
     let mut pixels = 0u64;
     for bytes in &encoded {
@@ -727,10 +733,21 @@ mod tests {
 
     #[test]
     fn references_over_max_dim_a_side_are_refused_before_decoding() {
-        let ok = decode_references(vec![png_b64(64, 32)]).ok().unwrap();
+        let item = |v| vec![("image".to_string(), v)];
+        let ok = decode_references(item(png_b64(64, 32))).ok().unwrap();
         assert_eq!((ok[0].width, ok[0].height), (64, 32));
-        let wide = decode_references(vec![png_b64(MAX_DIM as u32 + 1, 1)]);
+        let wide = decode_references(item(png_b64(MAX_DIM as u32 + 1, 1)));
         assert!(matches!(wide, Err(Error::Invalid(m)) if m.contains("a side")));
+    }
+
+    #[test]
+    fn reference_errors_name_the_field_they_came_in() {
+        let bad = |body: Value| match decode_references(reference_items(&body).ok().unwrap()) {
+            Err(Error::Invalid(m)) => m,
+            _ => panic!("invalid base64 accepted"),
+        };
+        assert!(bad(json!({ "image": "!" })).starts_with("\"image\""));
+        assert!(bad(json!({ "images": [png_b64(8, 8), "!"] })).starts_with("\"images[1]\""));
     }
 
     #[test]
