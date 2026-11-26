@@ -39,13 +39,11 @@ pub struct ThinkingControls {
     /// empty think block where the template has no switch).
     pub thinks: bool,
     /// The template reads `enable_thinking`, so a kwarg turns thinking on
-    /// as well as off (Gemma 4 defaults it off).
+    /// as well as off.
     pub enable_thinking: bool,
     /// The `reasoning_effort` levels it distinguishes, lowest first; empty
     /// when it reads none.
     pub efforts: Vec<&'static str>,
-    /// Thinking is on when a request says nothing (Gemma 4's is off).
-    pub default_on: bool,
     /// The level the template uses without `reasoning_effort`:
     /// `reasoning_effort|default('xhigh')`.
     pub default_effort: Option<&'static str>,
@@ -74,7 +72,19 @@ impl ThinkingControls {
 
     /// The `think` values `/api/show` reports: off, then the template's
     /// levels, or [`BUDGETED_EFFORT_LEVELS`] if `budgeted` and it is
-    /// switch-only, else on. The default is what an omitted `think` does.
+    /// switch-only, else on. The default is what an omitted `think`
+    /// does, which is thinking: llama-server defines `enable_thinking`
+    /// itself when it renders a model's own template, and renders it as
+    /// a request asking to think would, whatever default the template
+    /// names — measured against Qwen3.5 0.8B, Qwen3 0.6B and SmolLM3 3B
+    /// on llama.cpp b10621, b10809 and b10964.
+    ///
+    /// Reading that default off the template text instead, and sending
+    /// `enable_thinking: false` to hold llama-server to it, was the
+    /// other way out of #888. It is dropped because the reading was
+    /// wrong in both directions, SmolLM3's `is not defined` shape among
+    /// them, so it would have switched thinking off on a model whose
+    /// own template switches it on.
     pub fn thinking(&self, budgeted: bool) -> Option<Thinking> {
         if !self.thinks {
             return None;
@@ -89,9 +99,8 @@ impl ThinkingControls {
         let default = match levels {
             [] => {
                 values.push(true.into());
-                self.default_on.into()
+                true.into()
             }
-            _ if !self.default_on => false.into(),
             _ => self
                 .default_effort
                 .filter(|level| levels.contains(level))
@@ -158,19 +167,7 @@ pub fn thinking_controls(template: &str) -> ThinkingControls {
     } else {
         Vec::new()
     };
-    // Thinking starts on unless the template reads the switch only to turn it on.
     let squeezed: String = lower.split_whitespace().collect();
-    let default_on = !enable_thinking
-        || [
-            "enable_thinkingisfalse",
-            "enable_thinking==false",
-            "notenable_thinking",
-            "enable_thinkingisundefinedor",
-            "enable_thinkingisnotdefinedor",
-            "enable_thinking|default(true)",
-        ]
-        .iter()
-        .any(|test| squeezed.contains(test));
     let default_effort = squeezed
         .split_once("reasoning_effort|default(")
         .and_then(|(_, rest)| {
@@ -185,7 +182,6 @@ pub fn thinking_controls(template: &str) -> ThinkingControls {
         thinks,
         enable_thinking,
         efforts,
-        default_on,
         default_effort,
     }
 }
@@ -363,7 +359,6 @@ mod tests {
                 thinks: true,
                 enable_thinking: true,
                 efforts: vec!["low", "medium", "xhigh"],
-                default_on: true,
                 default_effort: Some("xhigh"),
             }
         );
@@ -459,38 +454,34 @@ mod tests {
             thinking(gpt_oss, true),
             Some((json!([false, "low", "medium", "high"]), json!("medium")))
         );
-        // A switch that only sees `false` starts on; Gemma 4's starts off.
-        let qwen3_5 = "{%- if enable_thinking is defined and enable_thinking is false %}<think></think>{%- endif %}";
-        let undefined =
-            "{%- if enable_thinking is not defined or enable_thinking %}<think>{%- endif %}";
-        assert_eq!(
-            thinking(undefined, false),
-            Some((json!([false, true]), json!(true)))
-        );
-        let gemma4 = "{%- set enable_thinking = enable_thinking | default(false) -%}{%- if enable_thinking -%}<|think|>{%- endif -%}";
-        assert_eq!(
-            thinking(qwen3_5, false),
-            Some((json!([false, true]), json!(true)))
-        );
-        assert_eq!(
-            thinking(gemma4, false),
-            Some((json!([false, true]), json!(false)))
-        );
-        // llmman bounds a switch's levels where it can: Qwen3.5 0.8B, #816.
-        assert_eq!(
-            thinking(qwen3_5, true),
-            Some((
-                json!([false, "minimal", "low", "medium", "high"]),
-                json!("medium")
-            ))
-        );
-        assert_eq!(
-            thinking(gemma4, true),
-            Some((
-                json!([false, "minimal", "low", "medium", "high"]),
-                json!(false)
-            ))
-        );
+        // A switch reports thinking whatever default its own template
+        // names, llama-server having defined `enable_thinking` before
+        // the template runs: Qwen3 0.6B's `is false`, SmolLM3's `is not
+        // defined`, Gemma 4's `default(false)`, Qwen3.5 0.8B's `is true`.
+        let switches = [
+            "{%- if enable_thinking is defined and enable_thinking is false %}<think></think>{%- endif %}",
+            "{%- if enable_thinking is not defined or enable_thinking %}<think>{%- endif %}",
+            "{%- if enable_thinking is not defined %}{%- set enable_thinking = true %}{%- endif %}\
+             {%- if enable_thinking %}<think>{%- endif %}",
+            "{%- set enable_thinking = enable_thinking | default(false) -%}{%- if enable_thinking -%}<|think|>{%- endif -%}",
+            "{%- if enable_thinking is defined and enable_thinking is true %}<think>{%- else %}<think></think>{%- endif %}",
+        ];
+        for switch in switches {
+            assert_eq!(
+                thinking(switch, false),
+                Some((json!([false, true]), json!(true))),
+                "{switch}"
+            );
+            // llmman bounds a switch's levels where it can: #816.
+            assert_eq!(
+                thinking(switch, true),
+                Some((
+                    json!([false, "minimal", "low", "medium", "high"]),
+                    json!("medium")
+                )),
+                "{switch}"
+            );
+        }
         // Thinking nothing reads: always on, can be switched off.
         let kimi =
             "{%- if thinking is defined and thinking is false -%}<think></think>{%- endif -%}";
