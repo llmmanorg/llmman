@@ -28,9 +28,10 @@ use tokio::time::{sleep, Duration, Instant};
 
 use crate::default_store;
 use crate::llama_release::LlamaPin;
+use crate::mediagen::server::GENERATION_BODY_LIMIT_BYTES;
 use crate::metrics::{self, UnloadReason};
 use crate::modelpack::{resolve_model, ModelPath};
-use crate::providers::{Wire, PLACEHOLDER_API_KEY};
+use crate::providers::Wire;
 use crate::storage::OciStore;
 
 mod aggregation;
@@ -42,6 +43,7 @@ mod gemini;
 mod hybrid;
 mod managed;
 mod messages;
+pub(crate) mod mounted;
 mod ollama;
 mod openai;
 mod realtime;
@@ -52,6 +54,7 @@ pub mod runtime;
 mod sched;
 pub(crate) use sched::parse_keep_alive_str;
 mod search;
+mod sessions;
 mod shell;
 mod stream;
 mod types;
@@ -77,7 +80,7 @@ use config::{
     threads_from_env_or_host, tls_from_env, whole_prompt_batch, MAX_CTX_SHRINK_ATTEMPTS,
 };
 pub use config::{context_length_from_env, DEFAULT_CTX_SIZE};
-use gemini::{gemini_method, handle_pinned_gemini};
+use gemini::{gemini_method, handle_pinned_gemini, routed_model};
 use hybrid::resolve_hybrid_side;
 use ollama::{
     handle_blob_head, handle_blob_upload, handle_copy, handle_create, handle_delete, handle_embed,
@@ -344,6 +347,8 @@ struct Inner {
     memory: u64,
     store_path: PathBuf,
     cache_path: PathBuf,
+    // LLMMAN_MODEL_DIRS: model directories served in place.
+    mounted: mounted::MountedModels,
     // `record_prompt`'s file; None under LLMMAN_NOHISTORY (and in tests).
     prompt_log: Option<PathBuf>,
     // `usage::record_usage`'s file; None under LLMMAN_NOUSAGE (and in tests).
@@ -1091,6 +1096,9 @@ fn canonical_ref(store_path: &std::path::Path, model_ref: &str) -> String {
 /// Best-effort: a spelling that does not resolve is returned unchanged,
 /// so the lookup finds nothing rather than the wrong model.
 fn running_key(state: &AppState, model_ref: &str) -> String {
+    if let Some(m) = state.0.mounted.find(model_ref) {
+        return m.name.clone();
+    }
     let resolved =
         crate::shortnames::resolve_ollama_api(model_ref).unwrap_or_else(|_| model_ref.to_string());
     canonical_ref(&state.0.store_path, &crate::storage::default_tag(&resolved))
@@ -1175,7 +1183,11 @@ fn stored_tag_for_digest(store_path: &std::path::Path, reference: &str) -> Optio
 /// first: by its key, and by the digest it records when the key cannot be
 /// had from the store any more.
 async fn unload_model(state: &AppState, model: &str) -> Result<(), AppError> {
-    let lock_key = load_identity(&state.0.store_path, model).map_err(AppError::bad_request)?;
+    let mounted = state.0.mounted.find(model);
+    let lock_key = match mounted {
+        Some(m) => m.name.clone(),
+        None => load_identity(&state.0.store_path, model).map_err(AppError::bad_request)?,
+    };
     let _guard = acquire_load_lock(&lock_key).await;
     // Only now, with any load of this model excluded: the running key is
     // the store's spelling, which a load in flight may just have changed.
@@ -1183,7 +1195,7 @@ async fn unload_model(state: &AppState, model: &str) -> Result<(), AppError> {
     // `ensure_model` takes before its own `canonical_ref`, and not from
     // the lock key: that has folded the digest onto `:latest`, which is
     // not where the store holds a model tagged otherwise.
-    let canonical = if crate::providers::is_remote_ref(model) {
+    let canonical = if mounted.is_some() || crate::providers::is_remote_ref(model) {
         lock_key
     } else {
         let resolved =
@@ -1204,8 +1216,8 @@ async fn unload_model(state: &AppState, model: &str) -> Result<(), AppError> {
     }
     // Nothing was loaded under that key. A provider-routed model never is,
     // and is absent from the store by definition, so naming one is not the
-    // 404 case.
-    if crate::providers::is_remote_ref(model) {
+    // 404 case. Nor is a mounted directory.
+    if mounted.is_some() || crate::providers::is_remote_ref(model) {
         return Ok(());
     }
     // The key may not be the one the content runs under. The store may
@@ -1940,7 +1952,7 @@ fn client_api_key(headers: Option<&HeaderMap>) -> Option<String> {
     let headers = headers?;
     let usable = |k: &str| {
         let k = k.trim();
-        (!k.is_empty() && k != PLACEHOLDER_API_KEY).then(|| k.to_string())
+        (!k.is_empty() && !crate::providers::is_placeholder_key(k)).then(|| k.to_string())
     };
     let bearer = auth::bearer(headers).and_then(usable);
     // Each candidate is filtered before the choice between them, not
@@ -2076,8 +2088,22 @@ async fn resolve_remote_target(
     // network can reach, or a browser acting for another site. That is a
     // blast-radius bound, not authentication — see `daemon_key_spendable`.
     let trusted = daemon_key_spendable(state, headers);
-    let credential = match client_api_key(headers) {
-        Some(key) => Some(crate::credentials::Resolved::from_key(key, "request")),
+    // A launched agent presents a session token, not a key, because it can
+    // switch provider: the key is the one the session registered for this
+    // provider, and the token itself is never forwarded (see `sessions`).
+    let presented = client_api_key(headers);
+    let session = presented.as_deref().filter(|k| sessions::is_token(k));
+    let credential = match (presented.as_deref(), session) {
+        (Some(_), Some(token)) => sessions::key_for(token, &provider_id)
+            .map(|key| crate::credentials::Resolved::from_key(key, "session")),
+        (Some(key), None) => Some(crate::credentials::Resolved::from_key(
+            key.to_string(),
+            "request",
+        )),
+        (None, _) => None,
+    };
+    let credential = match credential {
+        Some(credential) => Some(credential),
         None if trusted => provider_credential(provider).await?,
         None => None,
     };
@@ -2088,8 +2114,25 @@ async fn resolve_remote_target(
         None => {
             return Err(AppError(
                 anyhow!(
-                    "no API key for provider {provider_id:?} — send it as an Authorization \
-                     header{}",
+                    "no API key for provider {provider_id:?} — {}{}",
+                    if session.is_some() {
+                        format!(
+                            "this llmman launch session holds none for it: {} where you ran \
+                             llmman launch, and launch again{}",
+                            crate::providers::key_hint(&provider.id, provider.key_env.as_deref()),
+                            if crate::daemon::reachable_only_locally() {
+                                String::new()
+                            } else {
+                                format!(
+                                    " (a launch registers only the key of the provider it starts \
+                                     on with a daemon the network can reach: start it with \
+                                     --provider {provider_id})"
+                                )
+                            }
+                        )
+                    } else {
+                        "send it as an Authorization header".to_string()
+                    },
                     if is_cross_site(headers) && !state.0.auth.enforced() {
                         ". This request came from another site, so llmman serve's own \
                          environment is deliberately not used"
@@ -2345,16 +2388,30 @@ async fn resolve_target(
     // returns. See `load_identity`, which `unload_model` locks on for the
     // same reason; the two have to agree, or an unload by one spelling
     // passes a load by another.
-    let load_id = load_identity(&state.0.store_path, model_ref).map_err(AppError::bad_request)?;
+    //
+    // A mounted directory is keyed by its name and skips the store's steps:
+    // the pull, the signature policy and the layer check.
+    let mounted = state.0.mounted.find(model_ref);
+    if let Some(m) = mounted {
+        m.scan().await;
+    }
+    let load_id = match mounted {
+        Some(m) => m.name.clone(),
+        None => load_identity(&state.0.store_path, model_ref).map_err(AppError::bad_request)?,
+    };
     let requested = model_ref;
-    let model_ref =
-        crate::shortnames::resolve_ollama_api(model_ref).map_err(AppError::bad_request)?;
-    // Default the tag before the store lookups: otherwise "gemma4" and
-    // "gemma4:latest" reach the store, and the pull, as two spellings. A
-    // `@digest` stays on, unlike in the lock key, so `find` can resolve
-    // it to whatever tag holds that content.
-    let model_ref = crate::storage::default_tag(&model_ref);
-    let model_ref = canonical_ref(&state.0.store_path, &model_ref);
+    let model_ref = match mounted {
+        Some(m) => m.name.clone(),
+        None => {
+            let resolved =
+                crate::shortnames::resolve_ollama_api(model_ref).map_err(AppError::bad_request)?;
+            // Default the tag before the store lookups: otherwise "gemma4" and
+            // "gemma4:latest" reach the store, and the pull, as two spellings. A
+            // `@digest` stays on, unlike in the lock key, so `find` can resolve
+            // it to whatever tag holds that content.
+            canonical_ref(&state.0.store_path, &crate::storage::default_tag(&resolved))
+        }
+    };
     let model_ref = model_ref.as_str();
 
     // Already loaded and reusable — bypasses LLMMAN_MAX_QUEUE entirely,
@@ -2369,13 +2426,16 @@ async fn resolve_target(
     }
 
     // Not loaded here: a peer may have it, or more room for it. The
-    // guard is a no-op one, as for a provider.
-    if let Some(peer) = aggregation::route(state, model_ref, headers).await {
-        return Ok((
-            model_ref.to_string(),
-            aggregation::target(state, peer),
-            ActivityGuard::new(state, model_ref),
-        ));
+    // guard is a no-op one, as for a provider. A mounted directory is never
+    // routed to a peer.
+    if mounted.is_none() {
+        if let Some(peer) = aggregation::route(state, model_ref, headers).await {
+            return Ok((
+                model_ref.to_string(),
+                aggregation::target(state, peer),
+                ActivityGuard::new(state, model_ref),
+            ));
+        }
     }
 
     // The cold-start clock. It starts here rather than at the spawn
@@ -2400,7 +2460,7 @@ async fn resolve_target(
     // Pull if missing — and run pull_serialized even when present, so a
     // model already on disk is still subject to the signature policy
     // (it returns immediately when no policy applies). See verify_stored.
-    {
+    if mounted.is_none() {
         let present = crate::storage::OciStore::open(&state.0.store_path)
             .and_then(|s| s.find(model_ref))
             .is_ok();
@@ -2424,7 +2484,10 @@ async fn resolve_target(
 
     // Re-canonicalise after the pull: default_tag already fixed the lock
     // key, so this only refines to a more specific stored form.
-    let model_ref = canonical_ref(&state.0.store_path, model_ref);
+    let model_ref = match mounted {
+        Some(_) => model_ref.to_owned(),
+        None => canonical_ref(&state.0.store_path, model_ref),
+    };
     let model_ref = model_ref.as_str();
 
     // Re-check in case that stored form differs from the key above.
@@ -2439,9 +2502,12 @@ async fn resolve_target(
     // any two of them cannot hand the load a manifest nobody checked.
     // A failed find fails the load: `resolve_model` finds by the same
     // reference and would have failed with "model not found in store".
-    let desc = OciStore::open(&state.0.store_path)?
-        .find(model_ref)
-        .with_context(|| format!("model not found in store: {model_ref}"))?;
+    let desc = match mounted {
+        Some(m) => m.descriptor(),
+        None => OciStore::open(&state.0.store_path)?
+            .find(model_ref)
+            .with_context(|| format!("model not found in store: {model_ref}"))?,
+    };
     // The content may be running already under a key this spelling does
     // not resolve to; see `check_running_by_digest`'s doc comment for the
     // order that produces one.
@@ -2459,7 +2525,9 @@ async fn resolve_target(
     // above, and `resolve_model` loads that same manifest through
     // `load_ref`; `model_ref` stays the spelling for the running-process
     // keys and logs.
-    let load_ref = {
+    let load_ref = if mounted.is_some() {
+        model_ref.to_owned()
+    } else {
         let store_path = state.0.store_path.clone();
         let model_ref_owned = model_ref.to_owned();
         let desc = desc.clone();
@@ -2478,11 +2546,17 @@ async fn resolve_target(
     // read, so before the layer check a FIFO or a link to `/dev/zero`
     // at the manifest's blob path would stall the load instead of
     // being reported as a mismatch.
-    let size = OciStore::open(&state.0.store_path)?.total_size(&desc);
+    let size = match mounted {
+        Some(m) => m.size(),
+        None => OciStore::open(&state.0.store_path)?.total_size(&desc),
+    };
     let digest = desc.digest;
 
-    let model_path = resolve_model(&state.0.store_path, &state.0.cache_path, &load_ref)
-        .with_context(|| format!("resolve model {model_ref}"))?;
+    let model_path = match mounted {
+        Some(m) => m.resolve()?,
+        None => resolve_model(&state.0.store_path, &state.0.cache_path, &load_ref)
+            .with_context(|| format!("resolve model {model_ref}"))?,
+    };
     let context_shift = supports_context_shift(model_ref);
     // One header read feeds initial_ctx_size, embedding_model_ctx and
     // is_decision; unreadable means "generation model, unknown trained
@@ -2614,6 +2688,11 @@ async fn resolve_target(
         } else {
             state.0.runtime.ociman().await?
         };
+        if ociman.is_some() {
+            if let Some(m) = state.0.mounted.find(model_ref) {
+                m.ensure_visible_to_container()?;
+            }
+        }
         process = match (&model_path, ociman) {
             // The GGUF arms, in gguf_arm's order.
             (ModelPath::Gguf(path, mmproj), ociman) => {
@@ -2649,7 +2728,7 @@ async fn resolve_target(
                     }
                     (GgufArm::Speech { .. }, _) => {
                         let (child, tail) =
-                            spawn_mediagen_backend(&load_ref, port, state, Workload::CpuOnly)
+                            spawn_mediagen_backend(&load_ref, None, port, state, Workload::CpuOnly)
                                 .await?;
                         stderr_tail = Some(tail);
                         ModelProcess::Local(Engine::Speech, child, None)
@@ -2695,9 +2774,15 @@ async fn resolve_target(
                 oom_retryable = true;
                 ModelProcess::Container(ociman, Engine::LlamaServer, child)
             }
-            (ModelPath::Diffusion(_), None) => {
-                let (child, tail) =
-                    spawn_mediagen_backend(&load_ref, port, state, Workload::General).await?;
+            (ModelPath::Diffusion(paths), None) => {
+                let (child, tail) = spawn_mediagen_backend(
+                    &load_ref,
+                    Some(&paths.model),
+                    port,
+                    state,
+                    Workload::General,
+                )
+                .await?;
                 stderr_tail = Some(tail);
                 oom_retryable = true;
                 ModelProcess::Local(Engine::LlamaServer, child, None)
@@ -3846,6 +3931,43 @@ struct ProviderModelResponse {
     /// catalog names no ceiling.
     #[serde(skip_serializing_if = "Option::is_none")]
     output: Option<u32>,
+    /// See [`crate::providers::Caps`]: whether it answers chat, takes
+    /// images in, and calls tools.
+    chat: bool,
+    vision: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<bool>,
+    /// See [`crate::providers::Model::released`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    released: Option<String>,
+}
+
+impl ProviderModelResponse {
+    /// A model of a provider defined in `llmman.conf`, known by its id alone.
+    fn bare(id: String) -> Self {
+        let caps = crate::providers::Caps::of_id(&id);
+        Self::of(id, None, None, None, caps)
+    }
+
+    fn of(
+        id: String,
+        thinking: Option<Vec<String>>,
+        context: Option<u64>,
+        output: Option<u32>,
+        caps: crate::providers::Caps,
+    ) -> Self {
+        Self {
+            id,
+            cost: None,
+            thinking,
+            context,
+            output,
+            chat: caps.chat,
+            vision: caps.vision,
+            tools: caps.tools,
+            released: None,
+        }
+    }
 }
 
 /// US dollars per million tokens, models.dev's own unit (see
@@ -3879,7 +4001,6 @@ impl ProviderResponse {
                 .models
                 .iter()
                 .map(|m| ProviderModelResponse {
-                    id: m.id.clone(),
                     cost: m.cost.as_ref().map(|c| ProviderCostResponse {
                         input: c.input,
                         output: c.output,
@@ -3887,9 +4008,14 @@ impl ProviderResponse {
                         cache_write: c.cache_write,
                         reasoning: c.reasoning,
                     }),
-                    thinking: m.thinking.clone(),
-                    context: m.max_context,
-                    output: m.max_output,
+                    released: m.released.clone(),
+                    ..ProviderModelResponse::of(
+                        m.id.clone(),
+                        m.thinking.clone(),
+                        m.max_context,
+                        m.max_output,
+                        m.caps,
+                    )
                 })
                 .collect(),
         }
@@ -3950,22 +4076,154 @@ async fn handle_llmman_provider(
     })?;
     let mut response = ProviderResponse::new(&state, provider);
     if provider.key_optional && provider.models.is_empty() {
+        // A provider defined in llmman.conf: its models come from the
+        // endpoint's own /v1/models, which names no window and no output
+        // ceiling.
         response.models = configured_provider_models(&state, provider)
             .await
             .into_iter()
-            // A provider defined in llmman.conf: its models come from
-            // the endpoint's own /v1/models, which names no window and
-            // no output ceiling.
-            .map(|id| ProviderModelResponse {
-                id,
-                cost: None,
-                thinking: None,
-                context: None,
-                output: None,
-            })
+            .map(ProviderModelResponse::bare)
             .collect();
     }
     Ok(Json(response))
+}
+
+/// `GET /llmman/models`: every model `llmman launch` can offer, in one answer: each stored model,
+/// and each provider with its models. Loads nothing; a configured provider's list is asked for only
+/// when not asked lately ([`configured_models_cached`]).
+#[derive(Serialize)]
+struct ModelsResponse {
+    local: Vec<ollama::LocalModelResponse>,
+    providers: Vec<ProviderResponse>,
+}
+
+async fn handle_llmman_models(
+    State(state): State<AppState>,
+) -> Result<impl IntoResponse, AppError> {
+    models_answer(&state, provider_catalog().await).await
+}
+
+/// [`handle_llmman_models`] for `catalog`, which may have failed: a machine with no catalog, no
+/// configured provider and no route out is answered with its stored models and no provider.
+async fn models_answer(
+    state: &AppState,
+    catalog: Result<Arc<crate::providers::Catalog>, AppError>,
+) -> Result<Json<ModelsResponse>, AppError> {
+    let catalog = catalog.unwrap_or_else(|e| {
+        eprintln!("[llmman] no provider catalog for the model list: {:#}", e.0);
+        Arc::default()
+    });
+    let local = ollama::local_models(state).await?;
+    let mut providers: Vec<ProviderResponse> = catalog
+        .iter()
+        .map(|p| ProviderResponse::new(state, p))
+        .collect();
+    // `providers` follows the catalog's order, row for row.
+    let configured: Vec<(usize, &crate::providers::Provider)> = catalog
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| p.key_optional && p.models.is_empty())
+        .collect();
+    let listed = futures::future::join_all(
+        configured
+            .iter()
+            .map(|(_, provider)| configured_models_cached(state, provider)),
+    )
+    .await;
+    for ((i, _), ids) in configured.into_iter().zip(listed) {
+        providers[i].models = ids.into_iter().map(ProviderModelResponse::bare).collect();
+    }
+    Ok(Json(ModelsResponse { local, providers }))
+}
+
+/// How long a configured provider's model list is reused: a launch should
+/// not wait on an endpoint that was just asked.
+const CONFIGURED_MODELS_TTL: Duration = Duration::from_secs(300);
+/// An endpoint that did not answer is left alone for less.
+const CONFIGURED_MODELS_RETRY: Duration = Duration::from_secs(60);
+
+/// What [`configured_provider_models`] last found for each provider, and when.
+static CONFIGURED_MODELS: LazyLock<StdMutex<ConfiguredModels>> =
+    LazyLock::new(|| StdMutex::new(HashMap::new()));
+
+/// The ids found for each provider, and when.
+type ConfiguredModels = HashMap<String, (Instant, Vec<String>)>;
+
+/// [`configured_provider_models`], not asked again within
+/// [`CONFIGURED_MODELS_TTL`] (an empty answer, [`CONFIGURED_MODELS_RETRY`]).
+async fn configured_models_cached(
+    state: &AppState,
+    provider: &crate::providers::Provider,
+) -> Vec<String> {
+    let fresh = |at: Instant, ids: &[String]| {
+        let ttl = if ids.is_empty() {
+            CONFIGURED_MODELS_RETRY
+        } else {
+            CONFIGURED_MODELS_TTL
+        };
+        at.elapsed() < ttl
+    };
+    if let Some((at, ids)) = CONFIGURED_MODELS.lock().unwrap().get(&provider.id) {
+        if fresh(*at, ids) {
+            return ids.clone();
+        }
+    }
+    let asked = Instant::now();
+    let ids = configured_provider_models(state, provider).await;
+    remember_configured_models(&provider.id, asked, &ids);
+    ids
+}
+
+/// Keeps `ids`, found by a fetch begun at `asked`, unless a fetch begun
+/// later already stored its own: a slower, older one must not replace it.
+fn remember_configured_models(provider: &str, asked: Instant, ids: &[String]) {
+    let mut held = CONFIGURED_MODELS.lock().unwrap();
+    if held.get(provider).is_none_or(|(at, _)| *at < asked) {
+        held.insert(provider.to_string(), (asked, ids.to_vec()));
+    }
+}
+
+/// `POST /llmman/sessions`: the keys of one `llmman launch`, by provider id.
+#[derive(Deserialize)]
+struct OpenSessionBody {
+    keys: HashMap<String, String>,
+}
+
+/// What opening a session answers: the token the agent sends instead of a key.
+#[derive(Debug, Serialize)]
+struct OpenSessionResponse {
+    token: String,
+}
+
+/// `POST /llmman/sessions` (see [`sessions`]). Refused from another site's
+/// page, which could otherwise churn out the sessions of real launches.
+async fn handle_open_session(
+    headers: HeaderMap,
+    Json(body): Json<OpenSessionBody>,
+) -> Result<(StatusCode, Json<OpenSessionResponse>), AppError> {
+    if is_cross_site(Some(&headers)) {
+        return Err(AppError(
+            anyhow!("sessions cannot be opened from another site's page"),
+            StatusCode::FORBIDDEN,
+        ));
+    }
+    let token = sessions::open(body.keys).map_err(|e| {
+        let status = if e.is::<sessions::Full>() {
+            StatusCode::SERVICE_UNAVAILABLE
+        } else {
+            StatusCode::BAD_REQUEST
+        };
+        AppError(e, status)
+    })?;
+    Ok((StatusCode::CREATED, Json(OpenSessionResponse { token })))
+}
+
+/// `DELETE /llmman/sessions`: closes the session whose token is the bearer.
+async fn handle_close_session(headers: HeaderMap) -> StatusCode {
+    match client_api_key(Some(&headers)) {
+        Some(token) if sessions::close(&token) => StatusCode::NO_CONTENT,
+        _ => StatusCode::NOT_FOUND,
+    }
 }
 
 /// `PUT /llmman/providers/:id/key`.
@@ -4335,15 +4593,17 @@ async fn record_prompt(State(state): State<AppState>, req: Request, next: Next) 
         let model = UrlPath::<(String, String)>::from_request_parts(&mut parts, &())
             .await
             .ok()
-            .filter(|UrlPath((_, path))| {
-                gemini_method(path).is_some_and(|(_, method)| method.generates())
-            })
-            .and_then(|UrlPath((encoded_model, _))| {
-                base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .and_then(|UrlPath((encoded_model, path))| {
+                let (path_model, method) = gemini_method(&path)?;
+                if !method.generates() {
+                    return None;
+                }
+                let pinned = base64::engine::general_purpose::URL_SAFE_NO_PAD
                     .decode(encoded_model)
                     .ok()
-            })
-            .and_then(|bytes| String::from_utf8(bytes).ok());
+                    .and_then(|bytes| String::from_utf8(bytes).ok())?;
+                Some(routed_model(pinned, path_model))
+            });
         let Some(model) = model else {
             return next.run(Request::from_parts(parts, body)).await;
         };
@@ -4627,6 +4887,34 @@ fn backend_threads() -> i32 {
         .unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get() as i32))
 }
 
+/// Restarts this process with the [`crate::mediagen::backend_env`] `model`
+/// needs when it lacks it (`llmman serve MODEL` run directly; the daemon
+/// sets it on the workers it spawns): ggml reads it from threads already up.
+fn reexec_with_backend_env(model: &std::path::Path) -> anyhow::Result<()> {
+    let missing: Vec<_> = crate::mediagen::backend_env(model)
+        .iter()
+        .filter(|(var, val)| std::env::var(var).as_deref() != Ok(*val))
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        let exe = std::env::current_exe().context("locating the llmman binary")?;
+        let err = std::process::Command::new(&exe)
+            .args(std::env::args_os().skip(1))
+            .envs(missing.iter().map(|&&(var, val)| (var, val)))
+            .exec();
+        Err(err).with_context(|| format!("restarting {} with {missing:?}", exe.display()))
+    }
+    #[cfg(not(unix))]
+    {
+        // backend_env is macOS-only
+        Ok(())
+    }
+}
+
 /// The media backend of a diffusion model, resolved to `paths` by
 /// [`model_backend`].
 async fn mediagen_backend(
@@ -4638,6 +4926,7 @@ async fn mediagen_backend(
     if paths.text_encoder.is_none() && crate::mediagen::needs_text_encoder(&paths.model) {
         anyhow::bail!("{model_ref}: no text encoder in the model pack");
     }
+    reexec_with_backend_env(&paths.model)?;
     let (api, lib_dir) = load_ggml_api(args).await?;
     let params = crate::mediagen::ContextParams {
         model: paths.model.clone(),
@@ -4727,8 +5016,11 @@ fn mediagen_backend_args(model_ref: &str, port: u16) -> [String; 4] {
 /// PORT` (see `run`): the media backend of a diffusion model, the speech
 /// worker of a Canary GGUF. `workload` is whose runtime answer the child
 /// inherits (see `runtime::Workload`).
+/// `model` (a diffusion model's file) adds the environment it needs
+/// ([`crate::mediagen::backend_env`]).
 async fn spawn_mediagen_backend(
     model_ref: &str,
+    model: Option<&std::path::Path>,
     port: u16,
     state: &AppState,
     workload: Workload,
@@ -4760,6 +5052,11 @@ async fn spawn_mediagen_backend(
             cmd.env(var, val);
         }
     }
+    if let Some(model) = model {
+        for (var, val) in crate::mediagen::backend_env(model) {
+            cmd.env(var, val);
+        }
+    }
     crate::debug_log!("spawning {}: {:?}", exe.display(), cmd);
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
@@ -4770,9 +5067,6 @@ async fn spawn_mediagen_backend(
     let tail = tail_child_output(&mut child);
     Ok((child, tail))
 }
-
-/// Allows base64 images and long prompts while keeping request memory bounded.
-const GENERATION_BODY_LIMIT_BYTES: usize = 32 * 1024 * 1024;
 
 /// The daemon's routes and the layers over them, split out of
 /// [`serve_async`] so `the_scrape_endpoint_is_outside_the_cors_layer` can
@@ -4788,6 +5082,13 @@ fn build_router(app_state: AppState, metrics_enabled: bool) -> Router {
         // llmman's own API — see handle_llmman_providers
         .route("/llmman/providers", get(handle_llmman_providers))
         .route("/llmman/providers/:id", get(handle_llmman_provider))
+        .route("/llmman/models", get(handle_llmman_models))
+        .route(
+            "/llmman/sessions",
+            post(handle_open_session)
+                .layer(DefaultBodyLimit::max(sessions::BODY_LIMIT_BYTES))
+                .delete(handle_close_session),
+        )
         .route(
             "/llmman/providers/:id/key",
             put(handle_set_provider_key).delete(handle_delete_provider_key),
@@ -4816,8 +5117,15 @@ fn build_router(app_state: AppState, metrics_enabled: bool) -> Router {
             upload_route(handle_openai_transcriptions),
         )
         // OpenAI media generation (crate::mediagen::server)
-        .route("/v1/images/generations", post(handle_openai_images))
-        .route("/v1/videos", post(handle_openai_videos))
+        // reference images / conditioning video arrive as base64 in the body
+        .route(
+            "/v1/images/generations",
+            post(handle_openai_images).layer(DefaultBodyLimit::max(GENERATION_BODY_LIMIT_BYTES)),
+        )
+        .route(
+            "/v1/videos",
+            post(handle_openai_videos).layer(DefaultBodyLimit::max(GENERATION_BODY_LIMIT_BYTES)),
+        )
         .route("/v1/videos/:id", get(handle_openai_video_get))
         .route("/v1/videos/:id/content", get(handle_openai_video_get))
         .route("/v1/audio/speech", post(handle_openai_speech))
@@ -5229,6 +5537,19 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
     }
 
     // Before anything binds, so a misconfiguration fails at exec.
+    let mounted = mounted::MountedModels::from_env()?;
+    for m in mounted.iter() {
+        match crate::modelpack::resolve_model_dir(&m.dir) {
+            Ok(path) => eprintln!(
+                "[llmman] serving {} from {} as {} ({})",
+                m.name,
+                m.dir.display(),
+                path.format(),
+                mounted::VAR
+            ),
+            Err(e) => eprintln!("[llmman] warning: {} cannot be loaded: {e:#}", m.name),
+        }
+    }
     let auth = auth::Policy::from_env()?;
     if auth.enforced() {
         eprintln!("[llmman] API key required on every request (LLMMAN_API_KEYS)");
@@ -5301,6 +5622,7 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
         memory,
         store_path,
         cache_path,
+        mounted,
         prompt_log: crate::promptlog::enabled_from_env()
             .then(crate::promptlog::path)
             .transpose()?,

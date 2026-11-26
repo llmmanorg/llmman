@@ -647,7 +647,7 @@ fn encode_ids(tok: &tokenizers::Tokenizer, text: &str) -> Result<Vec<u32>> {
 }
 
 /// `[rows][cols]` -> `[cols][rows]`.
-fn transpose(a: &[f32], rows: usize, cols: usize) -> Vec<f32> {
+pub(super) fn transpose(a: &[f32], rows: usize, cols: usize) -> Vec<f32> {
     let mut out = vec![0f32; a.len()];
     for r in 0..rows {
         for c in 0..cols {

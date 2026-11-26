@@ -189,6 +189,11 @@ pub fn sdpa_gqa<'g>(
     }
 }
 
+/// `silu(gate) * up`.
+pub fn swiglu<'g>(g: &'g Graph<'g>, gate: Tensor<'g>, up: Tensor<'g>) -> Tensor<'g> {
+    g.mul(g.silu(gate), up)
+}
+
 /// `Cosmos3VLTextMLP`: `down(silu(gate) * up)` or `down(relu(up)^2)`.
 fn mlp<'g>(
     g: &'g Graph<'g>,
@@ -202,7 +207,7 @@ fn mlp<'g>(
         g.sqr(g.clamp(up, 0.0, f32::INFINITY))
     } else {
         let gate = g.linear(x, w.get(&format!("{prefix}.gate_proj.weight"))?, None);
-        g.mul(g.silu(gate), up)
+        swiglu(g, gate, up)
     };
     Ok(g.linear(h, w.get(&format!("{prefix}.down_proj.weight"))?, None))
 }
@@ -215,25 +220,45 @@ fn text_decoder<'g>(
     w: &'g Weights,
     gr: &'g Graph<'g>,
     ids: &[u32],
-    mut on_layer: impl FnMut(&'g Graph<'g>, Tensor<'g>, Tensor<'g>),
+    on_layer: impl FnMut(&'g Graph<'g>, Tensor<'g>, Tensor<'g>),
 ) -> Result<Tensor<'g>> {
+    check_prompt_len(ids.len())?;
+    let mask = causal_mask(ids.len() as i64);
+    text_decoder_ext(hp, w, gr, ids, &mask, hp.n_layers, on_layer, |_, _| {})
+}
+
+/// [`text_decoder`] with an explicit `[Tk, Tq]` mask, stopping after
+/// `n_layers` layers and handing `on_hidden(i, x)` each layer's output
+/// (hidden state `i`, the embeddings being state 0).
+#[allow(clippy::too_many_arguments)]
+fn text_decoder_ext<'g>(
+    hp: &Hparams,
+    w: &'g Weights,
+    gr: &'g Graph<'g>,
+    ids: &[u32],
+    mask: &[f32],
+    n_layers: i64,
+    mut on_layer: impl FnMut(&'g Graph<'g>, Tensor<'g>, Tensor<'g>),
+    mut on_hidden: impl FnMut(usize, Tensor<'g>),
+) -> Result<Tensor<'g>> {
+    check_prompt_len(ids.len())?;
     let n = ids.len() as i64;
-    if n == 0 || n > MAX_PROMPT_TOKENS {
-        bail!("the prompt must be 1 to {MAX_PROMPT_TOKENS} tokens, got {n}");
-    }
     let ids_i32: Vec<i32> = ids.iter().map(|&i| i as i32).collect();
     let ids_t = gr.input_i32(&[n], &ids_i32, "ids");
     let (cos, sin) = mrope_tables(hp, &text_positions(n));
     let half = hp.head_dim / 2;
     let cos_t = gr.input_f32(&[half, n], &cos, "cos");
     let sin_t = gr.input_f32(&[half, n], &sin, "sin");
-    let mask_t = gr.input_f32(&[n, n], &causal_mask(n), "mask");
+    if mask.len() as i64 != n * n {
+        bail!("the attention mask must be {n}x{n}");
+    }
+    let mask_t = gr.input_f32(&[n, n], mask, "mask");
 
     let g = &gr;
     let eps = hp.rms_eps;
     let hd = hp.head_dim;
     let mut x = g.get_rows(w.get("embed_tokens.weight")?, ids_t);
-    for l in 0..hp.n_layers {
+    for l in 0..n_layers.min(hp.n_layers) {
         let p = format!("layers.{l}");
         let h = rms(
             g,
@@ -280,8 +305,17 @@ fn text_decoder<'g>(
             Some(w.get(&format!("{p}.post_attention_layernorm.weight"))?),
         );
         x = g.add(x, mlp(g, w, &format!("{p}.mlp"), h2, hp.relu2)?);
+        on_hidden(l as usize + 1, x);
     }
     Ok(x)
+}
+
+/// Prompts run with an `n x n` mask: 1 to [`MAX_PROMPT_TOKENS`] tokens.
+fn check_prompt_len(n: usize) -> Result<()> {
+    if n == 0 || n as i64 > MAX_PROMPT_TOKENS {
+        bail!("the prompt must be 1 to {MAX_PROMPT_TOKENS} tokens, got {n}");
+    }
+    Ok(())
 }
 
 /// `[Tk, Tq]`: -inf where the key follows the query.
@@ -325,6 +359,59 @@ pub fn text_hidden(hp: &Hparams, w: &Weights, be: &Backend, ids: &[u32]) -> Resu
     gr.mark_output(x);
     gr.compute(be)?;
     Ok(gr.output_f32(x))
+}
+
+/// `[Tk, Tq]`: [`causal_mask`] with the keys from `n_real` on (right padding) hidden too.
+pub fn padded_causal_mask(n: i64, n_real: i64) -> Vec<f32> {
+    let mut mask = causal_mask(n);
+    let n = n as usize;
+    let real = (n_real as usize).min(n);
+    for q in real..n {
+        // a padding query still sees the prompt, but no padding, itself included
+        mask[q * n + real..q * n + q + 1].fill(f32::NEG_INFINITY);
+    }
+    mask
+}
+
+/// Hidden states `states` (`i` = after `i` layers) `[n][hidden]` each, under `mask`.
+pub fn text_hidden_states(
+    hp: &Hparams,
+    w: &Weights,
+    be: &Backend,
+    ids: &[u32],
+    mask: &[f32],
+    states: &[usize],
+) -> Result<Vec<Vec<f32>>> {
+    let last = states.iter().copied().max().unwrap_or(0);
+    if states.is_empty() || states.iter().any(|&s| s == 0 || s as i64 > hp.n_layers) {
+        bail!("hidden states {states:?} out of 1..={}", hp.n_layers);
+    }
+    let gr = text_graph(be, hp)?;
+    let mut outs: Vec<(usize, Tensor<'_>)> = Vec::new();
+    text_decoder_ext(
+        hp,
+        w,
+        &gr,
+        ids,
+        mask,
+        last as i64,
+        |_, _, _| {},
+        |i, x| {
+            if states.contains(&i) {
+                let x = gr.cont(x);
+                gr.mark_output(x);
+                outs.push((i, x));
+            }
+        },
+    )?;
+    gr.compute(be)?;
+    Ok(states
+        .iter()
+        .map(|s| {
+            let t = outs.iter().find(|(i, _)| i == s).expect("state captured").1;
+            gr.output_f32(t)
+        })
+        .collect())
 }
 
 /// One modality's tokens of the generation stream for a denoising step.
@@ -627,6 +714,18 @@ pub fn unpatchify(hp: &Hparams, tokens: &[f32], t: i64, h: i64, w: i64) -> Vec<f
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn padded_causal_mask_hides_the_padding() {
+        let m = padded_causal_mask(4, 2);
+        let inf = f32::NEG_INFINITY;
+        // rows are queries, columns keys
+        assert_eq!(&m[0..4], &[0.0, inf, inf, inf]);
+        assert_eq!(&m[4..8], &[0.0, 0.0, inf, inf]);
+        assert_eq!(&m[8..12], &[0.0, 0.0, inf, inf]);
+        assert_eq!(&m[12..16], &[0.0, 0.0, inf, inf]);
+        assert_eq!(padded_causal_mask(3, 3), causal_mask(3));
+    }
 
     #[test]
     fn patchify_roundtrip() {

@@ -196,6 +196,14 @@ pub fn active() -> bool {
     ACTIVE.get().is_some()
 }
 
+/// Whether the integration's environment is handed over on a command
+/// line, where no key may go (see [`prepare`]'s `carries_key`).
+pub fn env_on_command_line() -> bool {
+    ACTIVE
+        .get()
+        .is_some_and(|a| a.sandbox == Sandbox::Openshell)
+}
+
 /// Checks `sandbox` can run `integration`, before the daemon starts.
 /// `configured_by_file`: the launcher writes config under `~`, which
 /// OpenShell never sees. `carries_key`: the integration is handed a real
@@ -1238,12 +1246,11 @@ fn openshell_exec_args(
 }
 
 fn status_code(mut cmd: Command, what: &str) -> anyhow::Result<i32> {
-    let status = cmd
-        .stdin(Stdio::inherit())
+    cmd.stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status()
-        .with_context(|| format!("failed to run {what}"))?;
+        .stderr(Stdio::inherit());
+    let status =
+        super::wait_for_agent(&mut cmd).with_context(|| format!("failed to run {what}"))?;
     Ok(status.code().unwrap_or(1))
 }
 

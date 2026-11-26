@@ -14,6 +14,7 @@ already exists for the model format it finds, and runs it unmodified.
 | safetensors | [`sglang`](https://github.com/sgl-project/sglang) | Your `PATH`, with `LLMMAN_SAFETENSORS_ENGINE=sglang` |
 | safetensors | [`mlx_lm.server`](https://github.com/ml-explore/mlx-lm) | macOS: llmman's own `uv`-installed copy, installed when the daemon starts, or the one on your `PATH` — per `--runtime`, as for `llama-server`; preferred over `vllm` |
 | GGUF diffusion (LTX-2) | llmman itself, on ggml | The `libggml`/`libllama` next to `llama-server`; see [the blog post](https://llmmanorg.github.io/blog/image-audio-and-video-generation/) |
+| GGUF diffusion (FLUX.2 [klein]) | llmman itself, on ggml | The same libraries; see [below](#flux2-klein) |
 | Diffusers safetensors (Qwen-Image 2.1) | llmman itself, on ggml | The same libraries; see [below](#qwen-image-21) |
 | Diffusers safetensors | [`vllm serve --omni`](https://github.com/vllm-project/vllm-omni) | Your `PATH`'s `vllm` with the `vllm-omni` package installed |
 | Diffusers safetensors | `vllm serve --omni` in a container | `--runtime docker` / `podman` (Linux only): the `vllm/vllm-omni` image (CUDA only) |
@@ -87,6 +88,10 @@ container, and the daemon logs a warning when `--no-hardened` is given
 there. Each container run gets, before the engine's own flags:
 
 - `--cap-drop all` and `--security-opt no-new-privileges`;
+- on Linux, `--security-opt label=disable` as well, so an SELinux host lets
+  the container read the mounted store and model, as the
+  [sandbox](sandbox.md) does (relabelling with `:z` would rewrite the
+  labels of your own files instead);
 - `--read-only`, except for a container that passes `--gpus` (see below);
 - one `--tmpfs <path>:exec` per path the engine writes to. The `:exec`
   suffix is needed on both docker and podman, since both mount a `--tmpfs`
@@ -179,6 +184,12 @@ build, or CUDA 12 for a CUDA 12 driver, together with the matching `cudart`
 runtime libraries. The Linux CUDA builds need glibc 2.38, and arm64 has CUDA
 13 only; a host that does not fit gets the CPU build. `llmman gpu-discover`
 prints what the probe chose.
+
+Finding a release uses GitHub's API, which allows 60 requests per hour per IP
+address without a token and 5000 with one. Set `GITHUB_TOKEN` or `GH_TOKEN`
+(any token, no scopes); it is sent to `api.github.com` only. A rate limit that
+lifts within 30 seconds is waited out; a longer one fails with the reset time.
+Only an unpinned `latest` lookup falls back to a previously downloaded build.
 
 The `llmman` binary needs glibc 2.28+. `bin` also needs what llama.cpp's
 prebuilt builds need: glibc 2.34 and libstdc++ `GLIBCXX_3.4.30` (x64 CPU and
@@ -372,6 +383,21 @@ llmman run qwen-image-2.1 "A manatee in a sunlit lagoon"
 
 Text to image only: 1024x1024, 40 steps, RGBA PNG. The text encoder and the
 transformer load on first use and take turns when both do not fit.
+
+### FLUX.2 [klein]
+
+FLUX.2 [klein] 4B and 9B GGUFs (`hf.co/unsloth/FLUX.2-klein-9B-GGUF:Q8_0`)
+run in llmman on the same ggml libraries. The pull adds the FLUX.2 VAE and
+the Qwen3 text encoder (Qwen3-4B for 4B, Qwen3-8B for 9B):
+
+```sh
+llmman run hf.co/unsloth/FLUX.2-klein-9B-GGUF:Q8_0 "A manatee in a sunlit lagoon"
+```
+
+Text to image and editing: pass up to 8 reference images (PNG or JPEG, base64
+or data URLs) as `images` on `/v1/images/generations`. The distilled models
+default to 4 steps without CFG, the base models to 50 steps at CFG 4. Up to
+2048x2048; reference images are scaled to at most 1024x1024.
 
 ### `vllm serve` from llmman's store
 

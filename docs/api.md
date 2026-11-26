@@ -9,7 +9,7 @@ Ollama, OpenAI and Anthropic wire formats, plus a small API of its own.
 | Ollama | `/api/generate`, `/api/chat`, `/api/embed`, `/api/embeddings`, `/api/tags`, `/api/show`, `/api/pull`, `/api/push`, `/api/copy`, `/api/create`, `/api/blobs/{digest}`, `/api/ps`, `/api/delete`, `/api/version` |
 | OpenAI | `/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`, `/v1/models`, `/v1/responses`, `/v1/responses/input_tokens`, `/v1/audio/transcriptions` (also `/audio/transcriptions`), `/v1/audio/speech`, `/tts` (llama-server's own text to speech), `/v1/realtime` (WebSocket), `/v1/systemone` (llama-server's own API for decision models) |
 | Anthropic | `/v1/messages` |
-| llmman | `/llmman/providers`, `/llmman/providers/{id}`, `/llmman/providers/{id}/key`, `/llmman/node`, `/llmman/search`, `/llmman/search/model`, `/llmman/search/popular`, `/llmman/search/avatar`, `/llmman/shell` |
+| llmman | `/llmman/providers`, `/llmman/providers/{id}`, `/llmman/providers/{id}/key`, `/llmman/models`, `/llmman/sessions`, `/llmman/node`, `/llmman/search`, `/llmman/search/model`, `/llmman/search/popular`, `/llmman/search/avatar`, `/llmman/shell` |
 | Web UI | `/`, `/ui/*` and, for a browser, any other path outside the prefixes above (`/models`, `/c/<id>`) — see [webui.md](webui.md) |
 | llama.cpp | `/props` |
 | Prometheus | `/metrics` (off unless `LLMMAN_METRICS` is `1`, `true`, `yes` or `on`) |
@@ -266,6 +266,8 @@ upstream API has a notion of a [models.dev](https://models.dev) provider
 (see [providers.md](providers.md)). `/llmman/providers` lists the ones
 this daemon can route to, each with its API-key variable, whether the
 daemon has that key, and how many models it serves;
+`/llmman/models` lists every stored model and every provider with its models in one answer (each with `chat`, `vision`, `tools`, `released` (models.dev's release date), window and thinking levels where known; nothing is loaded), which `llmman launch` offers an agent; with no provider catalog to be had (no cache, no configured provider, no network) it answers with the stored models and no provider. `POST /llmman/sessions` takes `{"keys": {"<provider>": "<key>"}}` and returns `{"token": ...}`: a request carrying that token as its key is served with the key registered for the provider it routes to, and with no other (`DELETE /llmman/sessions` with the token as the bearer closes it). Keys stay in memory. At most 64 sessions are open; one used within the last hour is never evicted, and a new one past that is refused with 503.
+
 `/llmman/providers/{id}` adds those models and what each costs in US
 dollars per million tokens (absent, not zero, where models.dev publishes
 no price), including `cache_read`/`cache_write`/`reasoning` where it publishes those.

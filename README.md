@@ -343,6 +343,23 @@ llmman launch cline --model qwen3.8 -- --json "Explain this repository"
 llmman launch grok --model qwen3.8 -- -p "Explain this repository"
 ```
 
+Every launch offers the agent every model, not just the one it starts on:
+each pulled model and every chat model of every [provider](docs/providers.md),
+with each one's variants (thinking levels), window and image input where
+known, so you can switch inside the agent. `--model` and `--provider` only
+choose where it starts:
+
+```
+llmman launch claude --provider anthropic --model claude-sonnet-5-5  # starts there
+llmman launch claude --provider anthropic     # starts on anthropic's default (newest model at or below the median price); its models first
+llmman launch claude --model qwen3.8          # starts on that pulled model
+llmman launch claude                          # the model it last ran, else the loaded or latest pulled one, else a provider you have a key for
+```
+
+(Copilot CLI and Gemini CLI take one model, so only the starting one is
+configured. Only claude, codex, opencode, hermes and openclaw have a "last
+ran" model llmman reads; the others go to the loaded or latest pulled model.)
+
 Run `llmman launch` with no arguments to list the supported integrations
 (Claude Code, OpenCode, Codex, GitHub Copilot CLI, Factory Droid, Pi, OMP, Cline, Aider,
 Qwen Code, Gemini CLI, Grok Build, AGY, DeepSeek Harness, Docker Agent,
@@ -352,7 +369,7 @@ integration is up to you; llmman only execs what is already on your
 machine, except that a missing Cline can be installed with npm after an
 interactive confirmation. `dsh` runs under `npx` when it isn't installed
 globally. Any extra arguments after `--` are forwarded to the integration's
-own CLI. Short names work wherever a model reference is accepted.
+own CLI. OMP is offered the pulled models only (`--provider` is refused for it). Short names work wherever a model reference is accepted.
 
 To stop retyping flags, set them once, e.g. `llmman config set
 launch.opencode.model claude-sonnet-5-5` (also `.provider`, `.variant`);
@@ -390,7 +407,9 @@ require a GitHub login.
 
 AGY requires version 1.1.13 or newer for Gemini API-key and custom-endpoint
 support. llmman writes Gemini mode to its own stable settings directory at
-`~/.gemini/llmman/`; your AGY settings stay untouched.
+`~/.gemini/llmman/`; your AGY settings stay untouched. The model list needs an
+AGY with `--settings` (checked in its `--help`); an older one, such as 1.2.2,
+starts on the selected model alone and llmman says so.
 
 Cline merges the Ollama provider into `~/.cline/data/settings/providers.json`
 and `globalState.json`, honouring `CLINE_DIR` like Cline does.
@@ -420,7 +439,6 @@ OPENAI_TRANSCRIPTION_MODEL=hf.co/ggml-org/Voxtral-Mini-3B-2507-GGUF:Q4_K_M \
 The launch does not pull the speech model, so `llmman pull` it first or the
 first dictation waits for the download. `OPENAI_HOST` is also goose's OpenAI
 chat provider's host, so choosing "OpenAI" for chat sends it to llmman too.
-`--provider` still needs `--model`.
 
 Docker Agent is found on `PATH` or in `~/.docker/cli-plugins`, where Docker
 Desktop and `brew install docker-agent` put it. llmman generates its own
@@ -452,7 +470,9 @@ catalog `opencode` uses, so a new provider works without an llmman
 release. Requests still go through `llmman serve`; `--provider` changes
 where the daemon forwards them, not who the client talks to, so a local
 and a hosted model are one endpoint and one integration config. The key
-travels per request; it is never written into an integration's config.
+is never written into an integration's config or put on a command line: an
+agent that can switch provider is handed a session token, and the daemon
+spends each key only on its own provider.
 
 Which integrations support `--provider`, where the key comes from, and
 why it is only ever sent to a loopback daemon are in

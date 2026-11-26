@@ -14,11 +14,12 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use futures::StreamExt;
 use reqwest::Client;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio::time::{sleep, Duration, Instant};
 
 use super::backend::*;
 use super::hybrid::send_with_hybrid_fallback;
+use super::mounted::{MountedModel, MountedModels};
 use super::openai::{effort_budget_for, effort_budget_tokens, thinking_for, EFFORT_BUDGET_MESSAGE};
 use super::refusal::wire_refusal;
 use super::sched::*;
@@ -68,6 +69,11 @@ struct HeaderDetails {
 
 impl HeaderDetails {
     fn read(gguf: Option<&crate::gguf::Info>, manifest: &crate::storage::oci::Manifest) -> Self {
+        Self::from_gguf(gguf, crate::modelpack::gguf_shard_count(manifest))
+    }
+
+    /// `shards` is how many files the model's GGUF is split into.
+    fn from_gguf(gguf: Option<&crate::gguf::Info>, shards: usize) -> Self {
         Self {
             family: gguf
                 .and_then(|i| i.architecture())
@@ -77,10 +83,8 @@ impl HeaderDetails {
             // whole model only when it is not a split set.
             parameter_size: gguf
                 .and_then(|i| {
-                    i.u64("general.parameter_count").or_else(|| {
-                        (crate::modelpack::gguf_shard_count(manifest) == 1)
-                            .then_some(i.parameter_count)
-                    })
+                    i.u64("general.parameter_count")
+                        .or_else(|| (shards == 1).then_some(i.parameter_count))
                 })
                 .filter(|n| *n > 0)
                 .map(crate::fmt::human_count)
@@ -134,12 +138,90 @@ pub(super) struct ModelFacts {
     /// A projector that generates audio on a model without one is text to
     /// speech only.
     has_chat_template: bool,
+    /// The chat template renders a request's `tools`.
+    tools: bool,
+    /// The template's thinking choices (see
+    /// [`crate::chat_template::ThinkingControls::choices`]); `None` without a template.
+    thinking: Option<Vec<&'static str>>,
 }
 
 impl ModelFacts {
+    /// The facts of a model from its headers: `base` capabilities (from
+    /// [`crate::modelpack::capabilities`]) plus the projector's and the
+    /// GGUF's, and from `template` what only the chat template says.
+    fn from_headers(
+        format: String,
+        header: HeaderDetails,
+        base: Vec<String>,
+        gguf: Option<&crate::gguf::Info>,
+        projector: Option<&crate::gguf::Info>,
+        template: Option<&str>,
+    ) -> Self {
+        let caps = crate::modelpack::with_projector_caps(base, projector);
+        let tools = crate::modelpack::model_capabilities(caps.clone(), gguf, template)
+            .iter()
+            .any(|c| c == crate::modelpack::CAPABILITY_TOOLS);
+        Self {
+            tools,
+            thinking: template.map(|t| crate::chat_template::thinking_controls(t).choices()),
+            format,
+            header,
+            context_length: gguf.and_then(crate::gguf::Info::context_length),
+            capabilities: crate::modelpack::model_capabilities(caps, gguf, None),
+            architecture: gguf
+                .and_then(|info| info.architecture())
+                .map(str::to_string),
+            projector: projector.map(crate::gguf::Info::projector_caps),
+            has_chat_template: gguf
+                .is_some_and(|info| info.str("tokenizer.chat_template").is_some()),
+        }
+    }
+
+    /// A mounted model's facts, read off its directory, with its GGUF header
+    /// and chat template. Blocking.
+    fn mounted(dir: &Path) -> (Self, Option<crate::gguf::Info>, Option<String>) {
+        let Ok(path) = crate::modelpack::resolve_model_dir(dir) else {
+            return (Self::default(), None, None);
+        };
+        let (gguf, projector) = match &path {
+            crate::modelpack::ModelPath::Gguf(file, projector) => (
+                crate::gguf::read_info(file).ok(),
+                projector
+                    .as_ref()
+                    .and_then(|p| crate::gguf::read_info(p).ok()),
+            ),
+            _ => (None, None),
+        };
+        let template = match &gguf {
+            Some(info) => info.str("tokenizer.chat_template").map(str::to_string),
+            None => crate::modelpack::dir_chat_template(dir),
+        };
+        let mut base = vec![crate::modelpack::CAPABILITY_COMPLETION.to_string()];
+        if path.mmproj().is_some() {
+            base.push(crate::modelpack::CAPABILITY_VISION.to_string());
+        }
+        let facts = Self::from_headers(
+            path.format().to_string(),
+            HeaderDetails::from_gguf(gguf.as_ref(), crate::modelpack::dir_gguf_shard_count(dir)),
+            base,
+            gguf.as_ref(),
+            projector.as_ref(),
+            template.as_deref(),
+        );
+        (facts, gguf, template)
+    }
+
     /// The `details` object both lists carry.
     fn details(&self) -> OllamaModelDetails {
         self.header.clone().details(self.format.clone())
+    }
+
+    /// Whether it generates text. An embedding, decision, speech, image or
+    /// video model replaces `completion` in its capabilities.
+    fn chats(&self) -> bool {
+        self.capabilities
+            .iter()
+            .any(|c| c == crate::modelpack::CAPABILITY_COMPLETION)
     }
 
     /// The trained context, `meta.n_ctx_train` on `/v1/models`.
@@ -221,6 +303,48 @@ impl ModelFacts {
     }
 }
 
+/// The rows of a model list: the store's, less those a mounted model shadows,
+/// then the mounted ones. Blocking.
+pub(super) fn listed_rows(
+    store_path: &Path,
+    cache_path: &Path,
+    mounted: &MountedModels,
+) -> anyhow::Result<Vec<(crate::storage::oci::ImageSummary, Arc<ModelFacts>)>> {
+    let store = OciStore::open(store_path)?;
+    let mut list = store.list()?;
+    list.retain(|img| mounted.find(&img.reference).is_none());
+    let facts = listed_model_facts(&store, store_path, cache_path, &list);
+    Ok(list
+        .into_iter()
+        .zip(facts)
+        .chain(mounted.iter().map(|m| (m.summary(), mounted_facts(m))))
+        .collect())
+}
+
+/// [`ModelFacts::mounted`], kept once read: a mounted directory is read-only.
+fn mounted_facts(m: &MountedModel) -> Arc<ModelFacts> {
+    static CACHE: LazyLock<StdMutex<HashMap<String, Arc<ModelFacts>>>> =
+        LazyLock::new(|| StdMutex::new(HashMap::new()));
+    let digest = m.digest();
+    if let Some(facts) = CACHE.lock().unwrap().get(&digest) {
+        return facts.clone();
+    }
+    let (facts, gguf, _) = ModelFacts::mounted(&m.dir);
+    let facts = Arc::new(facts);
+    if gguf.is_some() || facts.format == "safetensors" {
+        CACHE.lock().unwrap().insert(digest, facts.clone());
+    }
+    facts
+}
+
+/// Refuses `action` on a mounted model, which only a stored one can take.
+fn refuse_mounted(state: &AppState, reference: &str, action: &str) -> Result<(), AppError> {
+    match state.0.mounted.refusal(reference, action) {
+        Some(msg) => Err(AppError::status(StatusCode::BAD_REQUEST, msg)),
+        None => Ok(()),
+    }
+}
+
 /// [`ModelFacts`] by store and manifest digest. Only a header that was read
 /// is kept: a tar layer's GGUF is unreadable until first extracted.
 static MODEL_FACTS: LazyLock<StdMutex<ModelFactsCache>> =
@@ -249,27 +373,18 @@ pub(super) fn listed_model_facts(
             };
             let gguf = crate::modelpack::gguf_info(store_path, cache_path, &manifest);
             let projector = crate::modelpack::projector_info(store_path, cache_path, &manifest);
-            let facts = Arc::new(ModelFacts {
-                format: served_format(store, &manifest),
-                header: HeaderDetails::read(gguf.as_ref(), &manifest),
-                context_length: gguf.as_ref().and_then(crate::gguf::Info::context_length),
-                capabilities: crate::modelpack::model_capabilities(
-                    crate::modelpack::with_projector_caps(
-                        crate::modelpack::capabilities(store, &manifest),
-                        projector.as_ref(),
-                    ),
-                    gguf.as_ref(),
-                    None,
-                ),
-                architecture: gguf
-                    .as_ref()
-                    .and_then(|info| info.architecture())
-                    .map(str::to_string),
-                projector: projector.as_ref().map(crate::gguf::Info::projector_caps),
-                has_chat_template: gguf
-                    .as_ref()
-                    .is_some_and(|info| info.str("tokenizer.chat_template").is_some()),
-            });
+            let template = match &gguf {
+                Some(info) => info.str("tokenizer.chat_template").map(str::to_string),
+                None => crate::modelpack::chat_template(store, store_path, cache_path, &manifest),
+            };
+            let facts = Arc::new(ModelFacts::from_headers(
+                served_format(store, &manifest),
+                HeaderDetails::read(gguf.as_ref(), &manifest),
+                crate::modelpack::capabilities(store, &manifest),
+                gguf.as_ref(),
+                projector.as_ref(),
+                template.as_deref(),
+            ));
             // Not cached while a tar-layer projector is unextracted.
             let projector_pending =
                 projector.is_none() && crate::modelpack::has_projector_layer(&manifest);
@@ -304,14 +419,11 @@ pub(super) async fn handle_tags(
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, AppError> {
     let (store_path, cache_path) = (state.0.store_path.clone(), state.0.cache_path.clone());
+    let mounted = state.0.mounted.clone();
     // Off the worker: an uncached header is blocking reads.
     let mut models = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-        let store = OciStore::open(&store_path)?;
-        let list = store.list()?;
-        let facts = listed_model_facts(&store, &store_path, &cache_path, &list);
-        Ok(list
+        Ok(listed_rows(&store_path, &cache_path, &mounted)?
             .into_iter()
-            .zip(facts)
             .map(|(img, facts)| OllamaModelInfo {
                 name: img.reference.clone(),
                 model: img.reference,
@@ -340,6 +452,80 @@ pub(super) async fn handle_tags(
         }
     }
     Ok(Json(OllamaTagsResponse { models }))
+}
+
+/// One stored model in `GET /llmman/models`: what an agent offered every
+/// model needs to list it, without a request per model.
+#[derive(Debug, Serialize)]
+pub(super) struct LocalModelResponse {
+    /// As `/api/tags` names it, which every route resolves.
+    name: String,
+    /// Whether it generates text.
+    chat: bool,
+    vision: bool,
+    tools: bool,
+    /// The window a load would serve, else the trained one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    context: Option<u64>,
+    /// The template's thinking choices; absent without a template.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking: Option<Vec<&'static str>>,
+    /// Whether it is loaded now. Absent when not, or when the daemon was
+    /// busy loading another model and did not wait to find out.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    loaded: bool,
+    /// When it was pulled or last re-pulled, in seconds since the epoch.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pulled: Option<u64>,
+}
+
+/// Every stored model, as [`LocalModelResponse`]s. Loads nothing.
+pub(super) async fn local_models(state: &AppState) -> Result<Vec<LocalModelResponse>, AppError> {
+    let (store_path, cache_path) = (state.0.store_path.clone(), state.0.cache_path.clone());
+    let rows = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+        let store = OciStore::open(&store_path)?;
+        let list = store.list()?;
+        let facts = listed_model_facts(&store, &store_path, &cache_path, &list);
+        Ok(list.into_iter().zip(facts).collect::<Vec<_>>())
+    })
+    .await
+    .context("list models task panicked")??;
+    let user_sizes_slots = llama_sets_slot_context(&extra_args_from_env(LLAMA_ARGS_VAR), true);
+    let gguf_engine = gguf_engine_from_env();
+    // A load holds the manager for as long as it takes; a launch does not
+    // wait for it to learn what is loaded.
+    let loaded: HashSet<String> = state
+        .0
+        .manager
+        .try_lock()
+        .map(|mgr| mgr.running.values().map(|m| m.digest.clone()).collect())
+        .unwrap_or_default();
+    Ok(rows
+        .into_iter()
+        .map(|(img, facts)| LocalModelResponse {
+            loaded: loaded.contains(&img.digest),
+            pulled: img
+                .modified_at
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs()),
+            name: img.reference,
+            chat: facts.chats(),
+            vision: facts
+                .capabilities
+                .iter()
+                .any(|c| c == crate::modelpack::CAPABILITY_VISION),
+            tools: facts.tools,
+            context: (!user_sizes_slots)
+                .then(|| {
+                    facts
+                        .starting_context_window(state, gguf_engine)
+                        .map(u64::from)
+                })
+                .flatten()
+                .or(facts.context_length()),
+            thinking: facts.thinking.clone(),
+        })
+        .collect())
 }
 
 /// The subset of a [`RunningModel`](super::RunningModel) `handle_ps` needs, cloned out while
@@ -477,6 +663,29 @@ pub(super) async fn handle_show(
             thinking: None,
         }));
     }
+    // Answered from its directory: a 404 here makes `run` and `launch` pull.
+    if let Some(m) = state.0.mounted.find(model_ref) {
+        eprintln!("[llmman] /api/show model={:?} (mounted)", m.name);
+        let dir = m.dir.clone();
+        let (facts, gguf, template) =
+            tokio::task::spawn_blocking(move || ModelFacts::mounted(&dir))
+                .await
+                .context("reading the model directory")?;
+        let capabilities = crate::modelpack::model_capabilities(
+            facts.capabilities.clone(),
+            gguf.as_ref(),
+            template.as_deref(),
+        );
+        return Ok(Json(OllamaShowResponse {
+            model_info: gguf
+                .as_ref()
+                .map_or_else(|| serde_json::json!({}), model_info_json),
+            details: facts.details(),
+            thinking: show_thinking(template.as_deref(), gguf.as_ref(), &capabilities),
+            capabilities,
+            template,
+        }));
+    }
     // Resolve the same way handle_pull stored it — otherwise a bare name
     // (e.g. "gemma4", pulled and stored as "docker.io/ai/gemma4") would
     // never be found by show/delete even though it's in the local store.
@@ -530,10 +739,28 @@ pub(super) async fn handle_show(
     };
     let capabilities =
         crate::modelpack::model_capabilities(capabilities, gguf.as_ref(), template.as_deref());
-    // Only where `think` is resolved against it: llama-server's own template.
-    let thinking = template
-        .as_deref()
-        .zip(gguf.as_ref())
+    let thinking = show_thinking(template.as_deref(), gguf.as_ref(), &capabilities);
+    Ok(Json(OllamaShowResponse {
+        model_info: gguf
+            .as_ref()
+            .map_or_else(|| serde_json::json!({}), model_info_json),
+        details: HeaderDetails::read(gguf.as_ref(), &manifest)
+            .details(served_format(&store, &manifest)),
+        capabilities,
+        template,
+        thinking,
+    }))
+}
+
+/// `/api/show`'s `thinking`: only where `think` is resolved against the
+/// template, llama-server's own.
+fn show_thinking(
+    template: Option<&str>,
+    gguf: Option<&crate::gguf::Info>,
+    capabilities: &[String],
+) -> Option<crate::chat_template::Thinking> {
+    template
+        .zip(gguf)
         .filter(|(_, info)| {
             capabilities
                 .iter()
@@ -549,17 +776,7 @@ pub(super) async fn handle_show(
         .and_then(|(template, _)| {
             let controls = crate::chat_template::thinking_controls(template);
             llama_thinking(&controls, &extra_args_from_env(LLAMA_ARGS_VAR), true).0
-        });
-    Ok(Json(OllamaShowResponse {
-        model_info: gguf
-            .as_ref()
-            .map_or_else(|| serde_json::json!({}), model_info_json),
-        details: HeaderDetails::read(gguf.as_ref(), &manifest)
-            .details(served_format(&store, &manifest)),
-        capabilities,
-        template,
-        thinking,
-    }))
+        })
 }
 
 /// Keys ollama's own `GetModelInfo` deletes before answering
@@ -660,6 +877,7 @@ pub(super) async fn handle_pull(
             "model is required",
         ));
     }
+    refuse_mounted(&state, model_ref, "pulled")?;
     let model = crate::shortnames::resolve_ollama_api(model_ref).map_err(AppError::bad_request)?;
     eprintln!("[llmman] /api/pull model={model:?}");
     let store_path = state.0.store_path.clone();
@@ -734,6 +952,7 @@ async fn push_impl(
             "model is required",
         ));
     }
+    refuse_mounted(&state, model_ref, "pushed")?;
     let model = crate::shortnames::resolve_ollama_api(model_ref).map_err(AppError::bad_request)?;
     eprintln!("[llmman] {route} model={model:?}");
     let store_path = state.0.store_path.clone();
@@ -938,6 +1157,7 @@ pub(super) async fn handle_delete(
         .as_deref()
         .filter(|s| !s.is_empty())
         .unwrap_or(&req.model);
+    refuse_mounted(&state, model_ref, "removed")?;
     // See handle_show: resolve the same way handle_pull stored it.
     let model_ref =
         crate::shortnames::resolve_ollama_api(model_ref).map_err(AppError::bad_request)?;
@@ -960,6 +1180,8 @@ pub(super) async fn handle_copy(
             "source and destination are required",
         ));
     }
+    refuse_mounted(&state, &req.source, "copied")?;
+    refuse_mounted(&state, &req.destination, "replaced by a copy")?;
     // Both resolved the way handle_pull stores a model, so a bare
     // `mine:tag` destination is found by the /api/chat that follows.
     let source =
@@ -1152,6 +1374,7 @@ pub(super) async fn handle_create(
             ),
         ));
     }
+    refuse_mounted(&state, model, "replaced by a created model")?;
     // Resolved like handle_copy's destination. A `@digest` spelling names
     // content, which a created model doesn't have yet (see cp.rs).
     let model = &crate::shortnames::resolve_ollama_api(model).map_err(AppError::bad_request)?;
@@ -1177,6 +1400,7 @@ pub(super) async fn handle_create(
             ))
         }
         (Some(from), true) => {
+            refuse_mounted(&state, &from, "copied")?;
             let source =
                 crate::shortnames::resolve_ollama_api(&from).map_err(AppError::bad_request)?;
             eprintln!("[llmman] /api/create {model:?} from {source:?}");

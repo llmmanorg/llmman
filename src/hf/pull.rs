@@ -364,11 +364,15 @@ impl Drop for TmpFileGuard<'_> {
 /// rather than failing the whole pull over that race.
 fn move_into_place(tmp_path: &Path, dest: &Path) -> Result<bool> {
     if dest.exists() {
+        crate::fsutil::touch(dest);
         return Ok(false);
     }
     match std::fs::rename(tmp_path, dest) {
         Ok(()) => Ok(true),
-        Err(_) if dest.exists() => Ok(false),
+        Err(_) if dest.exists() => {
+            crate::fsutil::touch(dest);
+            Ok(false)
+        }
         Err(e) => Err(e).with_context(|| format!("move downloaded blob to {}", dest.display())),
     }
 }
@@ -426,6 +430,7 @@ async fn download_layer(
             .map(|m| m.is_file() && m.len() as i64 == size)
             .unwrap_or(false)
         {
+            crate::fsutil::touch(&dest);
             progress::add_completed(progress_key, size);
             return Ok(Descriptor {
                 media_type: oci::MEDIA_TYPE_MODEL_WEIGHT_RAW.to_string(),
@@ -692,14 +697,27 @@ mod tests {
         let dest = dir.join("dest");
         std::fs::write(&tmp, b"content").unwrap();
         std::fs::write(&dest, b"content").unwrap(); // a sibling already won
+        backdate(&dest);
 
         assert!(!move_into_place(&tmp, &dest).unwrap());
+        assert_fresh(&dest);
         assert!(
             tmp.exists(),
             "move_into_place itself must leave the redundant tmp file for the caller's guard to clean up"
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn backdate(path: &Path) {
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 60 * 60);
+        crate::fsutil::set_mtime(path, old).unwrap();
+    }
+
+    fn assert_fresh(path: &Path) {
+        let age = std::fs::metadata(path).unwrap().modified().unwrap();
+        let age = age.elapsed().unwrap();
+        assert!(age < std::time::Duration::from_secs(60), "{age:?}");
     }
 
     const SHA: &str = "7ae557604adf67be50417f59c2c2f167def9a775";
@@ -831,5 +849,56 @@ mod tests {
         let progress = progress::poll(progress_key);
         let size = body.len() as i64;
         assert_eq!((progress.completed, progress.total), (size, size));
+    }
+
+    /// A blob already stored is reused without a download, and its age is
+    /// refreshed so `rm` and the grace sweep see it as used just now.
+    #[tokio::test]
+    async fn a_reused_blob_has_its_age_refreshed() {
+        use sha2::Digest as _;
+        let body = b"a text encoder two models share".to_vec();
+        let hex = hex::encode(sha2::Sha256::digest(&body));
+        let headers = [
+            ("x-linked-etag", format!("\"{hex}\"")),
+            ("x-linked-size", body.len().to_string()),
+        ];
+        let app = axum::Router::new().route(
+            "/o/r/resolve/c/model.gguf",
+            axum::routing::get(move || {
+                let headers = headers.clone();
+                async move { (headers, Vec::<u8>::new()) }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let dir = tempfile::tempdir().unwrap();
+        oci::ensure_layout(dir.path()).unwrap();
+        let blob = dir.path().join("blobs").join("sha256").join(&hex);
+        std::fs::create_dir_all(blob.parent().unwrap()).unwrap();
+        std::fs::write(&blob, &body).unwrap();
+        backdate(&blob);
+
+        // The mock serves no body, so this passes only by reusing the blob.
+        let progress_key = "hf-pull-reused-blob";
+        progress::reset(progress_key, "pulling");
+        let descriptor = download_layer(
+            &crate::hf::download_client().unwrap(),
+            &crate::hf::head_client().unwrap(),
+            &endpoint,
+            "o",
+            "r",
+            "c",
+            &lfs_file("model.gguf", body.len() as i64, None),
+            None,
+            dir.path(),
+            progress_key,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(descriptor.digest, format!("sha256:{hex}"));
+        assert_fresh(&blob);
     }
 }

@@ -1393,7 +1393,11 @@ fn launch_droid_with_model() {
             assert_eq!(entry["baseUrl"], format!("{}/v1", llmman::daemon::server()));
             assert_eq!(entry["apiKey"], "${LLMMAN_API_KEY}");
             assert_eq!(entry["provider"], "generic-chat-completion-api");
-            assert_eq!(entry["id"], format!("custom:{model}-[llmman]-0"));
+            // Droid's id is its display name and the entry's place: the
+            // shared list's plain id (the reference less its registry
+            // path), with no `[llmman]` suffix.
+            assert_eq!(entry["displayName"], MODEL);
+            assert_eq!(entry["id"], format!("custom:{MODEL}-0"));
             assert_eq!(entry["index"], 0);
             assert_eq!(settings["sessionDefaultSettings"]["model"], entry["id"]);
             assert_eq!(
@@ -1979,6 +1983,11 @@ fn launch_docker_agent_with_model() {
     //
     // Only docker-agent's own loop guard is retried; any other nonzero
     // exit still fails at once.
+    //
+    // The agent file exists while docker-agent runs and is removed when it
+    // exits, so a watcher reads it during the run and the checks below
+    // run on what it saw.
+    let watch = DockerAgentFileWatch::start();
     launch_and_assert_with(
         "docker-agent",
         &["--exec", PROMPT],
@@ -1986,7 +1995,7 @@ fn launch_docker_agent_with_model() {
         |_stdout| false,
         docker_agent_reply_is_pong,
         true,
-        docker_agent_left_the_users_own_config_alone,
+        |home| docker_agent_left_the_users_own_config_alone(home, watch.seen().as_ref()),
     );
 }
 
@@ -2052,19 +2061,140 @@ fn docker_agent_reply_is_pong_tells_a_reply_from_reasoning() {
     }
 }
 
+/// The agent file as docker-agent had it while it ran.
+struct SeenAgentFile {
+    name: String,
+    text: String,
+    #[cfg(unix)]
+    mode: u32,
+}
+
+/// Reads the agent file `launch docker-agent` writes, while the launch
+/// runs: it is removed when docker-agent exits, so nothing is left to read
+/// afterwards. Looks in the fresh homes [`fresh_home`] makes for this
+/// integration from the moment it starts, which are the only ones this
+/// test's launches use.
+struct DockerAgentFileWatch {
+    seen: Arc<Mutex<Option<SeenAgentFile>>>,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl DockerAgentFileWatch {
+    fn start() -> Self {
+        use std::sync::atomic::Ordering::SeqCst;
+        const HOME_PREFIX: &str = "llmman-e2e-docker-agent-";
+        let started = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before epoch")
+            .as_nanos();
+        let seen = Arc::new(Mutex::new(None));
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let thread = {
+            let (seen, stop) = (Arc::clone(&seen), Arc::clone(&stop));
+            std::thread::spawn(move || {
+                while !stop.load(SeqCst) {
+                    let homes = std::fs::read_dir(std::env::temp_dir())
+                        .into_iter()
+                        .flatten()
+                        .flatten()
+                        .filter(|e| {
+                            e.file_name()
+                                .to_string_lossy()
+                                .strip_prefix(HOME_PREFIX)
+                                .and_then(|nanos| nanos.parse::<u128>().ok())
+                                .is_some_and(|nanos| nanos >= started)
+                        });
+                    for home in homes {
+                        let dir = docker_agent_state_dir(&home.path());
+                        for file in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+                            let name = file.file_name().to_string_lossy().into_owned();
+                            if !(name.starts_with("llmman-agent-") && name.ends_with(".yaml")) {
+                                continue;
+                            }
+                            if let Ok(text) = std::fs::read_to_string(file.path()) {
+                                #[cfg(unix)]
+                                let mode = {
+                                    use std::os::unix::fs::PermissionsExt;
+                                    let Ok(meta) = file.metadata() else {
+                                        continue;
+                                    };
+                                    meta.permissions().mode() & 0o777
+                                };
+                                *seen.lock().unwrap() = Some(SeenAgentFile {
+                                    name,
+                                    text,
+                                    #[cfg(unix)]
+                                    mode,
+                                });
+                            }
+                        }
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            })
+        };
+        Self {
+            seen,
+            stop,
+            thread: Some(thread),
+        }
+    }
+
+    /// What the watcher read, which a launch that ran leaves it.
+    fn seen(&self) -> std::sync::MutexGuard<'_, Option<SeenAgentFile>> {
+        self.seen.lock().unwrap()
+    }
+}
+
+impl Drop for DockerAgentFileWatch {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// Where the launch writes its agent file: llmman's own state directory.
+fn docker_agent_state_dir(home: &Path) -> PathBuf {
+    home.join(".config/llmman/launch/docker-agent")
+}
+
 /// Checks what `launch_docker_agent` promises: it writes its own agent
-/// file under `~/.config/llmman`, and puts nothing in docker-agent's own
-/// `~/.config/cagent`. The second is asserted as "no llmman settings in
+/// file under `~/.config/llmman`, private to the user, removes it when
+/// docker-agent exits, and puts nothing in docker-agent's own
+/// `~/.config/cagent`. The last is asserted as "no llmman settings in
 /// that file" rather than "that directory is absent", because
 /// docker-agent creates it itself on first run.
 ///
 /// Runs on every platform: `docker_agent_config_dir` hangs off
 /// `llmman.conf`'s directory, which resolves `~` through
 /// `HOME`/`USERPROFILE`, so Windows writes into this temp home too.
-fn docker_agent_left_the_users_own_config_alone(home: &Path) {
-    let generated = docker_agent_generated_file(home);
-    let text = std::fs::read_to_string(&generated)
-        .unwrap_or_else(|error| panic!("read {}: {error}", generated.display()));
+fn docker_agent_left_the_users_own_config_alone(home: &Path, seen: Option<&SeenAgentFile>) {
+    let generated = seen.unwrap_or_else(|| {
+        panic!(
+            "no agent file was seen in {} while docker-agent ran",
+            docker_agent_state_dir(home).display()
+        )
+    });
+    // One per process, named after it, so concurrent launches never read
+    // each other's.
+    let pid = generated
+        .name
+        .strip_prefix("llmman-agent-")
+        .and_then(|rest| rest.strip_suffix(".yaml"));
+    assert!(
+        pid.is_some_and(|pid| !pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit())),
+        "unexpected agent file name {}",
+        generated.name
+    );
+    #[cfg(unix)]
+    assert_eq!(
+        generated.mode, 0o600,
+        "the agent file is readable by others"
+    );
+    let text = &generated.text;
     assert!(
         text.contains(&format!("base_url: \"{}/v1\"", llmman::daemon::server())),
         "generated agent does not route at the daemon: {text}"
@@ -2074,6 +2204,17 @@ fn docker_agent_left_the_users_own_config_alone(home: &Path) {
         // spelled out the way `launch_cline_with_model` does.
         text.contains("model: \"docker.io/ai/qwen3.5:0.8b\""),
         "generated agent does not name the resolved model: {text}"
+    );
+    // Version 11 only for a document that carries `capabilities`; the
+    // text-only version 2 is what Docker Desktop's docker-agent reads.
+    let version = if text.contains("capabilities:") {
+        "version: \"11\""
+    } else {
+        "version: \"2\""
+    };
+    assert!(
+        text.lines().any(|line| line == version),
+        "generated agent has the wrong config version for its models (want {version}): {text}"
     );
     // The key is named, not written, so a `--provider` launch cannot
     // leave a real credential in this file.
@@ -2086,6 +2227,22 @@ fn docker_agent_left_the_users_own_config_alone(home: &Path) {
         "generated agent persisted a credential: {text}"
     );
 
+    // Removed with docker-agent: the directory holds nothing of the launch.
+    let dir = docker_agent_state_dir(home);
+    let left: Vec<String> = std::fs::read_dir(&dir)
+        .map(|entries| {
+            entries
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(
+        left.is_empty(),
+        "launch docker-agent left {left:?} in {}",
+        dir.display()
+    );
+
     let theirs = home.join(".config/cagent/config.yaml");
     if let Ok(text) = std::fs::read_to_string(&theirs) {
         assert!(
@@ -2094,30 +2251,6 @@ fn docker_agent_left_the_users_own_config_alone(home: &Path) {
             theirs.display()
         );
     }
-}
-
-/// The agent file the launch wrote, matched rather than spelled out
-/// because `launch_docker_agent` names it after the model. One file is
-/// also the assertion that a launch leaves nothing else behind.
-fn docker_agent_generated_file(home: &Path) -> PathBuf {
-    let dir = home.join(".config/llmman/launch/docker-agent");
-    let mut written: Vec<PathBuf> = std::fs::read_dir(&dir)
-        .unwrap_or_else(|error| panic!("read {}: {error}", dir.display()))
-        .map(|entry| entry.expect("read directory entry").path())
-        .filter(|path| {
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with("agent-") && name.ends_with(".yaml"))
-        })
-        .collect();
-    written.sort();
-    assert_eq!(
-        written.len(),
-        1,
-        "expected one generated agent file in {}, found {written:?}",
-        dir.display()
-    );
-    written.remove(0)
 }
 
 #[test]
@@ -2181,8 +2314,12 @@ fn assert_openclaw_declares_the_served_window(home: &Path) {
     .expect("openclaw.json is JSON");
     let entry = config["models"]["providers"]["ollama"]["models"]
         .as_array()
-        .and_then(|models| models.iter().find(|m| m["id"] == MODEL))
-        .unwrap_or_else(|| panic!("no {MODEL} entry in {}", path.display()));
+        .and_then(|models| {
+            models
+                .iter()
+                .find(|m| m["id"] == model_reference().as_str())
+        })
+        .unwrap_or_else(|| panic!("no {} entry in {}", model_reference(), path.display()));
     let served = llmman::daemon::running_context_length(&model_reference())
         .expect("the daemon reports the window it serves");
     assert_eq!(entry["contextWindow"], served, "{entry}");
@@ -2383,13 +2520,20 @@ fn goose_request_failed(stdout: &str) -> bool {
     stdout.contains("Network error:") || stdout.contains("Ran into this error:")
 }
 
-/// `launch goose-desktop` hands the desktop app the same endpoint, model
-/// and key as the CLI, and leaves the user's goose config alone.
+/// `launch goose-desktop` hands the desktop app the same provider, model
+/// and key as the CLI, and leaves the user's goose config alone. The list
+/// of models goose switches among is a provider file in goose's
+/// `custom_providers` directory, which exists while the app runs and is
+/// removed when it exits; the provider is `llmman`, which reads its key from
+/// `LLMMAN_API_KEY` and its endpoint from that file. The only `OPENAI_*`
+/// variables set are `OPENAI_API_KEY` and `OPENAI_HOST`, for the desktop
+/// app's separate dictation provider; chat stays on the provider file.
 ///
 /// The one test here that stubs its binary: Goose Desktop is a GUI with
 /// no headless mode, so a real launch could only ever skip on a CI
-/// runner. The shim records the environment it was given, which is what
-/// the desktop path actually risks getting wrong.
+/// runner. The shim records the environment it was given and the provider
+/// file as it stands while it runs, which is what the desktop path
+/// actually risks getting wrong.
 #[test]
 fn launch_goose_desktop_env() {
     let _guard = lock_serial();
@@ -2403,6 +2547,16 @@ fn launch_goose_desktop_env() {
     let shim_dir = home.join("shim");
     std::fs::create_dir_all(&shim_dir).expect("create shim dir");
     let dump = home.join("env.txt");
+    let provider_copy = home.join("provider.json");
+    // goose's `custom_providers` directory: under the config directory,
+    // which Windows takes from `%APPDATA%` (not set by `HOME`), so there it
+    // is moved under `GOOSE_PATH_ROOT`.
+    let goose_root = home.join("goose-root");
+    let provider_dir = if cfg!(windows) {
+        goose_root.join("config").join("custom_providers")
+    } else {
+        home.join(".config/goose/custom_providers")
+    };
 
     // Only the variables under test are recorded, never the whole
     // environment: this inherits the runner's, and a failing assertion
@@ -2411,6 +2565,7 @@ fn launch_goose_desktop_env() {
     let shim = if cfg!(windows) {
         let path = shim_dir.join("goose-desktop.cmd");
         let d = dump.display();
+        let (p, c) = (provider_dir.display(), provider_copy.display());
         std::fs::write(
             &path,
             format!(
@@ -2418,6 +2573,8 @@ fn launch_goose_desktop_env() {
                  set GOOSE_ > \"{d}\" 2>nul\r\n\
                  set OPENAI_ >> \"{d}\" 2>nul\r\n\
                  set OLLAMA_HOST >> \"{d}\" 2>nul\r\n\
+                 set LLMMAN_API_KEY >> \"{d}\" 2>nul\r\n\
+                 type \"{p}\\*.json\" > \"{c}\" 2>nul\r\n\
                  exit /b 0\r\n"
             ),
         )
@@ -2429,9 +2586,12 @@ fn launch_goose_desktop_env() {
             &path,
             format!(
                 "#!/bin/sh\n\
-                 env | grep -E '^(GOOSE_|OPENAI_|OLLAMA_HOST=)' > '{}'\n\
+                 env | grep -E '^(GOOSE_|OPENAI_|OLLAMA_HOST=|LLMMAN_API_KEY=)' > '{}'\n\
+                 cat '{}'/*.json > '{}'\n\
                  exit 0\n",
-                dump.display()
+                dump.display(),
+                provider_dir.display(),
+                provider_copy.display()
             ),
         )
         .expect("write shim");
@@ -2470,6 +2630,9 @@ fn launch_goose_desktop_env() {
         .env("USERPROFILE", &home)
         .env("XDG_CONFIG_HOME", home.join(".config"))
         .env("XDG_DATA_HOME", home.join(".local/share"));
+    if cfg!(windows) {
+        cmd.env("GOOSE_PATH_ROOT", &goose_root);
+    }
     let output = try_spawn_with_timeout(
         cmd,
         TIMEOUT,
@@ -2485,6 +2648,9 @@ fn launch_goose_desktop_env() {
     );
 
     let dumped = std::fs::read_to_string(&dump).expect("shim did not record its environment");
+    // The provider file as the app saw it while it ran.
+    let provider = std::fs::read_to_string(&provider_copy)
+        .expect("the shim found no provider file in goose's custom_providers directory");
     // Read before the assertions, so a failing one cannot leave the
     // recorded values on disk.
     let config_after = std::fs::read_to_string(goose_config.join("config.yaml")).ok();
@@ -2497,6 +2663,14 @@ fn launch_goose_desktop_env() {
         })
         .unwrap_or_default();
     left_in_config.sort();
+    let left_in_providers: Vec<String> = std::fs::read_dir(&provider_dir)
+        .map(|entries| {
+            entries
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
     let _ = std::fs::remove_dir_all(&home);
 
     let get = |key: &str| {
@@ -2515,34 +2689,77 @@ fn launch_goose_desktop_env() {
         })
         .collect::<Vec<_>>()
         .join("\n");
-    assert_eq!(get("GOOSE_PROVIDER"), Some("openai"));
-    assert_eq!(get("OPENAI_BASE_PATH"), Some("v1/chat/completions"));
+    // Per launch: `llmman-<launcher pid>`, digits only after the prefix.
+    let provider_name = get("GOOSE_PROVIDER").unwrap_or_default();
     assert!(
-        get("OPENAI_API_KEY").is_some_and(|k| !k.is_empty()),
-        "no OPENAI_API_KEY in:\n{shown}"
+        provider_name
+            .strip_prefix("llmman-")
+            .is_some_and(|pid| !pid.is_empty() && pid.chars().all(|c| c.is_ascii_digit())),
+        "GOOSE_PROVIDER is not llmman-<pid> in:\n{shown}"
+    );
+    let key = get("LLMMAN_API_KEY").unwrap_or_default();
+    assert!(!key.is_empty(), "no LLMMAN_API_KEY in:\n{shown}");
+    // Exactly two `OPENAI_*` variables are expected: Goose Desktop's
+    // separate dictation provider reads them to reach llmman, with the same
+    // key and the daemon's origin. Chat stays on `GOOSE_PROVIDER` and the
+    // provider file, so nothing else may be set that could point goose's
+    // `openai` provider anywhere (OPENAI_BASE_PATH, OPENAI_MODEL, ...).
+    assert!(
+        get("OPENAI_API_KEY") == Some(key),
+        "OPENAI_API_KEY is missing or is not the LLMMAN_API_KEY value in:\n{shown}"
+    );
+    assert!(
+        get("OPENAI_HOST").is_some_and(|h| h.trim_end_matches('/') == llmman::daemon::server()),
+        "OPENAI_HOST is missing or is not the daemon's origin in:\n{shown}"
+    );
+    assert!(
+        dumped
+            .lines()
+            .filter(|l| l.starts_with("OPENAI_"))
+            .all(|l| l.starts_with("OPENAI_API_KEY=") || l.starts_with("OPENAI_HOST=")),
+        "an unexpected OPENAI_* variable is set in:\n{shown}"
     );
     // llmman resolves the short name before launching (see
     // `shortnames::resolve_ollama_api`), so this is the resolved
     // reference, not necessarily MODEL verbatim.
+    let model = get("GOOSE_MODEL").unwrap_or_default();
     assert!(
-        get("GOOSE_MODEL").is_some_and(|m| m.contains(MODEL)),
+        model.contains(MODEL),
         "GOOSE_MODEL does not name {MODEL} in:\n{shown}"
     );
-    // Scheme and authority only: goose appends OPENAI_BASE_PATH, so a
-    // `/v1` here would request `/v1/v1/chat/completions`, and any other
-    // path, query or fragment lands somewhere the daemon does not serve.
+
+    let document: serde_json::Value =
+        serde_json::from_str(&provider).expect("the provider file is JSON");
+    assert_eq!(document["name"], provider_name);
+    assert_eq!(document["engine"], "openai");
+    assert_eq!(document["base_path"], "v1/chat/completions");
+    assert_eq!(document["dynamic_models"], false);
+    assert_eq!(document["api_key_env"], "LLMMAN_API_KEY");
+    // Named, never written: the file is on disk while the app runs.
+    assert!(document.get("api_key").is_none());
+    assert_provider_file_holds_no_credential(&provider, &document, key);
+    assert!(
+        document["models"]
+            .as_array()
+            .is_some_and(|models| models.iter().any(|m| m["name"] == model)),
+        "the provider file does not list the starting model {model}"
+    );
+    // Scheme and authority only: goose appends `base_path`, so a `/v1`
+    // here would request `/v1/v1/chat/completions`, and any other path,
+    // query or fragment lands somewhere the daemon does not serve.
     // Checked structurally — rejecting `/v1` alone lets the rest past.
-    let host = get("OPENAI_HOST").expect("no OPENAI_HOST");
+    let host = document["base_url"].as_str().expect("no base_url");
     let authority = host
         .strip_prefix("http://")
         .or_else(|| host.strip_prefix("https://"))
-        .unwrap_or_else(|| panic!("OPENAI_HOST is not an http(s) URL: {host}"));
+        .unwrap_or_else(|| panic!("base_url is not an http(s) URL: {host}"));
     assert!(
         // A lone trailing slash still names the origin; anything after
         // it does not.
         !authority.trim_end_matches('/').contains(['/', '?', '#']),
-        "OPENAI_HOST is not a bare origin: {host}"
+        "base_url is not a bare origin: {host}"
     );
+    assert_eq!(host.trim_end_matches('/'), llmman::daemon::server());
 
     // Byte-identical, and alone: a launch that rewrote, replaced or
     // deleted the provider the user configured — or left a `.bak` beside
@@ -2552,11 +2769,75 @@ fn launch_goose_desktop_env() {
         Some(GOOSE_CONFIG_SENTINEL),
         "launch goose-desktop changed the user's config.yaml"
     );
+    // The provider file is gone with the app; the directory it was written
+    // to is goose's own, which launch created and leaves empty.
+    assert!(
+        left_in_providers.is_empty(),
+        "launch goose-desktop left {left_in_providers:?} in goose's custom_providers"
+    );
+    let expected: &[&str] = if cfg!(windows) {
+        &["config.yaml"]
+    } else {
+        &["config.yaml", "custom_providers"]
+    };
     assert_eq!(
-        left_in_config,
-        ["config.yaml"],
+        left_in_config, expected,
         "launch goose-desktop left files in ~/.config/goose"
     );
+}
+
+/// The provider file is on disk while the app runs, so it must hold no
+/// credential. What `key` (the `LLMMAN_API_KEY` the app was handed) lets this
+/// check say depends on what it is:
+///
+///   - a session token or the daemon's own key is a secret and long and
+///     random: the file must not contain it anywhere;
+///   - [`llmman::providers::PLACEHOLDER_API_KEY`], what a launch is handed
+///     when this shell holds no provider key (as on CI), is public and is
+///     also the provider's own name (`name`, `display_name`), so a substring
+///     test trips on the file's own label. It may stand only in those two
+///     fields, and nowhere else, not even as a whole value.
+///
+/// Either way the file must hold the value of no credential-looking variable
+/// of this environment (a provider key set in the shell, a CI token), which is
+/// what a real leak into it would be. Failures name the variable, not the
+/// value.
+fn assert_provider_file_holds_no_credential(
+    provider: &str,
+    document: &serde_json::Value,
+    key: &str,
+) {
+    if key == llmman::providers::PLACEHOLDER_API_KEY {
+        let fields = document
+            .as_object()
+            .expect("the provider file is an object");
+        for (field, value) in fields {
+            assert!(
+                value.as_str() != Some(key) || matches!(field.as_str(), "name" | "display_name"),
+                "the provider file holds the placeholder key in `{field}`"
+            );
+        }
+        let models = document["models"].as_array().expect("models");
+        assert!(
+            models.iter().all(|m| m["name"] != key),
+            "a listed model is named like the placeholder key"
+        );
+    } else {
+        assert!(!provider.contains(key), "the provider file holds the key");
+    }
+    for (name, value) in std::env::vars() {
+        let credential = ["_API_KEY", "_TOKEN", "_SECRET", "_PASSWORD"]
+            .iter()
+            .any(|suffix| name.to_uppercase().ends_with(suffix));
+        // Short values are no secret worth the false alarms a substring
+        // of a model name would raise.
+        if credential && value.len() >= 12 && value != key {
+            assert!(
+                !provider.contains(&value),
+                "the provider file holds the value of ${name}"
+            );
+        }
+    }
 }
 
 /// Seeded into the test's `~/.config/goose/config.yaml`: a provider that
@@ -2753,11 +3034,12 @@ fn serve_detach_rejects_an_unrelated_listener() {
     responder.join().unwrap();
 }
 
-/// `llmman launch qwen` with no `--model` is refused on the flag before
-/// any daemon work: under the dead-daemon setup a build that checked
-/// after `ensure_server` would report the daemon's startup exit instead.
+/// `llmman launch qwen` with no `--model` is no longer refused on the flag:
+/// the model is picked once the daemon answers. Under the dead-daemon setup
+/// it is the daemon's startup exit that is reported, quickly, and never "qwen
+/// needs a model".
 #[test]
-fn launch_qwen_without_a_model_is_refused_before_the_daemon() {
+fn launch_qwen_without_a_model_goes_on_to_the_daemon() {
     let (dir, port, path) = dead_daemon_setup("qwen-no-model");
 
     let mut cmd = Command::new(llmman_bin());
@@ -2780,18 +3062,50 @@ fn launch_qwen_without_a_model_is_refused_before_the_daemon() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         !output.status.success(),
-        "launch without a model succeeded\n{stderr}"
+        "launch with a dead daemon succeeded\n{stderr}"
     );
-    assert!(stderr.contains("qwen needs a model"), "{stderr}");
+    assert!(!stderr.contains("needs a model"), "{stderr}");
     assert!(
-        !stderr.contains("exited during startup"),
-        "the daemon was started first\n{stderr}"
+        stderr.contains("exited during startup") || stderr.contains("qwen is not installed"),
+        "{stderr}"
     );
-    // 30s, like the dead-daemon test: the refusal takes milliseconds, but
-    // a runner busy with the model tests beside it does not.
+    // 30s, like the dead-daemon test: a runner busy with the model tests
+    // beside it is slow, not wrong.
+    assert!(elapsed < Duration::from_secs(30), "took {elapsed:?}");
+}
+
+/// `--provider` with no `--model` is accepted by the flags (it starts on the
+/// provider's default), a blank one is still refused, and the help no longer
+/// says a model is required.
+#[test]
+fn launch_help_and_flags_describe_a_provider_that_needs_no_model() {
+    let help = Command::new(llmman_bin())
+        .args(["launch", "--help"])
+        .output()
+        .expect("llmman launch --help");
+    let help = String::from_utf8_lossy(&help.stdout);
+    assert!(!help.contains("Requires --model"), "{help}");
+    assert!(help.contains("default"), "{help}");
+    // Said plainly: which agents take one model and which read their own.
+    let help = help.split_whitespace().collect::<Vec<_>>().join(" ");
     assert!(
-        elapsed < Duration::from_secs(30),
-        "refusal took {elapsed:?}"
+        help.contains("copilot and Gemini CLI, which take one model"),
+        "{help}"
+    );
+    assert!(
+        help.contains("claude, codex, opencode, hermes and openclaw only"),
+        "{help}"
+    );
+
+    let blank = Command::new(llmman_bin())
+        .args(["launch", "claude", "--provider", " "])
+        .output()
+        .expect("llmman launch claude --provider ' '");
+    assert!(!blank.status.success());
+    assert!(
+        String::from_utf8_lossy(&blank.stderr).contains("--provider needs a provider id"),
+        "{}",
+        String::from_utf8_lossy(&blank.stderr)
     );
 }
 

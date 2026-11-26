@@ -31,6 +31,53 @@ pub struct Index {
     pub metadata: HashMap<String, String>,
 }
 
+impl Index {
+    /// The tensors under the names `rename` gives (dropping the `None`s).
+    pub fn renamed(&self, rename: impl Fn(&str) -> Option<String>) -> Index {
+        Index {
+            tensors: self
+                .tensors
+                .iter()
+                .filter_map(|d| {
+                    Some(TensorDesc {
+                        name: rename(&d.name)?,
+                        ..d.clone()
+                    })
+                })
+                .collect(),
+            metadata: self.metadata.clone(),
+        }
+    }
+
+    /// Dimension `i` (ggml order) of tensor `name`.
+    pub fn dim(&self, name: &str, i: usize) -> Result<i64> {
+        let d = self
+            .tensors
+            .iter()
+            .find(|d| d.name == name)
+            .ok_or_else(|| anyhow!("no {name}"))?;
+        d.ne.get(i)
+            .copied()
+            .ok_or_else(|| anyhow!("{name} has rank {}, expected more than {i}", d.ne.len()))
+    }
+
+    /// How many numbered blocks `{prefix}{k}.` there are: the largest `k` + 1.
+    pub fn count(&self, prefix: &str) -> i64 {
+        self.tensors
+            .iter()
+            .filter_map(|d| {
+                d.name
+                    .strip_prefix(prefix)?
+                    .split('.')
+                    .next()?
+                    .parse::<i64>()
+                    .ok()
+            })
+            .max()
+            .map_or(0, |m| m + 1)
+    }
+}
+
 pub fn read_index(path: &Path) -> Result<Index> {
     let mut f = File::open(path).with_context(|| format!("open {}", path.display()))?;
     read_index_from(&mut f, path)
@@ -77,6 +124,10 @@ fn read_safetensors(f: &mut File, path: &Path) -> Result<Index> {
                     );
                 }
             }
+            continue;
+        }
+        // BatchNorm's step counter (FLUX.2's VAE): an integer no graph reads
+        if name.ends_with(".num_batches_tracked") {
             continue;
         }
         let dtype = v["dtype"].as_str().unwrap_or("");

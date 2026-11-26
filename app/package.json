@@ -56,6 +56,11 @@
     "sharp": "^0.35.5",
     "typescript": "~6.0.3"
   },
+  "overrides": {
+    "@expo/fingerprint": {
+      "minimatch": "^11.0.1"
+    }
+  },
   "scripts": {
     "start": "expo start",
     "ios": "expo run:ios",

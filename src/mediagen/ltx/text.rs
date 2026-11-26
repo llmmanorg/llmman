@@ -55,6 +55,77 @@ pub struct TextEncoder {
 
 unsafe impl Send for TextEncoder {}
 
+/// A GGUF's vocabulary alone (no weights, no context): for tokenizing.
+pub struct Vocab {
+    api: &'static Api,
+    model: *mut LlamaModel,
+}
+
+unsafe impl Send for Vocab {}
+
+impl Drop for Vocab {
+    fn drop(&mut self) {
+        unsafe { (self.api.llama_model_free)(self.model) }
+    }
+}
+
+impl Vocab {
+    pub fn load(api: &'static Api, path: &str) -> Result<Vocab> {
+        unsafe {
+            let mut mp = (api.llama_model_default_params)();
+            {
+                let p = mp.view_mut::<LlamaModelParams>();
+                ffi::check_model_params(p)?;
+                p.vocab_only = true;
+            }
+            let cpath = CString::new(path)?;
+            let model = (api.llama_model_load_from_file)(cpath.as_ptr(), mp);
+            if model.is_null() {
+                bail!("failed to load the vocabulary of {path}");
+            }
+            Ok(Vocab { api, model })
+        }
+    }
+
+    pub fn tokenize(&self, text: &str, add_special: bool, parse_special: bool) -> Result<Vec<i32>> {
+        let vocab = unsafe { (self.api.llama_model_get_vocab)(self.model) };
+        tokenize(self.api, vocab, text, add_special, parse_special)
+    }
+}
+
+fn tokenize(
+    api: &'static Api,
+    vocab: *const ffi::LlamaVocab,
+    text: &str,
+    add_special: bool,
+    parse_special: bool,
+) -> Result<Vec<i32>> {
+    let ctext = CString::new(text)?;
+    let mut tokens = vec![0i32; text.len() + 16];
+    let run = |tokens: &mut [i32]| unsafe {
+        (api.llama_tokenize)(
+            vocab,
+            ctext.as_ptr(),
+            text.len() as i32,
+            tokens.as_mut_ptr(),
+            tokens.len() as i32,
+            add_special,
+            parse_special,
+        )
+    };
+    let mut n = run(&mut tokens);
+    if n < 0 {
+        // too small: llama.cpp says how many it needs
+        tokens.resize((-n) as usize, 0);
+        n = run(&mut tokens);
+    }
+    if n < 0 {
+        bail!("failed to tokenize");
+    }
+    tokens.truncate(n as usize);
+    Ok(tokens)
+}
+
 unsafe extern "C" fn cb_eval(t: TensorPtr, ask: bool, user_data: *mut c_void) -> bool {
     let enc = &*(user_data as *const TextEncoder);
     if enc.capture.is_null() {
@@ -193,39 +264,8 @@ impl TextEncoder {
         unsafe { (self.api.llama_model_get_vocab)(self.model) }
     }
 
-    fn tokenize(&self, text: &str, add_special: bool, parse_special: bool) -> Result<Vec<i32>> {
-        let ctext = CString::new(text)?;
-        let mut tokens = vec![0i32; text.len() + 16];
-        let mut n = unsafe {
-            (self.api.llama_tokenize)(
-                self.vocab(),
-                ctext.as_ptr(),
-                text.len() as i32,
-                tokens.as_mut_ptr(),
-                tokens.len() as i32,
-                add_special,
-                parse_special,
-            )
-        };
-        if n < 0 {
-            tokens.resize((-n) as usize, 0);
-            n = unsafe {
-                (self.api.llama_tokenize)(
-                    self.vocab(),
-                    ctext.as_ptr(),
-                    text.len() as i32,
-                    tokens.as_mut_ptr(),
-                    tokens.len() as i32,
-                    add_special,
-                    parse_special,
-                )
-            };
-        }
-        if n < 0 {
-            bail!("failed to tokenize");
-        }
-        tokens.truncate(n as usize);
-        Ok(tokens)
+    pub fn tokenize(&self, text: &str, add_special: bool, parse_special: bool) -> Result<Vec<i32>> {
+        tokenize(self.api, self.vocab(), text, add_special, parse_special)
     }
 
     /// Decodes `tokens` once, capturing every hidden state: index 0 the

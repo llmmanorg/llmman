@@ -1,11 +1,23 @@
 //! `llmman launch claude`.
 
 use super::common;
+use super::models::{write_transient, ModelEntry, ModelList};
 use super::optimizer::{Addition, Optimizer};
 use super::{
     before_terminator, exec_with_env_removing, find_on_path, has_flag, has_forwarded_model_flag,
     server,
 };
+
+/// The model claude last ran, which `/model` saved to its user settings.
+pub(super) fn remembered_model() -> Option<String> {
+    let dir = super::env_dir("CLAUDE_CONFIG_DIR")
+        .or_else(|| dirs::home_dir().map(|home| home.join(".claude")))?;
+    let text = std::fs::read_to_string(dir.join("settings.json")).ok()?;
+    let settings: serde_json::Value = serde_json::from_str(&text).ok()?;
+    // The picker saves a row that `picker_model` suffixed.
+    let model = settings["model"].as_str()?;
+    Some(model.strip_suffix("[1m]").unwrap_or(model).to_string())
+}
 
 /// Inherited variables that point claude at another provider or credential.
 const CLAUDE_ENV_TO_CLEAR: &[&str] = &[
@@ -47,6 +59,7 @@ pub(super) fn launch_claude(
     model: &str,
     api_key: &str,
     context_window: Option<u64>,
+    models: &ModelList,
     extra_args: &[String],
     optimizer: Optimizer,
 ) -> anyhow::Result<()> {
@@ -55,21 +68,155 @@ pub(super) fn launch_claude(
     let server = added.server.clone().unwrap_or_else(server);
     let session_model = session_model(model, extra_args);
     let window = claude_context_window(
-        context_window,
-        runs_model(model, extra_args),
+        session_window(session_model, context_window, models),
         std::env::var_os(CLAUDE_MAX_CONTEXT_ENV).is_some(),
     )
     // an image sandbox does not inherit the caller's
     .or_else(|| std::env::var(CLAUDE_MAX_CONTEXT_ENV).ok());
-    let (args, env) = with_addition(
+    let picker = models.entries().len() > 1;
+    let (args, mut env) = with_addition(
         claude_args(model, extra_args),
         claude_env(session_model, api_key, &server, window.as_deref()),
         &added,
     );
+    let args = if picker {
+        env.push((CLAUDE_ALWAYS_EFFORT_ENV, "1"));
+        merge_settings(args, picker_settings(models))?
+    } else {
+        args
+    };
     if let Some(notice) = optimizer.notice("claude") {
         eprintln!("{notice}");
     }
     exec_with_env_removing(&bin, &args, &env, CLAUDE_ENV_TO_CLEAR)
+}
+
+/// Sends claude's `effort` parameter for ids it does not know: without it
+/// `/effort` offers a model of llmman's nothing to choose.
+const CLAUDE_ALWAYS_EFFORT_ENV: &str = "CLAUDE_CODE_ALWAYS_ENABLE_EFFORT";
+
+/// The window at which claude takes an id it does not know to hold 1M
+/// tokens, with `[1m]`, whatever [`CLAUDE_MAX_CONTEXT_ENV`] says.
+const CLAUDE_1M_WINDOW: u64 = 1_000_000;
+
+/// The model a picker row selects. claude strips `[1m]` before sending the id and sizes such a row
+/// at 1M whatever [`CLAUDE_MAX_CONTEXT_ENV`] holds (one value per session), so a row of 1M or more
+/// keeps its window beside a smaller start.
+fn picker_model(entry: &ModelEntry) -> String {
+    if entry.context_window.is_some_and(|w| w >= CLAUDE_1M_WINDOW) {
+        format!("{}[1m]", entry.reference)
+    } else {
+        entry.reference.clone()
+    }
+}
+
+/// The `/model` picker for the list: one row per model, titled with its
+/// plain id and provider and described by what it takes, in the list's order
+/// and instead of claude's own lineup (a local model is none of its).
+fn picker_settings(models: &ModelList) -> serde_json::Value {
+    let rows: Vec<serde_json::Value> = models
+        .entries()
+        .iter()
+        .map(|entry| {
+            let mut notes = Vec::new();
+            if let Some(window) = entry.context_window {
+                notes.push(format!("{}k context", window / 1000));
+            }
+            if entry.vision {
+                notes.push("images".to_string());
+            }
+            if entry.tools == Some(true) {
+                notes.push("tools".to_string());
+            }
+            serde_json::json!({
+                "model": picker_model(entry),
+                "label": entry.label(),
+                "description": notes.join(", "),
+            })
+        })
+        .collect();
+    serde_json::json!({ "modelPicker": { "options": rows, "replaceBuiltInOptions": true } })
+}
+
+/// `args` with the `--settings` before a `--` folded with `ours` into one: claude keeps only the
+/// last `--settings`, so a forwarded one (or an optimizer's) would replace the picker. The last one
+/// stays as written; the picker replaces any it has.
+fn merge_settings(args: Vec<String>, ours: serde_json::Value) -> anyhow::Result<Vec<String>> {
+    merge_settings_in(args, ours, &super::models::state_dir("claude")?)
+}
+
+/// [`merge_settings`], written to `dir`.
+fn merge_settings_in(
+    args: Vec<String>,
+    ours: serde_json::Value,
+    dir: &std::path::Path,
+) -> anyhow::Result<Vec<String>> {
+    let end = args.iter().position(|a| a == "--").unwrap_or(args.len());
+    let mut rest = Vec::new();
+    let mut last = None;
+    let mut i = 0;
+    while i < args.len() {
+        let value = if i >= end {
+            None
+        } else if args[i] == "--settings" {
+            i += 1;
+            Some(args.get(i).cloned().unwrap_or_default())
+        } else {
+            args[i].strip_prefix("--settings=").map(str::to_string)
+        };
+        match value {
+            Some(value) => last = Some(value),
+            None => rest.push(args[i].clone()),
+        }
+        i += 1;
+    }
+    let mut merged = match last {
+        Some(value) => read_settings(&value)?,
+        None => serde_json::json!({}),
+    };
+    if let (Some(merged), serde_json::Value::Object(ours)) = (merged.as_object_mut(), ours) {
+        merged.extend(ours);
+    }
+    let text = serde_json::to_string(&merged).expect("settings serialize");
+    let path = write_transient(dir, "settings", "json", &text)?;
+    let mut out = vec![
+        "--settings".to_string(),
+        path.to_string_lossy().into_owned(),
+    ];
+    out.extend(rest);
+    Ok(out)
+}
+
+/// A `--settings` value: a JSON object, or the file that holds one.
+fn read_settings(value: &str) -> anyhow::Result<serde_json::Value> {
+    use anyhow::Context;
+    let text = if value.trim_start().starts_with('{') {
+        value.to_string()
+    } else {
+        std::fs::read_to_string(value).with_context(|| format!("read --settings {value}"))?
+    };
+    let settings: serde_json::Value = serde_json::from_str(&common::strip_json_comments(
+        text.trim_start_matches('\u{feff}'),
+    ))
+    .with_context(|| format!("--settings {value} is not JSON"))?;
+    anyhow::ensure!(
+        settings.is_object(),
+        "--settings {value} is not a JSON object"
+    );
+    Ok(settings)
+}
+
+/// The window of the model the session runs: llmman's start, or a forwarded `--model` the list
+/// holds. Not the list's smallest, which an embedding or tiny model would drag down.
+fn session_window(session_model: &str, window: Option<u64>, models: &ModelList) -> Option<u64> {
+    match models.start() {
+        Some(start) if start.reference == session_model => window,
+        _ => models
+            .entries()
+            .iter()
+            .find(|e| e.reference == session_model || e.id == session_model)
+            .and_then(|e| e.context_window),
+    }
 }
 
 /// `args` and `env` with what an optimizer adds: its arguments first, its
@@ -117,15 +264,11 @@ pub(super) fn cvmn_conflict(extra_args: &[String]) -> Option<&'static str> {
     }
 }
 
-/// The value for [`CLAUDE_MAX_CONTEXT_ENV`]: `launch`'s window for llmman's
-/// model, unless the caller set the variable.
-fn claude_context_window(
-    window: Option<u64>,
-    is_llmman_model: bool,
-    already_set: bool,
-) -> Option<String> {
+/// The value for [`CLAUDE_MAX_CONTEXT_ENV`]: the session model's window,
+/// unless the caller set the variable.
+fn claude_context_window(window: Option<u64>, already_set: bool) -> Option<String> {
     window
-        .filter(|&w| w > 0 && is_llmman_model && !already_set)
+        .filter(|&w| w > 0 && !already_set)
         .map(|w| w.to_string())
 }
 
@@ -342,17 +485,148 @@ mod tests {
     }
 
     #[test]
-    fn context_window_is_declared_only_for_llmmans_model_and_only_if_unset() {
+    fn context_window_is_declared_for_the_session_model_and_only_if_unset() {
         assert_eq!(
-            claude_context_window(Some(262144), true, false).as_deref(),
+            claude_context_window(Some(262144), false).as_deref(),
             Some("262144")
         );
-        assert_eq!(claude_context_window(None, true, false), None);
-        assert_eq!(claude_context_window(Some(0), true, false), None);
-        // a forwarded `--model` has a window of its own
-        assert_eq!(claude_context_window(Some(262144), false, false), None);
+        assert_eq!(claude_context_window(None, false), None);
+        assert_eq!(claude_context_window(Some(0), false), None);
         // the caller's own value wins
-        assert_eq!(claude_context_window(Some(262144), true, true), None);
+        assert_eq!(claude_context_window(Some(262144), true), None);
+    }
+
+    fn row(reference: &str, window: Option<u64>) -> ModelEntry {
+        ModelEntry {
+            context_window: window,
+            tools: Some(true),
+            ..ModelEntry::unlisted(reference)
+        }
+    }
+
+    fn list() -> ModelList {
+        ModelList::of(vec![
+            row("docker.io/ai/small", Some(8192)),
+            row("llmman.provider/a/huge", Some(1_000_000)),
+            row("llmman.provider/a/mid", Some(200_000)),
+            row("llmman.provider/b/unknown", None),
+        ])
+    }
+
+    /// The window is the model the session runs's, not the smallest of the
+    /// list (which a tiny model would drag down) and not the start's when
+    /// another is forwarded.
+    #[test]
+    fn the_window_is_the_session_models_own() {
+        let models = list();
+        // The start: what the daemon serves.
+        assert_eq!(
+            session_window("docker.io/ai/small", Some(4096), &models),
+            Some(4096)
+        );
+        // A forwarded one: the list's.
+        assert_eq!(
+            session_window("llmman.provider/a/mid", Some(4096), &models),
+            Some(200_000)
+        );
+        assert_eq!(
+            session_window("llmman.provider/b/unknown", Some(4096), &models),
+            None
+        );
+        assert_eq!(session_window("not-listed", Some(4096), &models), None);
+    }
+
+    #[test]
+    fn the_picker_lists_every_row_in_order_and_sizes_a_1m_row_itself() {
+        let picker = picker_settings(&list());
+        let options = picker["modelPicker"]["options"].as_array().unwrap();
+        assert_eq!(options.len(), 4);
+        assert_eq!(picker["modelPicker"]["replaceBuiltInOptions"], true);
+        let models: Vec<&str> = options
+            .iter()
+            .map(|o| o["model"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            models,
+            [
+                "docker.io/ai/small",
+                "llmman.provider/a/huge[1m]",
+                "llmman.provider/a/mid",
+                "llmman.provider/b/unknown"
+            ]
+        );
+        assert_eq!(options[0]["label"], "small");
+        assert_eq!(options[2]["label"], "a/mid");
+        assert_eq!(options[2]["description"], "200k context, tools");
+    }
+
+    #[test]
+    fn a_forwarded_settings_is_merged_in_both_forms_with_the_picker_kept() {
+        let dir = crate::cmd::launch::test_temp_dir("claude-settings");
+        let theirs = dir.join("theirs.json");
+        std::fs::write(
+            &theirs,
+            r#"{ "permissions": { "allow": ["Bash(ls)"] }, "modelPicker": { "options": [] } }"#,
+        )
+        .unwrap();
+        let ours = picker_settings(&list());
+        let path = theirs.display().to_string();
+        for forwarded in [
+            vec!["--settings".to_string(), path.clone()],
+            vec![format!("--settings={path}")],
+            vec![
+                "--settings".to_string(),
+                r#"{"permissions":{"allow":["Bash(ls)"]}}"#.to_string(),
+            ],
+        ] {
+            let mut args = vec!["--model".to_string(), "m".to_string()];
+            args.extend(forwarded);
+            args.extend(["-p".to_string(), "hi".to_string()]);
+            let merged = merge_settings_in(args, ours.clone(), &dir).unwrap();
+            assert_eq!(merged[0], "--settings");
+            assert_eq!(&merged[2..], ["--model", "m", "-p", "hi"]);
+            assert_eq!(
+                merged
+                    .iter()
+                    .filter(|a| a.starts_with("--settings"))
+                    .count(),
+                1
+            );
+            let written: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&merged[1]).unwrap()).unwrap();
+            assert_eq!(
+                written["permissions"]["allow"],
+                serde_json::json!(["Bash(ls)"])
+            );
+            assert_eq!(
+                written["modelPicker"]["options"].as_array().unwrap().len(),
+                4
+            );
+        }
+        // After a `--` it is a message, not a flag.
+        let args = vec!["--".to_string(), "--settings".to_string(), "x".to_string()];
+        let merged = merge_settings_in(args, ours, &dir).unwrap();
+        assert_eq!(&merged[2..], ["--", "--settings", "x"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn only_the_last_forwarded_settings_is_kept_as_claude_does() {
+        let dir = crate::cmd::launch::test_temp_dir("claude-settings-last");
+        let ours = picker_settings(&list());
+        let first = r#"{"permissions":{"allow":["Bash(*)"],"deny":["Read(x)"]},"env":{"A":"1"}}"#;
+        let second = r#"{"permissions":{"allow":[]},"modelPicker":{"options":[{"model":"x"}]}}"#;
+        let args = strings(&["--settings", first, "-p", "hi", "--settings", second]);
+        let merged = merge_settings_in(args, ours.clone(), &dir).unwrap();
+        assert_eq!(&merged[2..], ["-p", "hi"]);
+        let written: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&merged[1]).unwrap()).unwrap();
+        // The earlier one's allow rule and everything else of it is gone.
+        assert_eq!(written["permissions"], serde_json::json!({ "allow": [] }));
+        assert!(written.get("env").is_none());
+        // The picker is ours, not the caller's.
+        assert_eq!(written["modelPicker"], ours["modelPicker"]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Removal runs last, so an overlap would unset llmman's value.

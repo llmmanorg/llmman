@@ -5,7 +5,8 @@ that mounts a [ModelPack](https://github.com/modelpack/model-spec) model
 artifact into a pod, read-only, as the complete model directory: weights,
 `config.json`, tokenizer files, GGUF files, docs, every file at the path the
 artifact was packaged with. vLLM, SGLang, llama.cpp and anything else that
-reads a model from a directory can point straight at it.
+reads a model from a directory can point straight at it, as can `llmman serve`
+([below](#serving-a-mounted-model-with-llmman-serve)).
 
 It drops in for [modelpack/model-csi-driver](https://github.com/modelpack/model-csi-driver):
 the driver name, `model.csi.modelpack.org`, and the volume attribute,
@@ -119,6 +120,59 @@ A pre-provisioned PersistentVolume takes the same attribute, for pods that
 claim a volume rather than declare one:
 [`deploy/examples/persistent-volume.yaml`](../deploy/examples/persistent-volume.yaml).
 There is no dynamic provisioning: you create the PersistentVolume.
+
+### Serving a mounted model with llmman serve
+
+`llmman serve` can serve the mounted directory where it is, with llmman's API
+(Ollama, OpenAI and Anthropic compatible), keys and model list in front of
+vLLM. `LLMMAN_MODEL_DIRS` maps a model name to the directory; nothing is
+imported into llmman's store or copied
+([configuration.md](configuration.md#environment-variables) has the
+details).
+
+[`deploy/examples/llmman-serve-vllm.yaml`](../deploy/examples/llmman-serve-vllm.yaml)
+is a Deployment and a Service for a safetensors model. To run it:
+
+1. Create the API key Secret the file's header names: a pod binds every
+   address, and the daemon refuses to start without keys.
+2. Edit `LLMMAN_MODEL_DIRS` and the volume's `reference`, and the vLLM image
+   if you want another build.
+3. Pin the init container's image to a release that has `LLMMAN_MODEL_DIRS`
+   (`docker.io/ai/llmman:server-<version>`).
+
+The vLLM image must be Linux with glibc 2.28 or newer (Debian, Ubuntu and Red
+Hat family images; not Alpine) and have `vllm` on its `PATH`, as the
+`vllm/vllm-openai` images do. No llmman-specific image is needed: an init
+container copies the `llmman` binary out of an `ai/llmman` image into an
+`emptyDir`, and `llmman serve` with `LLMMAN_RUNTIME=path` starts the image's
+own `vllm`.
+
+Pitfalls:
+
+* The image's entrypoint is `vllm serve`, so the manifest sets `command`;
+  `args` alone would pass `serve` to vllm.
+* A vLLM image has no `LLMMAN_RUNTIME=path` or `LLMMAN_HOST=0.0.0.0:17434`,
+  which the `ai/llmman` images preset; a loopback bind is unreachable through
+  the Service.
+* Set `LLMMAN_MODELS` to a writable directory (the example uses the
+  `emptyDir`): without a writable `$HOME`, `llmman serve` exits at start with
+  only `Permission denied` or `Read-only file system`.
+* The kubelet mounts volumes before it starts init containers, so a first
+  start waits in `Init:0/1` for the model pull. That can exceed the
+  Deployment's default progress deadline of ten minutes, which the example
+  raises.
+* The model loads on the first request, which can take many minutes
+  (`LLMMAN_LOAD_TIMEOUT`, 20 minutes). The example sets
+  `LLMMAN_KEEP_ALIVE=-1` so that the dedicated pod never unloads it.
+* vLLM needs `/dev/shm` larger than a pod's default 64 MiB.
+* A mounted model cannot be pulled, pushed, copied or removed (the daemon
+  answers 400, and `llmman rm` says why) and is not checked against
+  `[verify]`; the driver applied that policy when it mounted the volume.
+
+A GGUF volume is served the same way by an image that has `llama-server`, such
+as an `ai/llmman:server-*` image: drop the init container and set
+`command: ["llmman", "serve"]`. A Diffusers pipeline or a speech model is
+refused; those run from the store.
 
 ### Volume attributes
 
@@ -266,7 +320,7 @@ Pods keep working if the driver pod restarts: their mounts belong to the
 kubelet, not the plugin.
 
 To remove a model from a node, remove it with llmman in the driver pod; that
-also prunes what no other model uses and is more than an hour old. Or delete the
+also frees, at once, what no other model uses. Or delete the
 directory when no pod uses anything in it:
 
 ```console

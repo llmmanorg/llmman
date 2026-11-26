@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 
 use super::common;
+use super::models::{ModelEntry, ModelList};
 use super::{exec_with_env, find_on_path, has_flag, server, Effort};
 
 /// The env var dsh's generated provider entry reads its key from, so no
@@ -30,11 +31,16 @@ pub(super) const DSH_MISSING: &str =
 /// deliberately, since a per-launch directory costs a cleanup hook on
 /// every exit path (signals included) for a case that needs two
 /// simultaneous sessions on different models to bite at all.
+///
+/// Every model of `models` is a route entry the user can pick inside dsh;
+/// dsh sends the entry's `id` as the model name, so the daemon is handed the
+/// reference unchanged.
 pub(super) fn launch_dsh(
     model: &str,
     api_key: &str,
-    vision: bool,
+    _vision: bool,
     effort: Option<&Effort>,
+    models: &ModelList,
     extra_args: &[String],
 ) -> anyhow::Result<()> {
     let launcher = dsh_launcher(extra_args);
@@ -52,9 +58,10 @@ pub(super) fn launch_dsh(
 
     let dir = dsh_config_dir()?;
     let settings_path = dir.join("settings.yaml");
-    write_dsh_settings(&settings_path, model, vision, effort)?;
+    let sections = dsh_sections(model, effort, models);
+    write_dsh_settings(&settings_path, &sections)?;
     let patch_path = dir.join("llmman.cordis.yml");
-    write_dsh_patch(&patch_path, &settings_path)?;
+    write_dsh_patch(&patch_path, &settings_path, &sections)?;
 
     let mut args = prefix;
     if !args.is_empty() {
@@ -169,64 +176,130 @@ pub(super) fn dsh_config_dir() -> anyhow::Result<PathBuf> {
     Ok(dir.join("launch").join("dsh"))
 }
 
-/// The settings document `llmman.cordis.yml` points dsh at: registers
-/// `llmman` as an `llm-pi-ai` provider route at this daemon's `/v1`, and
-/// selects it as the `agent-default-model`. A `--variant` becomes the
-/// route's default `reasoning`, among the model's `reasoningEfforts`.
-fn write_dsh_settings(
-    path: &Path,
-    model: &str,
-    vision: bool,
-    effort: Option<&Effort>,
-) -> anyhow::Result<()> {
-    let quoted_model = common::yaml_quote(model);
-    let base_url = common::yaml_quote(&format!("{}/v1", server()));
-    // Claiming image input a text-only model can't serve would have dsh
-    // attach what the daemon then rejects.
-    let input = if vision { "[text, image]" } else { "[text]" };
-    let (reasoning, efforts) = effort.map_or_else(Default::default, |e| {
-        let map: Vec<String> = (e.levels.iter())
-            .map(|&l| format!("{l}: {}", if l == "off" { "none" } else { l }))
-            .collect();
-        (
-            format!("      reasoning: {}\n", e.default),
-            format!("          reasoningEfforts: {{ {} }}\n", map.join(", ")),
-        )
-    });
-    let contents = format!(
-        "# Written by `llmman launch dsh`; edits are overwritten.\n\
-         agent-default-model:\n  provider: llmman\n  model: {quoted_model}\n\
-         llm-pi-ai:\n  providers:\n    llmman:\n      displayName: llmman\n      \
-         apiKeyEnv: {DSH_API_KEY_ENV}\n      api: openai-completions\n      baseURL: {base_url}\n\
-         {reasoning}      \
-         models:\n        - id: {quoted_model}\n          name: {quoted_model}\n          input: {input}\n\
-         {efforts}"
-    );
-    write_dsh_file(path, &contents)
+/// The two sections dsh is configured with, each as the YAML body after its key: the `llmman`
+/// provider route holding every model, and `model` as the `agent-default-model` (a `--variant` is
+/// its `reasoningEffort`).
+struct DshSections {
+    default_model: String,
+    providers: String,
 }
 
-/// dsh's patch shape: points its `settings` provider at the document above.
-fn write_dsh_patch(path: &Path, settings_path: &Path) -> anyhow::Result<()> {
-    write_dsh_file(path, &dsh_patch_document(settings_path))
+fn dsh_sections(model: &str, effort: Option<&Effort>, models: &ModelList) -> DshSections {
+    let quoted_model = common::yaml_quote(model);
+    let base_url = common::yaml_quote(&format!("{}/v1", server()));
+    let reasoning = effort.map_or_else(String::new, |e| {
+        format!("  reasoningEffort: {}\n", e.default)
+    });
+    let name = models.display_namer();
+    let entries: String = models
+        .entries()
+        .iter()
+        .map(|entry| dsh_model(entry, &name(entry)))
+        .collect();
+    let listed = if entries.is_empty() {
+        " []\n".to_string()
+    } else {
+        format!("\n{entries}")
+    };
+    DshSections {
+        default_model: format!("  provider: llmman\n  model: {quoted_model}\n{reasoning}"),
+        providers: format!(
+            "  providers:\n    llmman:\n      displayName: llmman\n      \
+             apiKeyEnv: {DSH_API_KEY_ENV}\n      api: openai-completions\n      baseURL: {base_url}\n      \
+             models:{listed}"
+        ),
+    }
+}
+
+/// The settings document `settings` is pointed at, which the dsh versions
+/// that still read one take their configuration from.
+fn write_dsh_settings(path: &Path, sections: &DshSections) -> anyhow::Result<()> {
+    let contents = format!(
+        "# Written by `llmman launch dsh`; edits are overwritten.\n\
+         agent-default-model:\n{}llm-pi-ai:\n{}",
+        sections.default_model, sections.providers
+    );
+    common::write_atomic_in_dir(path, contents.as_bytes())
+}
+
+/// One `models:` item of the route. The `id` is what dsh sends as the model
+/// name; `name` is what its picker shows.
+fn dsh_model(entry: &ModelEntry, name: &str) -> String {
+    let mut out = format!(
+        "        - id: {}\n          name: {}\n",
+        common::yaml_quote(&entry.reference),
+        common::yaml_quote(name)
+    );
+    if let Some(window) = entry.context_window {
+        out.push_str(&format!("          contextWindow: {window}\n"));
+    }
+    if let Some(max_output) = entry.max_output {
+        out.push_str(&format!("          maxTokens: {max_output}\n"));
+    }
+    // Claiming image input a text-only model can't serve would have dsh
+    // attach what the daemon then rejects.
+    let input = if entry.vision {
+        "[text, image]"
+    } else {
+        "[text]"
+    };
+    out.push_str(&format!("          input: {input}\n"));
+    let levels = dsh_reasoning_levels(entry);
+    if !levels.is_empty() {
+        if levels.iter().all(|level| level == "off") {
+            // dsh refuses a map that offers nothing beyond `off`; `false` is
+            // what it names for a model that cannot think.
+            out.push_str("          reasoningEfforts: false\n");
+        } else {
+            let efforts: Vec<String> = levels
+                .iter()
+                .map(|l| format!("{l}: {}", if l == "off" { "none" } else { l }))
+                .collect();
+            out.push_str(&format!(
+                "          reasoningEfforts: {{ {} }}\n",
+                efforts.join(", ")
+            ));
+        }
+    }
+    out
+}
+
+/// The model's variants as dsh's levels, in its cycle order. What dsh has no
+/// word for is left out.
+fn dsh_reasoning_levels(entry: &ModelEntry) -> Vec<String> {
+    entry.spelled_variants("dsh")
+}
+
+/// dsh's patch shape: points its `settings` provider at the document above and carries the same two
+/// sections. dsh 0.2 no longer reads that document (the sections moved into the profile), so
+/// without them a launch starts on dsh's own DeepSeek model and `headless` asks for a DeepSeek key.
+fn write_dsh_patch(
+    path: &Path,
+    settings_path: &Path,
+    sections: &DshSections,
+) -> anyhow::Result<()> {
+    let document = dsh_patch_document(settings_path, sections);
+    common::write_atomic_in_dir(path, document.as_bytes())
 }
 
 /// Split from `write_dsh_patch` so a test can render a Windows-shaped
 /// path on any platform: `yaml_quote` escapes the `\` separators, and
 /// forgetting that is what once turned the Windows leg red.
-fn dsh_patch_document(settings_path: &Path) -> String {
+fn dsh_patch_document(settings_path: &Path, sections: &DshSections) -> String {
     let quoted_settings_path = common::yaml_quote(&settings_path.to_string_lossy());
+    let nested = |body: &str| -> String {
+        body.lines()
+            .map(|line| format!("  {line}\n"))
+            .collect::<String>()
+    };
     format!(
         "# Written by `llmman launch dsh`; edits are overwritten.\n\
-         - id: settings\n  config:\n    path: {quoted_settings_path}\n"
+         - id: settings\n  config:\n    path: {quoted_settings_path}\n\
+         - id: agent-default-model\n  config:\n{}\
+         - id: llm-pi-ai\n  config:\n{}",
+        nested(&sections.default_model),
+        nested(&sections.providers)
     )
-}
-
-fn write_dsh_file(path: &Path, contents: &str) -> anyhow::Result<()> {
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
-    }
-    crate::fsutil::write_atomic(path, contents.as_bytes())
-        .with_context(|| format!("write {}", path.display()))
 }
 
 #[cfg(test)]
@@ -234,21 +307,39 @@ mod tests {
     use super::*;
     use crate::daemon;
 
+    fn hosted(provider: &str, id: &str) -> ModelEntry {
+        ModelEntry::unlisted(&crate::providers::format_remote_ref(provider, id))
+    }
+
+    fn list(entries: Vec<ModelEntry>) -> ModelList {
+        ModelList::of(entries)
+    }
+
+    /// The settings document as YAML, for a launch on `entries[0]`.
+    fn settings_of(
+        tag: &str,
+        entries: Vec<ModelEntry>,
+        effort: Option<&Effort>,
+    ) -> (String, serde_json::Value) {
+        let dir = super::super::test_temp_dir(tag);
+        let path = dir.join("settings.yaml");
+        let model = entries[0].reference.clone();
+        write_dsh_settings(&path, &dsh_sections(&model, effort, &list(entries))).unwrap();
+        let contents = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        let doc = yaml_serde::from_str(&contents).expect("valid YAML");
+        (contents, doc)
+    }
+
     /// A shortname like `qwen3.5:0.8b` must round-trip quoted, or the
     /// `:` breaks YAML parsing; the key must never appear literally.
     #[test]
     fn write_dsh_settings_points_at_llmman_with_the_key_in_the_environment() {
-        let dir = std::env::temp_dir().join(format!(
-            "llmman-dsh-settings-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let path = dir.join("settings.yaml");
-        write_dsh_settings(&path, "qwen3.5:0.8b", false, None).unwrap();
-        let contents = std::fs::read_to_string(&path).unwrap();
+        let (contents, _) = settings_of(
+            "dsh-settings",
+            vec![ModelEntry::unlisted("qwen3.5:0.8b")],
+            None,
+        );
         assert!(contents.contains("provider: llmman"));
         assert!(contents.contains("model: \"qwen3.5:0.8b\""));
         assert!(contents.contains(&format!("apiKeyEnv: {DSH_API_KEY_ENV}")));
@@ -256,31 +347,96 @@ mod tests {
         assert!(contents.contains(&format!("baseURL: \"{}/v1\"", daemon::server())));
         assert!(contents.contains("id: \"qwen3.5:0.8b\""));
         assert!(!contents.contains("apiKey:"), "no literal key in the file");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// dsh sends an image only to a model whose `input` lists one — and
-    /// must not attach one to a text-only model the daemon would reject.
+    /// Every row is a model of the route, the starting one first and the
+    /// default selection; the model dsh sends is the reference, whole.
     #[test]
-    fn write_dsh_settings_declares_image_input_only_for_a_vision_model() {
-        let dir = std::env::temp_dir().join(format!(
-            "llmman-dsh-vision-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let path = dir.join("settings.yaml");
-        write_dsh_settings(&path, "m", true, None).unwrap();
-        assert!(std::fs::read_to_string(&path)
+    fn dsh_settings_hold_every_model_with_the_start_selected() {
+        let entries = vec![
+            ModelEntry::unlisted("qwen3.5:0.8b"),
+            hosted("alpha", "m"),
+            hosted("beta", "m"),
+            hosted("beta", "other"),
+        ];
+        let (_, doc) = settings_of("dsh-all", entries.clone(), None);
+        assert_eq!(doc["agent-default-model"]["provider"], "llmman");
+        assert_eq!(doc["agent-default-model"]["model"], "qwen3.5:0.8b");
+        let route = &doc["llm-pi-ai"]["providers"]["llmman"];
+        let ids: Vec<&str> = route["models"]
+            .as_array()
             .unwrap()
-            .contains("input: [text, image]"));
-        write_dsh_settings(&path, "m", false, None).unwrap();
-        assert!(std::fs::read_to_string(&path)
+            .iter()
+            .map(|m| m["id"].as_str().unwrap())
+            .collect();
+        let references: Vec<&str> = entries.iter().map(|e| e.reference.as_str()).collect();
+        assert_eq!(ids, references);
+        // Two providers' `m` are told apart; the rest keep the plain id.
+        let names: Vec<&str> = route["models"]
+            .as_array()
             .unwrap()
-            .contains("input: [text]"));
-        let _ = std::fs::remove_dir_all(&dir);
+            .iter()
+            .map(|m| m["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["qwen3.5:0.8b", "alpha/m", "beta/m", "other"]);
+    }
+
+    /// What the catalog says of a model reaches dsh's record of it, and
+    /// nothing is claimed that it does not say.
+    #[test]
+    fn dsh_settings_carry_each_models_window_output_vision_and_efforts() {
+        let rich = ModelEntry {
+            context_window: Some(200_000),
+            max_output: Some(8000),
+            thinking: Some(vec!["none".into(), "low".into(), "high".into()]),
+            vision: true,
+            ..hosted("alpha", "rich")
+        };
+        let plain = ModelEntry {
+            thinking: Some(Vec::new()),
+            ..hosted("alpha", "plain")
+        };
+        let switch = ModelEntry {
+            thinking: Some(vec!["none".into(), "thinking".into()]),
+            ..hosted("alpha", "switch")
+        };
+        let unknown = hosted("alpha", "unknown");
+        // The catalog's own row for groq's qwen/qwen3.6-27b: dsh has no word
+        // for `default`, which leaves `off` alone.
+        let off_only = ModelEntry {
+            thinking: Some(vec!["none".into(), "default".into()]),
+            ..hosted("groq", "qwen/qwen3.6-27b")
+        };
+        let (_, doc) = settings_of(
+            "dsh-fields",
+            vec![rich, plain, switch, unknown, off_only],
+            None,
+        );
+        let models = &doc["llm-pi-ai"]["providers"]["llmman"]["models"];
+        assert_eq!(models[0]["contextWindow"], 200_000);
+        assert_eq!(models[0]["maxTokens"], 8000);
+        assert_eq!(models[0]["input"], serde_json::json!(["text", "image"]));
+        assert_eq!(
+            models[0]["reasoningEfforts"],
+            serde_json::json!({ "off": "none", "low": "low", "high": "high" })
+        );
+        assert_eq!(models[1]["input"], serde_json::json!(["text"]));
+        assert!(models[1].get("contextWindow").is_none());
+        assert!(models[1].get("maxTokens").is_none());
+        assert!(models[1].get("reasoningEfforts").is_none());
+        // A switch-only template's on is dsh's `medium`, as for `--variant`.
+        assert_eq!(
+            models[2]["reasoningEfforts"],
+            serde_json::json!({ "off": "none", "medium": "medium" })
+        );
+        // Nothing said: the levels every wire accepts.
+        assert_eq!(
+            models[3]["reasoningEfforts"],
+            serde_json::json!({ "off": "none", "low": "low", "medium": "medium", "high": "high" })
+        );
+        // dsh refuses a map that offers nothing beyond off: a model whose
+        // only level is off is declared as one that cannot think.
+        assert_eq!(models[4]["reasoningEfforts"], serde_json::json!(false));
     }
 
     /// The fallback that makes `llmman launch dsh` work without a global
@@ -318,7 +474,8 @@ mod tests {
         ));
         let settings_path = dir.join("settings.yaml");
         let patch_path = dir.join("llmman.cordis.yml");
-        write_dsh_patch(&patch_path, &settings_path).unwrap();
+        let sections = dsh_sections("m", None, &list(vec![ModelEntry::unlisted("m")]));
+        write_dsh_patch(&patch_path, &settings_path, &sections).unwrap();
         let contents = std::fs::read_to_string(&patch_path).unwrap();
         assert!(contents.contains("id: settings"));
         // Through `yaml_quote`, not the raw path: on Windows a path's
@@ -334,9 +491,42 @@ mod tests {
         // depends on is covered without needing the Windows CI leg to
         // be the thing that catches it (which is how it was caught).
         let win = Path::new(r"C:\Users\hb\.config\llmman\launch\dsh\settings.yaml");
-        let rendered = dsh_patch_document(win);
+        let rendered = dsh_patch_document(win, &sections);
         assert!(rendered.contains(r#"path: "C:\\Users\\hb\\"#), "{rendered}");
         assert!(!rendered.contains(r#"path: "C:\Users"#), "{rendered}");
+    }
+
+    /// dsh 0.2 ignores the settings document, so the patch itself holds the
+    /// default model and the route with every model, in the shape of the
+    /// document's sections (dsh `headless` verified live on 0.2.2-rc.5).
+    #[test]
+    fn the_patch_carries_the_default_model_and_the_route_inline() {
+        let effort = Effort { default: "low" };
+        let entries = vec![ModelEntry::unlisted("qwen3.5:0.8b"), hosted("alpha", "m")];
+        let (_, doc) = settings_of("dsh-inline-doc", entries.clone(), Some(&effort));
+        let sections = dsh_sections("qwen3.5:0.8b", Some(&effort), &list(entries));
+        let patch: serde_json::Value =
+            yaml_serde::from_str(&dsh_patch_document(Path::new("/s.yaml"), &sections))
+                .expect("valid YAML");
+        let entry = |id: &str| {
+            patch
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|e| e["id"] == id)
+                .unwrap_or_else(|| panic!("no entry {id}: {patch}"))["config"]
+                .clone()
+        };
+        assert_eq!(entry("agent-default-model"), doc["agent-default-model"]);
+        assert_eq!(entry("llm-pi-ai"), doc["llm-pi-ai"]);
+        assert_eq!(entry("settings")["path"], "/s.yaml");
+        assert_eq!(
+            entry("llm-pi-ai")["providers"]["llmman"]["models"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
     }
 
     /// Past dsh's own `--` boundary, a token is an app argument rather
@@ -420,7 +610,8 @@ mod tests {
         for command in ["web", "plugin"] {
             let via_command = args(&[command, "--port", "8080"]);
             assert_eq!(dsh_launcher(&via_command).command, Some(command));
-            let err = launch_dsh("m", "k", false, None, &via_command).unwrap_err();
+            let err =
+                launch_dsh("m", "k", false, None, &ModelList::default(), &via_command).unwrap_err();
             assert!(err.to_string().contains("--profile"), "{err}");
         }
         // `--profile web`'s *value* is not the `web` command — refusing
@@ -452,10 +643,10 @@ mod tests {
     #[test]
     fn launch_dsh_refuses_a_conflicting_patch_flag() {
         let word = vec!["--patch".to_string(), "/tmp/x.yml".to_string()];
-        let err = launch_dsh("m", "k", false, None, &word).unwrap_err();
+        let err = launch_dsh("m", "k", false, None, &ModelList::default(), &word).unwrap_err();
         assert!(err.to_string().contains("--patch"), "{err}");
         let joined = vec!["--patch=/tmp/x.yml".to_string()];
-        let err = launch_dsh("m", "k", false, None, &joined).unwrap_err();
+        let err = launch_dsh("m", "k", false, None, &ModelList::default(), &joined).unwrap_err();
         assert!(err.to_string().contains("--patch"), "{err}");
     }
 
@@ -499,25 +690,41 @@ mod tests {
         );
     }
 
+    /// A `--variant` is the default selection's effort, not the route's:
+    /// the route's own default would be refused by every model that lacks it.
     #[test]
-    fn dsh_settings_start_the_route_at_the_variant() {
-        let path = std::env::temp_dir()
-            .join(format!("llmman-dsh-variant-{}", std::process::id()))
-            .join("settings.yaml");
-        let effort = Effort {
-            default: "low",
-            levels: vec!["off", "low", "high"],
+    fn dsh_settings_start_the_default_model_at_the_variant() {
+        let effort = Effort { default: "low" };
+        let thinks = ModelEntry {
+            thinking: Some(vec!["none".into(), "low".into(), "high".into()]),
+            ..hosted("alpha", "thinks")
         };
-        write_dsh_settings(&path, "m", false, Some(&effort)).unwrap();
-        let contents = std::fs::read_to_string(&path).unwrap();
-        let _ = std::fs::remove_dir_all(path.parent().unwrap());
-        let doc: serde_json::Value = yaml_serde::from_str(&contents).expect("valid YAML");
+        let plain = ModelEntry {
+            thinking: Some(Vec::new()),
+            ..hosted("alpha", "plain")
+        };
+        let (_, doc) = settings_of("dsh-variant", vec![thinks, plain], Some(&effort));
+        assert_eq!(doc["agent-default-model"]["reasoningEffort"], "low");
         let route = &doc["llm-pi-ai"]["providers"]["llmman"];
-        assert_eq!(route["reasoning"], "low");
+        assert!(route.get("reasoning").is_none());
         assert_eq!(route["baseURL"], format!("{}/v1", daemon::server()));
         assert_eq!(
             route["models"][0]["reasoningEfforts"],
             serde_json::json!({ "off": "none", "low": "low", "high": "high" })
         );
+        let (_, doc) = settings_of("dsh-novariant", vec![hosted("alpha", "m")], None);
+        assert!(doc["agent-default-model"].get("reasoningEffort").is_none());
+    }
+
+    #[test]
+    fn dsh_settings_name_the_key_variable_and_hold_no_secret() {
+        let (contents, _) = settings_of(
+            "dsh-secret",
+            vec![hosted("alpha", "m"), ModelEntry::unlisted("qwen3.5:0.8b")],
+            None,
+        );
+        assert!(contents.contains(&format!("apiKeyEnv: {DSH_API_KEY_ENV}")));
+        assert!(!contents.contains("apiKey:"), "{contents}");
+        assert!(!contents.contains("sk-"), "{contents}");
     }
 }

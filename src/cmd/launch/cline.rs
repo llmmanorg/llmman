@@ -5,6 +5,7 @@ use std::process::Command;
 
 use anyhow::Context;
 
+use super::models::{ModelEntry, ModelList};
 use super::{accepts_prompt, env_dir, exec_with_env, find_on_path, node_user_profile, server};
 
 const CLINE_NPM_INSTALL_ARGS: &[&str] = &["install", "-g", "cline@latest"];
@@ -68,9 +69,19 @@ pub(super) fn ensure_cline_installed() -> anyhow::Result<()> {
 /// through exactly the arguments supplied after `--`. Cline reads both the
 /// current provider store and legacy global-state fields, so keep them in
 /// sync while preserving unrelated user settings in each file.
-pub(super) fn launch_cline(model: &str, extra_args: &[String]) -> anyhow::Result<()> {
+///
+/// Every model of `models` is registered for that route in Cline's
+/// `models.json`, so its `/model` picker offers them; Cline sends the entry's
+/// `id`, the reference, as the model name. The stored key stays absent: Cline
+/// reaches the daemon without one, and a hosted model is served from the key
+/// the daemon holds.
+pub(super) fn launch_cline(
+    model: &str,
+    models: &ModelList,
+    extra_args: &[String],
+) -> anyhow::Result<()> {
     let bin = find_on_path("cline").ok_or_else(|| anyhow::anyhow!("cline is not installed"))?;
-    write_cline_settings(model)?;
+    write_cline_settings(model, models)?;
     exec_with_env(&bin, extra_args, &[])
 }
 
@@ -103,10 +114,23 @@ pub(super) fn cline_data_dir() -> anyhow::Result<PathBuf> {
     Ok(cline_dir()?.join("data"))
 }
 
-fn write_cline_settings(model: &str) -> anyhow::Result<()> {
+fn write_cline_settings(model: &str, models: &ModelList) -> anyhow::Result<()> {
     let server = server();
     let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-    write_cline_settings_at(&cline_data_dir()?, model, &server, &now)
+    write_cline_at(&cline_data_dir()?, model, &server, &now, models)
+}
+
+/// The route and the list it leads to: the list first, so that a write
+/// that fails leaves no route to a model Cline has not been told of.
+fn write_cline_at(
+    data_dir: &Path,
+    model: &str,
+    server: &str,
+    now: &str,
+    models: &ModelList,
+) -> anyhow::Result<()> {
+    write_cline_models_at(data_dir, models)?;
+    write_cline_settings_at(data_dir, model, server, now)
 }
 
 /// How long Cline's Ollama provider waits for a response to *start*, in
@@ -263,6 +287,64 @@ fn write_cline_settings_at(
     )
 }
 
+/// What starts the key of every model entry llmman registers, so the next
+/// launch replaces them, and only them: models the user added by hand
+/// beside them stay.
+const CLINE_MODEL_KEY_PREFIX: &str = "llmman/";
+
+/// Registers every model of `models` under `providers.ollama.models` of `settings/models.json`.
+/// Cline lists them beside the stored ones it finds at `/api/tags`; an entry of the same `id`
+/// replaces it.
+fn write_cline_models_at(data_dir: &Path, models: &ModelList) -> anyhow::Result<()> {
+    let path = data_dir.join("settings/models.json");
+    let (raw, mut document) = read_cline_json(&path)?;
+    let before = document.clone();
+    let root = document
+        .as_object_mut()
+        .expect("read_cline_json returns an object");
+    root.entry("version")
+        .or_insert_with(|| serde_json::json!(1));
+    let registered = root
+        .entry("providers")
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .context("Cline models.json providers is not a JSON object")?
+        .entry("ollama")
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .context("Cline models.json providers.ollama is not a JSON object")?
+        .entry("models")
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .context("Cline models.json providers.ollama.models is not a JSON object")?;
+    registered.retain(|key, _| !key.starts_with(CLINE_MODEL_KEY_PREFIX));
+    let name = models.display_namer();
+    let keys = models.unique_keys(|entry| format!("{CLINE_MODEL_KEY_PREFIX}{}", entry.label()));
+    for (entry, key) in models.entries().iter().zip(keys) {
+        registered.insert(key, cline_model(entry, &name(entry)));
+    }
+    write_cline_json(&path, raw.as_deref(), &before, &document)
+}
+
+/// One registered model. Cline takes one reasoning effort for the whole provider, so a model's
+/// levels only decide whether it thinks.
+fn cline_model(entry: &ModelEntry, name: &str) -> serde_json::Value {
+    let mut model = serde_json::json!({
+        "id": entry.reference,
+        "name": name,
+        "supportsVision": entry.vision,
+        "supportsReasoning": !entry.variants().is_empty(),
+        "capabilities": if entry.tools == Some(false) { vec![] } else { vec!["tools"] },
+    });
+    if let Some(window) = entry.context_window {
+        model["contextWindow"] = window.into();
+    }
+    if let Some(max_output) = entry.max_output {
+        model["maxTokens"] = max_output.into();
+    }
+    model
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -415,6 +497,195 @@ mod tests {
         let global: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&global_path).unwrap()).unwrap();
         assert_eq!(global["requestTimeoutMs"], 90000);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    fn hosted(provider: &str, id: &str) -> ModelEntry {
+        ModelEntry::unlisted(&crate::providers::format_remote_ref(provider, id))
+    }
+
+    fn registered(root: &Path) -> serde_json::Map<String, serde_json::Value> {
+        let text = std::fs::read_to_string(root.join("settings/models.json")).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
+        parsed["providers"]["ollama"]["models"]
+            .as_object()
+            .unwrap()
+            .clone()
+    }
+
+    /// A failure of the second write must not leave the route (the
+    /// provider settings that start Cline on the model) without the list.
+    #[test]
+    fn a_failed_list_write_leaves_no_route_to_it() {
+        let root = super::super::test_temp_dir("cline-order");
+        // A directory where the list's file goes: writing it fails.
+        std::fs::create_dir_all(root.join("settings/models.json")).unwrap();
+        let list = ModelList::of(vec![ModelEntry::unlisted("docker.io/ai/qwen3.5:0.8b")]);
+        let written = write_cline_at(&root, "m", "http://h", "2026-09-20T06:00:00Z", &list);
+        assert!(written.is_err());
+        assert!(!root.join("settings/providers.json").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cline_registers_every_model_with_what_the_catalog_says() {
+        let root = super::super::test_temp_dir("cline-models");
+        let rich = ModelEntry {
+            context_window: Some(200_000),
+            max_output: Some(8000),
+            thinking: Some(vec!["low".into(), "high".into()]),
+            vision: true,
+            tools: Some(true),
+            ..hosted("alpha", "rich")
+        };
+        let plain = ModelEntry {
+            thinking: Some(Vec::new()),
+            tools: Some(false),
+            ..hosted("alpha", "plain")
+        };
+        let stored = ModelEntry::unlisted("docker.io/ai/qwen3.5:0.8b");
+        let list = ModelList::of(vec![stored.clone(), rich.clone(), plain.clone()]);
+        write_cline_models_at(&root, &list).unwrap();
+
+        let models = registered(&root);
+        assert_eq!(models.len(), 3);
+        let by_id = |id: &str| {
+            models
+                .values()
+                .find(|m| m["id"] == id)
+                .unwrap_or_else(|| panic!("{id} is not registered"))
+        };
+        // The id is what Cline sends as the model name: the reference.
+        let rich = by_id(&rich.reference);
+        assert_eq!(rich["name"], "rich");
+        assert_eq!(rich["contextWindow"], 200_000);
+        assert_eq!(rich["maxTokens"], 8000);
+        assert_eq!(rich["supportsVision"], true);
+        assert_eq!(rich["supportsReasoning"], true);
+        assert_eq!(rich["capabilities"], serde_json::json!(["tools"]));
+        let plain = by_id(&plain.reference);
+        assert_eq!(plain["supportsVision"], false);
+        assert_eq!(plain["supportsReasoning"], false);
+        assert_eq!(plain["capabilities"], serde_json::json!([]));
+        assert!(plain.get("contextWindow").is_none());
+        assert!(plain.get("maxTokens").is_none());
+        assert_eq!(by_id("docker.io/ai/qwen3.5:0.8b")["name"], "qwen3.5:0.8b");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cline_keeps_models_of_the_same_id_from_different_providers_apart() {
+        let root = super::super::test_temp_dir("cline-twins");
+        let list = ModelList::of(vec![
+            hosted("alpha", "gpt"),
+            hosted("beta", "gpt"),
+            ModelEntry::unlisted("gpt"),
+        ]);
+        write_cline_models_at(&root, &list).unwrap();
+        let models = registered(&root);
+        assert_eq!(models.len(), 3);
+        let mut names: Vec<&str> = models
+            .values()
+            .map(|m| m["name"].as_str().unwrap())
+            .collect();
+        names.sort_unstable();
+        assert_eq!(names, ["alpha/gpt", "beta/gpt", "gpt"]);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The route's selection is the starting model, which is also the first
+    /// row of the registered ones.
+    #[test]
+    fn cline_starts_on_the_first_model_of_the_list() {
+        let root = super::super::test_temp_dir("cline-start");
+        let list = ModelList::of(vec![hosted("alpha", "first"), hosted("beta", "second")]);
+        let start = list.start().unwrap().reference.clone();
+        write_cline_settings_at(
+            &root,
+            &start,
+            "http://127.0.0.1:17434",
+            "2026-09-20T06:00:00Z",
+        )
+        .unwrap();
+        write_cline_models_at(&root, &list).unwrap();
+        let providers: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(root.join("settings/providers.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            providers["providers"]["ollama"]["settings"]["model"],
+            start.as_str()
+        );
+        assert!(registered(&root)
+            .values()
+            .any(|m| m["id"] == start.as_str()));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cline_models_merge_keeps_the_users_and_replaces_its_own() {
+        let root = super::super::test_temp_dir("cline-merge");
+        let path = root.join("settings/models.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let original = r#"{
+  "version": 1,
+  "providers": {
+    "mine": { "provider": { "name": "Mine", "baseUrl": "http://mine" }, "models": { "m": { "id": "m" } } },
+    "ollama": { "models": {
+      "llmman/gone/old": { "id": "llmman.provider/gone/old" },
+      "handmade": { "id": "handmade", "name": "kept" }
+    } }
+  }
+}"#;
+        std::fs::write(&path, original).unwrap();
+
+        let list = ModelList::of(vec![hosted("alpha", "m")]);
+        write_cline_models_at(&root, &list).unwrap();
+        let parsed: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(parsed["providers"]["mine"]["models"]["m"]["id"], "m");
+        let models = &parsed["providers"]["ollama"]["models"];
+        assert_eq!(models["handmade"]["name"], "kept");
+        assert!(models.get("llmman/gone/old").is_none());
+        assert_eq!(models["llmman/alpha/m"]["id"], "llmman.provider/alpha/m");
+        assert_eq!(
+            std::fs::read_to_string(root.join("settings/models.json.bak")).unwrap(),
+            original
+        );
+
+        // Unchanged: not rewritten.
+        let written = std::fs::read(&path).unwrap();
+        write_cline_models_at(&root, &list).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), written);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The key is not a thing Cline is given a place for here: neither file
+    /// holds one, whatever the daemon is asked for.
+    #[test]
+    fn cline_files_hold_no_secret() {
+        let root = super::super::test_temp_dir("cline-secret");
+        let list = ModelList::of(vec![
+            hosted("alpha", "m"),
+            ModelEntry::unlisted("qwen3.5:0.8b"),
+        ]);
+        write_cline_settings_at(
+            &root,
+            &list.start().unwrap().reference,
+            "http://127.0.0.1:17434",
+            "2026-09-20T06:00:00Z",
+        )
+        .unwrap();
+        write_cline_models_at(&root, &list).unwrap();
+        for file in [
+            "settings/providers.json",
+            "settings/models.json",
+            "globalState.json",
+        ] {
+            let text = std::fs::read_to_string(root.join(file)).unwrap();
+            assert!(!text.contains("apiKey"), "{file}: {text}");
+            assert!(!text.contains("sk-"), "{file}: {text}");
+        }
         let _ = std::fs::remove_dir_all(root);
     }
 
