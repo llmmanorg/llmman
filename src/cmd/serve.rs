@@ -28,6 +28,7 @@ use tokio::time::{sleep, Duration, Instant};
 
 use crate::default_store;
 use crate::llama_release::LlamaPin;
+use crate::mediagen::server::GENERATION_BODY_LIMIT_BYTES;
 use crate::metrics::{self, UnloadReason};
 use crate::modelpack::{resolve_model, ModelPath};
 use crate::providers::{Wire, PLACEHOLDER_API_KEY};
@@ -2649,7 +2650,7 @@ async fn resolve_target(
                     }
                     (GgufArm::Speech { .. }, _) => {
                         let (child, tail) =
-                            spawn_mediagen_backend(&load_ref, port, state, Workload::CpuOnly)
+                            spawn_mediagen_backend(&load_ref, None, port, state, Workload::CpuOnly)
                                 .await?;
                         stderr_tail = Some(tail);
                         ModelProcess::Local(Engine::Speech, child, None)
@@ -2695,9 +2696,15 @@ async fn resolve_target(
                 oom_retryable = true;
                 ModelProcess::Container(ociman, Engine::LlamaServer, child)
             }
-            (ModelPath::Diffusion(_), None) => {
-                let (child, tail) =
-                    spawn_mediagen_backend(&load_ref, port, state, Workload::General).await?;
+            (ModelPath::Diffusion(paths), None) => {
+                let (child, tail) = spawn_mediagen_backend(
+                    &load_ref,
+                    Some(&paths.model),
+                    port,
+                    state,
+                    Workload::General,
+                )
+                .await?;
                 stderr_tail = Some(tail);
                 oom_retryable = true;
                 ModelProcess::Local(Engine::LlamaServer, child, None)
@@ -4627,6 +4634,34 @@ fn backend_threads() -> i32 {
         .unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get() as i32))
 }
 
+/// Restarts this process with the [`crate::mediagen::backend_env`] `model`
+/// needs when it lacks it (`llmman serve MODEL` run directly; the daemon
+/// sets it on the workers it spawns): ggml reads it from threads already up.
+fn reexec_with_backend_env(model: &std::path::Path) -> anyhow::Result<()> {
+    let missing: Vec<_> = crate::mediagen::backend_env(model)
+        .iter()
+        .filter(|(var, val)| std::env::var(var).as_deref() != Ok(*val))
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        let exe = std::env::current_exe().context("locating the llmman binary")?;
+        let err = std::process::Command::new(&exe)
+            .args(std::env::args_os().skip(1))
+            .envs(missing.iter().map(|&&(var, val)| (var, val)))
+            .exec();
+        Err(err).with_context(|| format!("restarting {} with {missing:?}", exe.display()))
+    }
+    #[cfg(not(unix))]
+    {
+        // backend_env is macOS-only
+        Ok(())
+    }
+}
+
 /// The media backend of a diffusion model, resolved to `paths` by
 /// [`model_backend`].
 async fn mediagen_backend(
@@ -4638,6 +4673,7 @@ async fn mediagen_backend(
     if paths.text_encoder.is_none() && crate::mediagen::needs_text_encoder(&paths.model) {
         anyhow::bail!("{model_ref}: no text encoder in the model pack");
     }
+    reexec_with_backend_env(&paths.model)?;
     let (api, lib_dir) = load_ggml_api(args).await?;
     let params = crate::mediagen::ContextParams {
         model: paths.model.clone(),
@@ -4727,8 +4763,11 @@ fn mediagen_backend_args(model_ref: &str, port: u16) -> [String; 4] {
 /// PORT` (see `run`): the media backend of a diffusion model, the speech
 /// worker of a Canary GGUF. `workload` is whose runtime answer the child
 /// inherits (see `runtime::Workload`).
+/// `model` (a diffusion model's file) adds the environment it needs
+/// ([`crate::mediagen::backend_env`]).
 async fn spawn_mediagen_backend(
     model_ref: &str,
+    model: Option<&std::path::Path>,
     port: u16,
     state: &AppState,
     workload: Workload,
@@ -4760,6 +4799,11 @@ async fn spawn_mediagen_backend(
             cmd.env(var, val);
         }
     }
+    if let Some(model) = model {
+        for (var, val) in crate::mediagen::backend_env(model) {
+            cmd.env(var, val);
+        }
+    }
     crate::debug_log!("spawning {}: {:?}", exe.display(), cmd);
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
@@ -4770,9 +4814,6 @@ async fn spawn_mediagen_backend(
     let tail = tail_child_output(&mut child);
     Ok((child, tail))
 }
-
-/// Allows base64 images and long prompts while keeping request memory bounded.
-const GENERATION_BODY_LIMIT_BYTES: usize = 32 * 1024 * 1024;
 
 /// The daemon's routes and the layers over them, split out of
 /// [`serve_async`] so `the_scrape_endpoint_is_outside_the_cors_layer` can
@@ -4816,8 +4857,15 @@ fn build_router(app_state: AppState, metrics_enabled: bool) -> Router {
             upload_route(handle_openai_transcriptions),
         )
         // OpenAI media generation (crate::mediagen::server)
-        .route("/v1/images/generations", post(handle_openai_images))
-        .route("/v1/videos", post(handle_openai_videos))
+        // reference images / conditioning video arrive as base64 in the body
+        .route(
+            "/v1/images/generations",
+            post(handle_openai_images).layer(DefaultBodyLimit::max(GENERATION_BODY_LIMIT_BYTES)),
+        )
+        .route(
+            "/v1/videos",
+            post(handle_openai_videos).layer(DefaultBodyLimit::max(GENERATION_BODY_LIMIT_BYTES)),
+        )
         .route("/v1/videos/:id", get(handle_openai_video_get))
         .route("/v1/videos/:id/content", get(handle_openai_video_get))
         .route("/v1/audio/speech", post(handle_openai_speech))

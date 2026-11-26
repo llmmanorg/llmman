@@ -14,6 +14,7 @@ already exists for the model format it finds, and runs it unmodified.
 | safetensors | [`sglang`](https://github.com/sgl-project/sglang) | Your `PATH`, with `LLMMAN_SAFETENSORS_ENGINE=sglang` |
 | safetensors | [`mlx_lm.server`](https://github.com/ml-explore/mlx-lm) | macOS: llmman's own `uv`-installed copy, installed when the daemon starts, or the one on your `PATH` — per `--runtime`, as for `llama-server`; preferred over `vllm` |
 | GGUF diffusion (LTX-2) | llmman itself, on ggml | The `libggml`/`libllama` next to `llama-server`; see [the blog post](https://llmmanorg.github.io/blog/image-audio-and-video-generation/) |
+| GGUF diffusion (FLUX.2 [klein]) | llmman itself, on ggml | The same libraries; see [below](#flux2-klein) |
 | Diffusers safetensors (Qwen-Image 2.1) | llmman itself, on ggml | The same libraries; see [below](#qwen-image-21) |
 | Diffusers safetensors | [`vllm serve --omni`](https://github.com/vllm-project/vllm-omni) | Your `PATH`'s `vllm` with the `vllm-omni` package installed |
 | Diffusers safetensors | `vllm serve --omni` in a container | `--runtime docker` / `podman` (Linux only): the `vllm/vllm-omni` image (CUDA only) |
@@ -376,6 +377,21 @@ llmman run qwen-image-2.1 "A manatee in a sunlit lagoon"
 
 Text to image only: 1024x1024, 40 steps, RGBA PNG. The text encoder and the
 transformer load on first use and take turns when both do not fit.
+
+### FLUX.2 [klein]
+
+FLUX.2 [klein] 4B and 9B GGUFs (`hf.co/unsloth/FLUX.2-klein-9B-GGUF:Q8_0`)
+run in llmman on the same ggml libraries. The pull adds the FLUX.2 VAE and
+the Qwen3 text encoder (Qwen3-4B for 4B, Qwen3-8B for 9B):
+
+```sh
+llmman run hf.co/unsloth/FLUX.2-klein-9B-GGUF:Q8_0 "A manatee in a sunlit lagoon"
+```
+
+Text to image and editing: pass up to 8 reference images (PNG or JPEG, base64
+or data URLs) as `images` on `/v1/images/generations`. The distilled models
+default to 4 steps without CFG, the base models to 50 steps at CFG 4. Up to
+2048x2048; reference images are scaled to at most 1024x1024.
 
 ### `vllm serve` from llmman's store
 

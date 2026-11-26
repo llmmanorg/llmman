@@ -142,6 +142,32 @@ impl TextEncoder {
         }
     }
 
+    /// The model's vocabulary only (no weights, no context): for tokenizing.
+    pub fn load_vocab(api: &'static Api, path: &str) -> Result<Box<TextEncoder>> {
+        unsafe {
+            let mut mp = (api.llama_model_default_params)();
+            {
+                let p = mp.view_mut::<LlamaModelParams>();
+                ffi::check_model_params(p)?;
+                p.vocab_only = true;
+            }
+            let cpath = CString::new(path)?;
+            let model = (api.llama_model_load_from_file)(cpath.as_ptr(), mp);
+            if model.is_null() {
+                bail!("failed to load the vocabulary of {path}");
+            }
+            Ok(Box::new(TextEncoder {
+                api,
+                model,
+                ctx: ptr::null_mut(),
+                n_ctx: 0,
+                n_threads: 1,
+                flash: false,
+                capture: ptr::null_mut(),
+            }))
+        }
+    }
+
     /// Creates the llama context if there is none.
     fn ensure_context(&mut self) -> Result<()> {
         if !self.ctx.is_null() {
@@ -193,7 +219,7 @@ impl TextEncoder {
         unsafe { (self.api.llama_model_get_vocab)(self.model) }
     }
 
-    fn tokenize(&self, text: &str, add_special: bool, parse_special: bool) -> Result<Vec<i32>> {
+    pub fn tokenize(&self, text: &str, add_special: bool, parse_special: bool) -> Result<Vec<i32>> {
         let ctext = CString::new(text)?;
         let mut tokens = vec![0i32; text.len() + 16];
         let mut n = unsafe {

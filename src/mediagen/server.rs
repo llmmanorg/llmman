@@ -16,13 +16,20 @@ use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
 use super::http::{self, now, Discovery};
-use super::{encode, ActionMode, ActionParams, Context, GenParams};
+use super::{encode, ActionMode, ActionParams, Context, GenParams, ImageCheck};
 
 const MAX_DIM: i64 = 4096;
 const MAX_FRAMES: i64 = 1025;
 const MAX_STEPS: i64 = 200;
 /// Output pixels per request (width x height x frames): 3 GiB of RGB.
 const MAX_PIXELS: i64 = 1 << 30;
+const MAX_REFERENCE_IMAGES: usize = 8;
+/// Decoded pixels of all the reference images of a request together
+/// (checked from their headers before decoding): 192 MiB of RGB.
+const MAX_REFERENCE_PIXELS: u64 = 64 << 20;
+/// Allows base64 images and long prompts while keeping request memory bounded;
+/// the daemon's generation routes use it too.
+pub const GENERATION_BODY_LIMIT_BYTES: usize = 32 * 1024 * 1024;
 
 struct Video {
     id: String,
@@ -36,16 +43,21 @@ pub struct Server {
     videos: Mutex<VecDeque<Video>>,
     counter: AtomicU32,
     supports_image: bool,
+    supports_refs: bool,
     supports_video: bool,
     supports_audio: bool,
     /// Frame counts are `stride * k + 1`.
     temporal_stride: i64,
-    /// `"ltx"`, `"cosmos3"` or `"qwen-image"`.
+    /// `"ltx"`, `"cosmos3"`, `"qwen-image"`, `"z-image"` or `"flux2"`.
     family: &'static str,
     /// The model's own defaults when a request leaves them out.
     default_steps: i32,
     default_cfg: f32,
     default_size: (i64, i64),
+    /// The largest image the model generates, in pixels.
+    max_image_pixels: i64,
+    /// The model's own request checks ([`Context::image_check`]).
+    image_check: ImageCheck,
 }
 
 type Shared = Arc<Server>;
@@ -134,6 +146,68 @@ fn common_params(body: &Value, default_size: (i64, i64)) -> Result<GenParams, Er
     p.enhance_prompt = get_bool(body, "enhance_prompt", true);
     p.negative_prompt = get_str(body, "negative_prompt");
     Ok(p)
+}
+
+/// The reference images of `/v1/images/generations`, still encoded:
+/// `image` (one) or `images` (a list), each PNG or JPEG as base64 or a data URL.
+fn reference_items(body: &Value) -> Result<Vec<Value>, Error> {
+    let items: Vec<Value> = match (body.get("image"), body.get("images")) {
+        (Some(_), Some(_)) => {
+            return Err(Error::Invalid(
+                "pass \"image\" or \"images\", not both".into(),
+            ))
+        }
+        (Some(v), None) => vec![v.clone()],
+        (None, Some(Value::Array(a))) => a.clone(),
+        (None, Some(_)) => return Err(Error::Invalid("\"images\" must be a list".into())),
+        (None, None) => Vec::new(),
+    };
+    if items.len() > MAX_REFERENCE_IMAGES {
+        return Err(Error::Invalid(format!(
+            "at most {MAX_REFERENCE_IMAGES} reference images"
+        )));
+    }
+    Ok(items)
+}
+
+/// [`reference_items`] decoded, after their headers pass the size limits:
+/// [`MAX_DIM`] a side (resizing allocates a row of the source width) and
+/// [`MAX_REFERENCE_PIXELS`] together. CPU-bound: run it off the async runtime.
+fn decode_references(items: Vec<Value>) -> Result<Vec<super::Frames>, Error> {
+    let encoded = items
+        .into_iter()
+        .map(|v| Ok(get_b64(&json!({ "image": v }), "image")?.unwrap_or_default()))
+        .collect::<Result<Vec<_>, Error>>()?;
+    let mut pixels = 0u64;
+    for bytes in &encoded {
+        let (w, h) = encode::image_dimensions(bytes).map_err(|e| Error::Invalid(e.to_string()))?;
+        if w as i64 > MAX_DIM || h as i64 > MAX_DIM {
+            return Err(Error::Invalid(format!(
+                "a reference image is {w}x{h}, at most {MAX_DIM} a side"
+            )));
+        }
+        pixels += w as u64 * h as u64;
+    }
+    if pixels > MAX_REFERENCE_PIXELS {
+        return Err(Error::Invalid(format!(
+            "the reference images hold {pixels} pixels, at most {MAX_REFERENCE_PIXELS} together"
+        )));
+    }
+    encoded
+        .iter()
+        .map(|bytes| encode::decode_image(bytes).map_err(|e| Error::Invalid(e.to_string())))
+        .collect()
+}
+
+/// `(w, h)` scaled down to at most `max_pixels` and [`MAX_DIM`] a side,
+/// sides rounded down to multiples of 32 (the request alignment, so
+/// [`common_params`] keeps them), aspect kept.
+fn fit_size(w: i64, h: i64, max_pixels: i64) -> (i64, i64) {
+    let scale = ((max_pixels as f64 / (w * h) as f64).sqrt())
+        .min(MAX_DIM as f64 / w.max(h) as f64)
+        .min(1.0);
+    let fit = |v: i64| ((v as f64 * scale) as i64 / 32 * 32).max(32);
+    (fit(w), fit(h))
 }
 
 /// A base64 field, with or without a `data:...;base64,` prefix.
@@ -304,7 +378,8 @@ async fn generate(
     .map_err(|e| Error::Failed(e.to_string()))
 }
 
-/// POST /v1/images/generations: OpenAI fields plus negative_prompt, seed, steps, cfg_scale, width, height.
+/// POST /v1/images/generations: OpenAI fields plus negative_prompt, seed, steps, cfg_scale, width,
+/// height, and `image`/`images` (reference images, for models that edit).
 async fn images(State(s): State<Shared>, body: axum::body::Bytes) -> Result<Response, Error> {
     if !s.supports_image {
         return Err(Error::Invalid(
@@ -328,10 +403,35 @@ async fn images(State(s): State<Shared>, body: axum::body::Bytes) -> Result<Resp
             "only response_format=b64_json is supported".into(),
         ));
     }
-    let mut p = common_params(&body, s.default_size)?;
+    let items = reference_items(&body)?;
+    if !items.is_empty() && !s.supports_refs {
+        return Err(Error::Invalid(
+            "the loaded model does not take reference images".into(),
+        ));
+    }
+    let refs = tokio::task::spawn_blocking(move || decode_references(items))
+        .await
+        .map_err(|e| Error::Failed(e.to_string()))??;
+    // without a size, an edit keeps its first reference's, within the model's limits
+    let size = get_str(&body, "size");
+    let default_size = refs
+        .first()
+        .filter(|_| size.is_empty() || size == "auto")
+        .map_or(s.default_size, |r| {
+            fit_size(r.width, r.height, s.max_image_pixels)
+        });
+    let mut p = common_params(&body, default_size)?;
+    if p.width * p.height > s.max_image_pixels {
+        return Err(Error::Invalid(format!(
+            "{}x{} is over the model's {} pixels",
+            p.width, p.height, s.max_image_pixels
+        )));
+    }
     p.prompt = prompt;
     p.n_frames = 1;
+    p.ref_images = refs;
     check_pixels(&p)?;
+    (s.image_check)(&p).map_err(|e| Error::Invalid(e.to_string()))?;
     let stream = get_bool(&body, "stream", false);
     let cancelled = Arc::new(AtomicBool::new(false));
 
@@ -581,6 +681,7 @@ async fn speech(State(s): State<Shared>, body: axum::body::Bytes) -> Result<Resp
 pub fn router(ctx: Context, model_name: String, model_path: String) -> Router {
     let s = Arc::new(Server {
         supports_image: ctx.supports_image(),
+        supports_refs: ctx.supports_reference_images(),
         supports_video: ctx.supports_video(),
         supports_audio: ctx.supports_audio(),
         temporal_stride: ctx.temporal_stride(),
@@ -588,6 +689,8 @@ pub fn router(ctx: Context, model_name: String, model_path: String) -> Router {
         default_steps: ctx.default_steps(),
         default_cfg: ctx.default_cfg(),
         default_size: ctx.default_size(),
+        max_image_pixels: ctx.max_image_pixels().unwrap_or(MAX_PIXELS),
+        image_check: ctx.image_check(),
         ctx: Mutex::new(ctx),
         model_name,
         videos: Mutex::new(VecDeque::new()),
@@ -597,10 +700,48 @@ pub fn router(ctx: Context, model_name: String, model_path: String) -> Router {
     Router::new()
         .route("/v1/images/generations", post(images))
         .route("/v1/videos", post(videos))
+        // reference images and conditioning video ride in the JSON body, as base64
+        .layer(axum::extract::DefaultBodyLimit::max(
+            GENERATION_BODY_LIMIT_BYTES,
+        ))
         .route("/v1/videos/:id", get(video_get))
         .route("/v1/videos/:id/content", get(video_content))
         .route("/v1/audio/speech", post(speech))
         .with_state(s)
         .merge(http::discovery_routes(discovery))
         .merge(http::text_routes_refused(NOT_SUPPORTED))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn png_b64(w: u32, h: u32) -> Value {
+        let mut png = Vec::new();
+        image::RgbImage::new(w, h)
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        Value::String(b64(&png))
+    }
+
+    #[test]
+    fn references_over_max_dim_a_side_are_refused_before_decoding() {
+        let ok = decode_references(vec![png_b64(64, 32)]).ok().unwrap();
+        assert_eq!((ok[0].width, ok[0].height), (64, 32));
+        let wide = decode_references(vec![png_b64(MAX_DIM as u32 + 1, 1)]);
+        assert!(matches!(wide, Err(Error::Invalid(m)) if m.contains("a side")));
+    }
+
+    #[test]
+    fn fit_size_bounds_a_large_reference() {
+        let (w, h) = fit_size(4000, 3000, 2048 * 2048);
+        assert!(w * h <= 2048 * 2048 && w % 32 == 0 && h % 32 == 0);
+        assert!((w as f64 / h as f64 - 4.0 / 3.0).abs() < 0.02);
+        // just over the limit: rounding to 32 does not push it back over
+        let (w, h) = fit_size(2064, 2032, 2048 * 2048);
+        assert!(w * h <= 2048 * 2048 && w % 32 == 0 && h % 32 == 0);
+        assert_eq!(fit_size(640, 480, 2048 * 2048), (640, 480));
+        // a side longer than MAX_DIM
+        assert_eq!(fit_size(9000, 100, MAX_PIXELS).0, MAX_DIM);
+    }
 }

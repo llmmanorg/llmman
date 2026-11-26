@@ -414,10 +414,12 @@ fn is_weights_file(lower: &str) -> bool {
 /// True when the repo ships a diffusion model: a transformer GGUF next to
 /// VAE / text projection sidecars (e.g. `unsloth/LTX-2.3-GGUF`).
 pub fn is_diffusion_repo(files: &[HfFile]) -> bool {
-    // Z-Image GGUFs ship without sidecars; their family is in the file name
-    let zimage = files
-        .iter()
-        .any(|f| f.kind == "file" && is_model_gguf(&f.path) && is_zimage_file(&f.path));
+    // Z-Image and FLUX.2 [klein] GGUFs ship without sidecars; their family is in the file name
+    let zimage = files.iter().any(|f| {
+        f.kind == "file"
+            && is_model_gguf(&f.path)
+            && (is_zimage_file(&f.path) || is_flux2_klein_file(&f.path))
+    });
     zimage
         || files.iter().any(|f| {
             let name = basename_lower(&f.path);
@@ -433,6 +435,14 @@ pub fn is_diffusion_repo(files: &[HfFile]) -> bool {
 fn is_zimage_file(path: &str) -> bool {
     let name = basename_lower(path);
     name.contains("z-image") || name.contains("z_image")
+}
+
+/// A FLUX.2 [klein] transformer file (4B or 9B, distilled or base).
+fn is_flux2_klein_file(path: &str) -> bool {
+    let name = basename_lower(path);
+    ["flux-2-klein", "flux.2-klein", "flux2-klein", "flux2_klein"]
+        .iter()
+        .any(|k| name.contains(k))
 }
 
 fn basename_lower(path: &str) -> String {
@@ -567,11 +577,24 @@ pub struct DiffusionPlan {
     pub external: Vec<(&'static str, &'static str, &'static str)>,
 }
 
+/// The FLUX.2 VAE of the Apache-2.0 [klein] 4B repository (not gated; the 9B shares it).
+const FLUX2_VAE: (&str, &str) = (
+    "black-forest-labs/FLUX.2-klein-4B",
+    "vae/diffusion_pytorch_model.safetensors",
+);
+
 /// The official Z-Image-Turbo repository's FLUX.1 VAE (Diffusers layout, not gated).
 const ZIMAGE_VAE: (&str, &str) = (
     "Tongyi-MAI/Z-Image-Turbo",
     "vae/diffusion_pytorch_model.safetensors",
 );
+
+/// An image family's official VAE (`(owner/repo, path)`) and a test for its
+/// own VAE files.
+struct FamilyVae {
+    official: (&'static str, &'static str),
+    same_family: fn(&str) -> bool,
+}
 
 /// See llama.cpp's `common_download_get_hf_plan` for the same resolution.
 pub fn diffusion_plan(files: &[HfFile], model_path: &str) -> DiffusionPlan {
@@ -591,11 +614,48 @@ pub fn diffusion_plan(files: &[HfFile], model_path: &str) -> DiffusionPlan {
         text_encoder: diffusion_default_text_encoder(model_path),
         external: Vec::new(),
     };
-    if is_zimage_file(model_path) {
-        // images only; the VAE comes from the official repository unless the repo has one
-        match candidates.into_iter().find(|(role, _)| *role == "vae") {
-            Some((_, Some(file))) => plan.sidecars.push(("vae", file)),
-            _ => plan.external.push(("vae", ZIMAGE_VAE.0, ZIMAGE_VAE.1)),
+    // the official VAE of an image family, and whether a file is that family's
+    let family_vae = if is_zimage_file(model_path) {
+        Some(FamilyVae {
+            official: ZIMAGE_VAE,
+            same_family: is_zimage_file,
+        })
+    } else if is_flux2_klein_file(model_path) {
+        Some(FamilyVae {
+            official: FLUX2_VAE,
+            same_family: |p| {
+                let name = basename_lower(p);
+                ["flux2", "flux.2", "flux-2"]
+                    .iter()
+                    .any(|k| name.contains(k))
+            },
+        })
+    } else {
+        None
+    };
+    if let Some(FamilyVae {
+        official: (repo, path),
+        same_family,
+    }) = family_vae
+    {
+        // images only; the VAE comes from the official repository unless the repo
+        // has it, or a VAE of the same family (not another family's video VAE)
+        let local = files
+            .iter()
+            .find(|f| f.kind == "file" && f.path == path)
+            .cloned()
+            .or_else(|| {
+                // only this family's files compete for the VAE
+                let own: Vec<HfFile> = files
+                    .iter()
+                    .filter(|f| same_family(&f.path))
+                    .cloned()
+                    .collect();
+                select_diffusion_sidecar(&own, model_path, "vae")
+            });
+        match local {
+            Some(file) => plan.sidecars.push(("vae", file)),
+            None => plan.external.push(("vae", repo, path)),
         }
         plan.outputs.push("image");
         return plan;
@@ -677,6 +737,14 @@ pub fn diffusion_default_text_encoder(model_path: &str) -> Option<&'static str> 
     if is_zimage_file(model_path) {
         // Z-Image's text encoder is Qwen3-4B (its second-to-last hidden state)
         return Some("unsloth/Qwen3-4B-GGUF:Q8_0");
+    }
+    if is_flux2_klein_file(model_path) {
+        // [klein] 4B reads Qwen3-4B, 9B Qwen3-8B
+        return Some(if name.contains("9b") {
+            "unsloth/Qwen3-8B-GGUF:Q8_0"
+        } else {
+            "unsloth/Qwen3-4B-GGUF:Q8_0"
+        });
     }
     if name.contains("ltx-2.5") || name.contains("ltx-2-5") {
         return None;
@@ -1067,6 +1135,47 @@ mod tests {
         let plan = diffusion_plan(&with_vae, "z-image-turbo-Q8_0.gguf");
         assert_eq!(plan.sidecars.len(), 1);
         assert!(plan.external.is_empty());
+    }
+
+    #[test]
+    fn flux2_klein_repo_gets_its_text_encoder_and_vae() {
+        let files = vec![
+            file("flux-2-klein-9b-Q4_K_M.gguf", 2),
+            file("flux-2-klein-9b-Q8_0.gguf", 3),
+        ];
+        assert!(is_diffusion_repo(&files));
+        let plan = diffusion_plan(&files, "flux-2-klein-9b-Q8_0.gguf");
+        // another family's VAE in the listing is not FLUX.2's
+        let mut with_video_vae = files.clone();
+        with_video_vae.push(file("ltx-2.3-video_vae.safetensors", 1));
+        assert_eq!(
+            diffusion_plan(&with_video_vae, "flux-2-klein-9b-Q8_0.gguf").external,
+            plan.external
+        );
+        // ... even next to FLUX.2's own
+        with_video_vae.push(file("flux2_vae.safetensors", 1));
+        let both = diffusion_plan(&with_video_vae, "flux-2-klein-9b-Q8_0.gguf");
+        assert!(both.external.is_empty());
+        assert_eq!(both.sidecars[0].1.path, "flux2_vae.safetensors");
+        // the official file in the repo itself is used as is
+        let mut with_vae = files.clone();
+        with_vae.push(file("vae/diffusion_pytorch_model.safetensors", 1));
+        let local = diffusion_plan(&with_vae, "flux-2-klein-9b-Q8_0.gguf");
+        assert!(local.external.is_empty() && local.sidecars.len() == 1);
+        assert_eq!(plan.outputs, ["image"]);
+        assert_eq!(plan.text_encoder, Some("unsloth/Qwen3-8B-GGUF:Q8_0"));
+        assert_eq!(
+            plan.external,
+            [(
+                "vae",
+                "black-forest-labs/FLUX.2-klein-4B",
+                "vae/diffusion_pytorch_model.safetensors"
+            )]
+        );
+        assert_eq!(
+            diffusion_default_text_encoder("flux-2-klein-4b-Q4_K_M.gguf"),
+            Some("unsloth/Qwen3-4B-GGUF:Q8_0")
+        );
     }
 
     #[test]
