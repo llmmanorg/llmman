@@ -182,6 +182,40 @@ fn pack(z: &[f32], c: usize, h: usize, w: usize) -> Vec<f32> {
     out
 }
 
+/// The output size of `p` (sides rounded down to multiples of 16), refused when
+/// it is too large or the caption, the output and the references, which attend
+/// together, make more tokens than attention takes.
+pub fn check_size(p: &GenParams, flash: bool) -> Result<(i64, i64)> {
+    let (w, h) = (p.width / SCALE * SCALE, p.height / SCALE * SCALE);
+    if w <= 0 || h <= 0 {
+        bail!("width and height must be at least {SCALE}");
+    }
+    if w > MAX_PIXELS / h {
+        bail!("FLUX.2 generates at most 2048x2048 pixels, got {w}x{h}");
+    }
+    let tokens = PROMPT_TOKENS as i64
+        + (w / SCALE) * (h / SCALE)
+        + p.ref_images
+            .iter()
+            .map(|f| {
+                let (rw, rh) = ref_size(f.width, f.height);
+                (rw / SCALE) * (rh / SCALE)
+            })
+            .sum::<i64>();
+    let (max_tokens, why) = if flash {
+        (MAX_TOKENS_FLASH, "")
+    } else {
+        (MAX_TOKENS_DENSE, " without flash attention")
+    };
+    if tokens > max_tokens {
+        bail!(
+            "the prompt, output and reference images make {tokens} tokens, at most {max_tokens}{why}; \
+             use a smaller size or fewer references"
+        );
+    }
+    Ok((w, h))
+}
+
 /// A reference image's size for encoding: within [`MAX_REF_PIXELS`],
 /// sides rounded down to multiples of 16, aspect kept.
 fn ref_size(w: i64, h: i64) -> (i64, i64) {
@@ -252,7 +286,7 @@ impl Model {
                 hp.in_channels
             );
         }
-        let te = Qwen3Text::load(api, be, text_path)?;
+        let te = Qwen3Text::load(api, be, text_path, TEXT_STATES.iter().copied().max())?;
         if te.hp.hidden * TEXT_STATES.len() as i64 != hp.ctx_dim {
             bail!(
                 "the text encoder's hidden size is {}, the transformer expects {} / {}",
@@ -284,6 +318,10 @@ impl Model {
             cond: None,
             ncond: None,
         })
+    }
+
+    pub fn flash(&self) -> bool {
+        self.flash
     }
 
     pub fn default_steps(&self) -> i32 {
@@ -636,13 +674,7 @@ impl Model {
         if p.image.is_some() || p.video.is_some() || p.action.is_some() {
             bail!("FLUX.2 takes reference images (\"images\"), not video conditioning");
         }
-        let (w, h) = (p.width / SCALE * SCALE, p.height / SCALE * SCALE);
-        if w <= 0 || h <= 0 {
-            bail!("width and height must be at least {SCALE}");
-        }
-        if w > MAX_PIXELS / h {
-            bail!("FLUX.2 generates at most 2048x2048 pixels, got {w}x{h}");
-        }
+        let (w, h) = check_size(p, self.flash)?;
         let steps = if p.n_steps > 0 {
             p.n_steps
         } else {
@@ -657,32 +689,6 @@ impl Model {
         let mut prompts = vec![p.prompt.as_str()];
         if use_cfg {
             prompts.push(p.negative_prompt.as_str());
-        }
-        // the caption, the output and every reference attend together
-        let tokens = PROMPT_TOKENS as i64
-            + (w / SCALE) * (h / SCALE)
-            + p.ref_images
-                .iter()
-                .map(|f| {
-                    let (rw, rh) = ref_size(f.width, f.height);
-                    (rw / SCALE) * (rh / SCALE)
-                })
-                .sum::<i64>();
-        let max_tokens = if self.flash {
-            MAX_TOKENS_FLASH
-        } else {
-            MAX_TOKENS_DENSE
-        };
-        if tokens > max_tokens {
-            bail!(
-                "the prompt, output and reference images make {tokens} tokens, at most {max_tokens}{}; \
-                 use a smaller size or fewer references",
-                if self.flash {
-                    ""
-                } else {
-                    " without flash attention"
-                }
-            );
         }
         self.prepare(be, &prompts)?;
         let refs = p
@@ -787,6 +793,25 @@ fn swiglu<'g>(g: &'g Graph<'g>, x: Tensor<'g>) -> Tensor<'g> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn check_size_counts_references_against_the_attention_budget() {
+        let mut p = GenParams {
+            width: 1024,
+            height: 1024,
+            ..Default::default()
+        };
+        assert_eq!(check_size(&p, false).unwrap(), (1024, 1024));
+        // 512 + 4096 + 4096 tokens: over the dense budget, within flash's
+        p.ref_images.push(crate::mediagen::Frames {
+            width: 1024,
+            height: 1024,
+            n_frames: 1,
+            ..Default::default()
+        });
+        assert!(check_size(&p, false).is_err());
+        assert!(check_size(&p, true).is_ok());
+    }
 
     #[test]
     fn sigmas_follow_the_empirical_shift() {

@@ -49,6 +49,9 @@ pub struct ContextParams {
     pub flash_attn: bool,
 }
 
+/// A request check from [`Context::image_check`].
+pub type ImageCheck = Box<dyn Fn(&GenParams) -> Result<()> + Send + Sync>;
+
 #[derive(Clone, Debug)]
 pub struct GenParams {
     pub prompt: String,
@@ -459,6 +462,18 @@ impl Context {
             Inner::Ltx(_) | Inner::QwenImage(_) | Inner::ZImage(_) => 1.0,
             Inner::Flux2(m) => m.default_cfg(),
             Inner::Cosmos3(_) => cosmos3::DEFAULT_CFG,
+        }
+    }
+
+    /// Checks an image request before it waits for the model, so one the model
+    /// would refuse is answered as invalid: what the server calls with each one.
+    pub fn image_check(&self) -> ImageCheck {
+        match &self.inner {
+            Inner::Flux2(m) => {
+                let flash = m.flash();
+                Box::new(move |p| flux2::check_size(p, flash).map(drop))
+            }
+            _ => Box::new(|_| Ok(())),
         }
     }
 

@@ -49,7 +49,13 @@ pub fn tensor_name(n: &str) -> Option<String> {
 }
 
 impl Qwen3Text {
-    pub fn load(api: &'static Api, be: &Backend, path: &Path) -> Result<Qwen3Text> {
+    /// `layers`: load only the first ones, for callers that never read past them.
+    pub fn load(
+        api: &'static Api,
+        be: &Backend,
+        path: &Path,
+        layers: Option<usize>,
+    ) -> Result<Qwen3Text> {
         let idx = read_index(path)?;
         let arch = idx.metadata.get("general.architecture").map(String::as_str);
         if arch != Some("qwen3") {
@@ -59,9 +65,10 @@ impl Qwen3Text {
         let hidden = ne("token_embd.weight", 0)?;
         let head_dim = ne("blk.0.attn_q_norm.weight", 0)?;
         let n_layers = idx.count("blk.");
+        let keep = layers.map_or(n_layers, |l| (l as i64).min(n_layers));
         let hp = cosmos3::Hparams::from_config(&json!({
             "hidden_size": hidden,
-            "num_hidden_layers": n_layers,
+            "num_hidden_layers": keep,
             "num_attention_heads": ne("blk.0.attn_q.weight", 1)? / head_dim,
             "num_key_value_heads": ne("blk.0.attn_k.weight", 1)? / head_dim,
             "head_dim": head_dim,
@@ -76,7 +83,13 @@ impl Qwen3Text {
             path,
             be.weight_buft(),
             &LoadOpts {
-                rename: Some(Box::new(tensor_name)),
+                rename: Some(Box::new(move |n| {
+                    let layer = n.strip_prefix("blk.").and_then(|r| r.split('.').next());
+                    match layer.map(str::parse::<i64>) {
+                        Some(Ok(l)) if l >= keep => None,
+                        _ => tensor_name(n),
+                    }
+                })),
                 transform: None,
             },
         )?;

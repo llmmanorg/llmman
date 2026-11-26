@@ -16,7 +16,7 @@ use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
 use super::http::{self, now, Discovery};
-use super::{encode, ActionMode, ActionParams, Context, GenParams};
+use super::{encode, ActionMode, ActionParams, Context, GenParams, ImageCheck};
 
 const MAX_DIM: i64 = 4096;
 const MAX_FRAMES: i64 = 1025;
@@ -56,6 +56,8 @@ pub struct Server {
     default_size: (i64, i64),
     /// The largest image the model generates, in pixels.
     max_image_pixels: i64,
+    /// The model's own request checks ([`Context::image_check`]).
+    image_check: ImageCheck,
 }
 
 type Shared = Arc<Server>;
@@ -429,6 +431,7 @@ async fn images(State(s): State<Shared>, body: axum::body::Bytes) -> Result<Resp
     p.n_frames = 1;
     p.ref_images = refs;
     check_pixels(&p)?;
+    (s.image_check)(&p).map_err(|e| Error::Invalid(e.to_string()))?;
     let stream = get_bool(&body, "stream", false);
     let cancelled = Arc::new(AtomicBool::new(false));
 
@@ -687,6 +690,7 @@ pub fn router(ctx: Context, model_name: String, model_path: String) -> Router {
         default_cfg: ctx.default_cfg(),
         default_size: ctx.default_size(),
         max_image_pixels: ctx.max_image_pixels().unwrap_or(MAX_PIXELS),
+        image_check: ctx.image_check(),
         ctx: Mutex::new(ctx),
         model_name,
         videos: Mutex::new(VecDeque::new()),
