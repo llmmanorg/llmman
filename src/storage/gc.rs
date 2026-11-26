@@ -154,11 +154,12 @@ pub fn referenced_digests(store: &OciStore) -> anyhow::Result<HashSet<String>> {
     Ok(all_digests(&held_by_manifests(store)?))
 }
 
-/// A manifest as [`held_by_manifests`] saw it: when its blob was last
-/// written, and its config and layer digests.
+/// A manifest as [`held_by_manifests`] saw it: its blob's mtime, when the
+/// newest tag pointer holding it was written, and its config and layer digests.
 #[derive(Debug)]
 pub struct Held {
     modified: Option<SystemTime>,
+    tagged_at: Option<SystemTime>,
     digests: Vec<String>,
 }
 
@@ -180,8 +181,17 @@ pub fn held_by_manifests(store: &OciStore) -> anyhow::Result<HashMap<String, Hel
         let digests = std::iter::once(manifest.config.digest)
             .chain(manifest.layers.into_iter().map(|l| l.digest))
             .collect();
+        let tagged_at = store.ref_mtime(&desc);
         let modified = blob_mtime(store, &desc.digest);
-        held.insert(desc.digest, Held { modified, digests });
+        held.entry(desc.digest)
+            .and_modify(|h: &mut Held| {
+                h.tagged_at = h.tagged_at.zip(tagged_at).map(|(a, b)| a.max(b));
+            })
+            .or_insert(Held {
+                modified,
+                tagged_at,
+                digests,
+            });
     }
     Ok(held)
 }
@@ -528,10 +538,10 @@ pub fn sweep(store: &OciStore, cache_path: &Path) -> anyhow::Result<(GcStats, Gc
 
 /// Deletes, at any age, what only the tags removed since `before` (a
 /// [`held_by_manifests`] taken ahead of the untag) held, plus cache
-/// directories named by those digests. Skips a removed manifest whose blob
-/// changed since `before` (republished), and layers touched after it was
-/// written (reused by a writer). Deletes nothing if the surviving set can't
-/// be computed.
+/// directories named by those digests. Every writer publishes the tag last,
+/// so a blob newer than the tag was reused by another writer and is kept; a
+/// manifest so touched or republished since `before` keeps all its blobs.
+/// Deletes nothing if the surviving set can't be computed.
 pub fn reclaim_removed(
     store: &OciStore,
     cache_path: &Path,
@@ -540,18 +550,18 @@ pub fn reclaim_removed(
     let live = all_digests(&held_by_manifests(store)?);
     let mut candidates = HashSet::new();
     for (manifest, held) in before.iter().filter(|(m, _)| !live.contains(*m)) {
-        let Some(written) = held
-            .modified
-            .filter(|&at| blob_mtime(store, manifest) == Some(at))
-        else {
+        let (Some(modified), Some(tagged_at)) = (held.modified, held.tagged_at) else {
             continue;
         };
+        if modified > tagged_at || blob_mtime(store, manifest) != Some(modified) {
+            continue;
+        }
         candidates.insert(manifest.clone());
         candidates.extend(
             held.digests
                 .iter()
                 .filter(|d| {
-                    !live.contains(*d) && blob_mtime(store, d).is_none_or(|at| at <= written)
+                    !live.contains(*d) && blob_mtime(store, d).is_some_and(|at| at <= tagged_at)
                 })
                 .cloned(),
         );
@@ -1175,26 +1185,96 @@ mod tests {
         std::fs::remove_dir_all(&root).unwrap();
     }
 
+    /// Sets the mtimes of a tagged model's manifest, config, layer and tag
+    /// pointer to that many seconds ago (negative: in the future).
+    #[cfg(unix)]
+    fn stamp(
+        store: &OciStore,
+        reference: &str,
+        (desc, manifest): &(
+            crate::storage::oci::Descriptor,
+            crate::storage::oci::Manifest,
+        ),
+        ago: [i64; 4],
+    ) {
+        let now = SystemTime::now();
+        let at = |secs: i64| {
+            let d = Duration::from_secs(secs.unsigned_abs());
+            if secs < 0 {
+                now + d
+            } else {
+                now - d
+            }
+        };
+        let paths = [
+            blob(store, &desc.digest),
+            blob(store, &manifest.config.digest),
+            blob(store, &manifest.layers[0].digest),
+            crate::storage::oci::manifest_ref_path(store.root(), reference),
+        ];
+        for (path, secs) in paths.iter().zip(ago) {
+            crate::fsutil::set_mtime(path, at(secs)).unwrap();
+        }
+    }
+
     #[cfg(unix)]
     #[test]
-    fn rm_keeps_a_candidate_a_writer_reused_after_the_removed_manifest() {
-        let (root, cache, store) = rm_fixture("rm-reused");
-        let (desc, manifest) = tagged_model(&store, "docker.io/ai/m:latest", b"config", b"weights");
-        // The manifest and config are older than the layer's last touch,
-        // as if a concurrent writer reused the layer after the tag landed.
-        let now = SystemTime::now();
-        filetime_set(&blob(&store, &desc.digest), now - Duration::from_secs(60));
-        filetime_set(
-            &blob(&store, &manifest.config.digest),
-            now - Duration::from_secs(120),
-        );
+    fn rm_frees_everything_whatever_order_the_writer_published_in() {
+        // [manifest, config, layer, pointer] ages, oldest first by write order.
+        let orders = [
+            (
+                "registry pull: manifest, config, layers, tag",
+                [300, 200, 200, 100],
+            ),
+            (
+                "hf/build: layers, config, manifest, tag",
+                [100, 200, 300, 50],
+            ),
+        ];
+        for (label, ago) in orders {
+            let (root, cache, store) = rm_fixture("rm-order");
+            let reference = "docker.io/ai/m:latest";
+            let model = tagged_model(&store, reference, b"config", b"weights");
+            stamp(&store, reference, &model, ago);
 
-        let (blobs, _) = rm_and_reclaim(&store, &cache, "docker.io/ai/m:latest").unwrap();
+            let (blobs, _) = rm_and_reclaim(&store, &cache, reference).unwrap();
+
+            assert_eq!(blobs.count, 3, "{label}");
+            std::fs::remove_dir_all(&root).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rm_keeps_a_layer_a_writer_reused_after_the_tag_was_published() {
+        let (root, cache, store) = rm_fixture("rm-reused");
+        let reference = "docker.io/ai/m:latest";
+        let model = tagged_model(&store, reference, b"config", b"weights");
+        stamp(&store, reference, &model, [300, 200, -60, 100]);
+
+        let (blobs, _) = rm_and_reclaim(&store, &cache, reference).unwrap();
 
         assert_eq!(blobs.count, 2);
-        assert!(blob(&store, &manifest.layers[0].digest).exists());
-        assert!(!blob(&store, &desc.digest).exists());
-        assert!(!blob(&store, &manifest.config.digest).exists());
+        assert!(blob(&store, &model.1.layers[0].digest).exists());
+        assert!(!blob(&store, &model.0.digest).exists());
+        assert!(!blob(&store, &model.1.config.digest).exists());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rm_keeps_a_manifest_touched_after_its_tag_and_all_its_layers() {
+        let (root, cache, store) = rm_fixture("rm-manifest-touched");
+        let reference = "docker.io/ai/m:latest";
+        let model = tagged_model(&store, reference, b"config", b"weights");
+        stamp(&store, reference, &model, [-60, 200, 200, 100]);
+
+        let (blobs, caches) = rm_and_reclaim(&store, &cache, reference).unwrap();
+
+        assert_eq!((blobs.count, caches.count), (0, 0));
+        assert!(blob(&store, &model.0.digest).exists());
+        assert!(blob(&store, &model.1.config.digest).exists());
+        assert!(blob(&store, &model.1.layers[0].digest).exists());
         std::fs::remove_dir_all(&root).unwrap();
     }
 
@@ -1206,11 +1286,11 @@ mod tests {
         let (desc, manifest) = tagged_model(&store, reference, b"config", b"weights");
         let before = held_by_manifests(&store).unwrap();
         store.remove(reference).unwrap();
-        // A same-content pull reused the blobs, layer first, between the
-        // untag and its own tag write.
+        // A same-content pull reused the blobs between the untag and its own
+        // tag write.
         let later = SystemTime::now() + Duration::from_secs(30);
-        filetime_set(&blob(&store, &manifest.layers[0].digest), later);
-        filetime_set(&blob(&store, &desc.digest), later);
+        crate::fsutil::set_mtime(&blob(&store, &manifest.layers[0].digest), later).unwrap();
+        crate::fsutil::set_mtime(&blob(&store, &desc.digest), later).unwrap();
 
         let (blobs, caches) = reclaim_removed(&store, &cache, &before).unwrap();
 
