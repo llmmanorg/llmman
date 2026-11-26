@@ -223,7 +223,8 @@ fn record_port(file_name: &str, name: &str) -> Option<u16> {
 
 /// The port in the record its daemon holds a lock on. The OS releases a
 /// lock when its holder exits, so a record left by a daemon that crashed
-/// is never used, even while another daemon is starting.
+/// is never used, even while another daemon is starting. Nor is a record
+/// others can open, since they could hold its lock.
 fn held_port(dir: &Path, name: &str) -> Option<u16> {
     std::fs::read_dir(dir)
         .ok()?
@@ -231,10 +232,11 @@ fn held_port(dir: &Path, name: &str) -> Option<u16> {
         .find_map(|entry| {
             let port = record_port(entry.file_name().to_str()?, name)?;
             let record = std::fs::File::open(entry.path()).ok()?;
-            matches!(
-                record.try_lock_shared(),
-                Err(std::fs::TryLockError::WouldBlock)
-            )
+            (owner_only(&record)
+                && matches!(
+                    record.try_lock_shared(),
+                    Err(std::fs::TryLockError::WouldBlock)
+                ))
             .then_some(port)
         })
 }
@@ -344,6 +346,21 @@ fn open_owner_only(path: &Path) -> std::io::Result<std::fs::File> {
     #[cfg(unix)]
     file.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
     Ok(file)
+}
+
+/// Whether only its owner can open `file`: earlier versions left records
+/// readable by everyone.
+#[cfg(unix)]
+fn owner_only(file: &std::fs::File) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    file.metadata()
+        .is_ok_and(|m| m.permissions().mode() & 0o077 == 0)
+}
+
+/// Windows has no mode bits: the profile's ACL keeps other users out.
+#[cfg(not(unix))]
+fn owner_only(_: &std::fs::File) -> bool {
+    true
 }
 
 /// A daemon's published port. Dropping it removes the record.
@@ -2128,6 +2145,24 @@ mod tests {
                 .mode();
             assert_eq!(mode & 0o777, 0o600, "{name}");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clients_ignore_a_record_others_can_open() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        // Another user locks, through a read-only descriptor, a record an
+        // earlier version left readable by everyone.
+        let path = dir.path().join(format!("{NAME}-53097.port"));
+        std::fs::write(&path, "").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let holder = std::fs::File::open(&path).unwrap();
+        holder.lock().unwrap();
+        assert_eq!(held_port(dir.path(), NAME), None);
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(held_port(dir.path(), NAME), Some(53097));
     }
 
     #[test]
