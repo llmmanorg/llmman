@@ -27,7 +27,7 @@ OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 ========================================================================
-@expo/cli 57.0.28 (MIT)
+@expo/cli 57.0.35 (MIT)
 
 The MIT License (MIT)
 
@@ -52,7 +52,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
 ========================================================================
-@expo/metro-runtime 57.0.16 (MIT)
+@expo/metro-runtime 57.0.19 (MIT)
 
 The MIT License (MIT)
 
@@ -431,7 +431,7 @@ The above copyright notice and this permission notice shall be included in all c
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 ========================================================================
-expo-asset 57.0.20 (MIT)
+expo-asset 57.0.22 (MIT)
 
 The MIT License (MIT)
 
@@ -506,7 +506,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
 ========================================================================
-expo-constants 57.0.22 (MIT)
+expo-constants 57.0.25 (MIT)
 
 The MIT License (MIT)
 
@@ -681,7 +681,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
 ========================================================================
-expo-modules-core 57.0.21 (MIT)
+expo-modules-core 57.0.26 (MIT)
 
 The MIT License (MIT)
 
@@ -781,7 +781,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
 ========================================================================
-expo 57.0.27 (MIT)
+expo 57.0.34 (MIT)
 
 The MIT License (MIT)
 
