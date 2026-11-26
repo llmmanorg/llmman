@@ -712,8 +712,11 @@ pub fn ensure_server_with_args(preload_model: &str, serve_args: &[&str]) -> anyh
     }
     // The daemon may have exited right after the final poll above: check
     // once more so that narrow window still reports the exit status
-    // instead of the generic timeout.
-    bail_if_exited(&mut child, log_path.as_deref())?;
+    // instead of the generic timeout. If it exited because a competing
+    // daemon won the bind, that daemon is the start.
+    if bail_if_exited(&mut child, log_path.as_deref())? {
+        return Ok(());
+    }
     // Timed out with the daemon alive but not listening. If a backend
     // fetch began in the window since the loop's last look, leave the
     // daemon to finish it (see above) and say so.
@@ -969,24 +972,45 @@ fn stop_group(pid: u32) {
 }
 
 /// Bails with the daemon's exit status (and its log tail) if the freshly
-/// spawned `llmman serve` child has already exited; returns Ok(()) while
-/// it's still running. On the exited branch this also best-effort kills
+/// spawned `llmman serve` child has already exited; returns Ok(false) while
+/// it's still running, and Ok(true) if it exited but a competing daemon is
+/// serving. On the exited branch this also best-effort kills
 /// the daemon's whole process group first, so a llama-server child the
 /// daemon spawned before dying is not left holding a loaded model.
 fn bail_if_exited(
     child: &mut std::process::Child,
     log_path: Option<&std::path::Path>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<bool> {
+    check_child_startup(child, log_path, server_alive)
+}
+
+/// Probe only after observing an exited child, including when another
+/// caller won the bind. The injected probe makes that ordering testable.
+fn check_child_startup(
+    child: &mut std::process::Child,
+    log_path: Option<&std::path::Path>,
+    mut server_alive: impl FnMut() -> bool,
+) -> anyhow::Result<bool> {
     let pid = child.id();
     let Some(status) = child.try_wait().context("wait on llmman serve")? else {
-        return Ok(());
+        return Ok(false);
     };
     // An exited child is not always a failed startup: two concurrent
     // clients can both spawn a daemon, and the loser exits with "address
-    // in use" while the winner serves. If something is listening now, the
-    // start succeeded, whoever's daemon it is.
-    if server_alive() {
-        return Ok(());
+    // in use" before the winner starts listening. Give the competing
+    // listener a short grace period before reporting the child's failure.
+    // Do not depend on the shared serve.log to identify a bind conflict:
+    // concurrent children can overwrite or rotate it.
+    let deadline = std::time::Instant::now() + Duration::from_secs(1);
+    loop {
+        if server_alive() {
+            return Ok(true);
+        }
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        std::thread::sleep(remaining.min(Duration::from_millis(50)));
     }
     // The daemon may have spawned a llama-server before dying, and that
     // child shares the daemon's process group (see detach), so stop the
@@ -2118,6 +2142,43 @@ fn encode_path_segment(segment: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn an_exited_startup_child_reuses_a_competing_listener() {
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args(["-c", "exit 1"]);
+        detach(&mut cmd);
+        let mut child = cmd.spawn().unwrap();
+        assert!(!child.wait().unwrap().success());
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let probed = std::cell::Cell::new(false);
+        assert!(check_child_startup(&mut child, None, || {
+            probed.set(true);
+            std::net::TcpStream::connect(addr).is_ok()
+        })
+        .unwrap());
+        assert!(probed.get(), "an exited child must recheck the listener");
+
+        let mut attempts = 0;
+        assert!(check_child_startup(&mut child, None, || {
+            attempts += 1;
+            attempts > 1 && std::net::TcpStream::connect(addr).is_ok()
+        })
+        .unwrap());
+        assert!(
+            attempts > 1,
+            "wait for a competing listener to become ready"
+        );
+
+        drop(listener);
+        let started = std::time::Instant::now();
+        let err = check_child_startup(&mut child, None, || false).unwrap_err();
+        assert!(err.to_string().contains("exited during startup"));
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
 
     #[test]
     fn no_autostart_turns_a_missing_server_into_an_error_naming_the_address() {

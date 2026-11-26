@@ -2914,10 +2914,10 @@ fn ensure_server_fails_fast_when_daemon_dies_at_startup() {
 
 #[cfg(unix)]
 #[test]
-fn serve_detach_starts_once_and_outlives_its_caller() {
+fn serve_detach_concurrent_starts_reuse_a_daemon_that_outlives_its_callers() {
     fn version(host: &str) -> Result<serde_json::Value, reqwest::Error> {
         reqwest::blocking::Client::builder()
-            .timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(1))
             .build()?
             .get(format!("http://{host}/api/version"))
             .send()?
@@ -2931,13 +2931,19 @@ fn serve_detach_starts_once_and_outlives_its_caller() {
     }
     impl Drop for StopDaemon {
         fn drop(&mut self) {
-            // The test's unique loopback port identified this daemon via
-            // /api/version; retry here if the earlier identity read panicked.
-            let pid = self.pid.or_else(|| {
-                version(&self.host).ok()?["pid"]
-                    .as_u64()
-                    .and_then(|pid| u32::try_from(pid).ok())
-            });
+            // A failed caller can leave its detached child initializing.
+            // Give it time to bind before looking up the PID for cleanup.
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut pid = self.pid;
+            while pid.is_none() {
+                pid = version(&self.host)
+                    .ok()
+                    .and_then(|body| body["pid"].as_u64().and_then(|pid| u32::try_from(pid).ok()));
+                if pid.is_some() || Instant::now() >= deadline {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
             if let Some(pid) = pid.filter(|pid| *pid > 1 && *pid != std::process::id()) {
                 unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
             }
@@ -2962,11 +2968,27 @@ fn serve_detach_starts_once_and_outlives_its_caller() {
             String::from_utf8_lossy(&out.stderr)
         );
     };
-    start();
     let mut daemon = StopDaemon {
         host: host.clone(),
         pid: None,
     };
+    // Start both clients together against an initially empty port. They may
+    // both spawn: the port bind picks the winner. The deterministic daemon
+    // unit test separately covers the exited child's listener recheck.
+    let gate = std::sync::Barrier::new(2);
+    std::thread::scope(|scope| {
+        let callers: Vec<_> = (0..2)
+            .map(|_| {
+                scope.spawn(|| {
+                    gate.wait();
+                    start();
+                })
+            })
+            .collect();
+        for caller in callers {
+            caller.join().unwrap();
+        }
+    });
     let pid = version(&host).unwrap()["pid"].as_u64().unwrap() as u32;
     assert!(pid > 1 && pid != std::process::id());
     daemon.pid = Some(pid);
