@@ -132,7 +132,9 @@ pub fn run(args: &LaunchArgs) -> anyhow::Result<()> {
     let configured;
     let args = match args.integration.as_deref() {
         Some(name) => {
-            let (with_defaults, applied) =
+            // An alias launches the integration it names.
+            let name = canonical_integration(name).unwrap_or(name);
+            let (mut with_defaults, applied) =
                 apply_defaults(args, name, || crate::config::launch_defaults(name))?;
             if !applied.is_empty() {
                 // So a refusal of a flag that was not typed makes sense.
@@ -141,6 +143,7 @@ pub fn run(args: &LaunchArgs) -> anyhow::Result<()> {
                     applied.join(" ")
                 );
             }
+            with_defaults.integration = Some(name.to_string());
             configured = with_defaults;
             &configured
         }
@@ -672,6 +675,7 @@ fn integration(name: &str) -> Option<&'static Integration> {
     let name = name.to_ascii_lowercase();
     let canonical = match name.as_str() {
         "copilot-cli" => "copilot",
+        "muse-code" => "muse",
         other => other,
     };
     INTEGRATIONS.iter().find(|i| i.name == canonical)
@@ -767,9 +771,7 @@ fn test_temp_dir(tag: &str) -> PathBuf {
 /// launcher knows.
 fn find_integration_binary(i: &Integration) -> Option<PathBuf> {
     match i.name {
-        "copilot" => copilot::find_copilot(),
-        "droid" => droid::find_droid(),
-        "muse" => common::find_on_path_or_local_bin("muse"),
+        "copilot" | "droid" | "muse" => common::find_on_path_or_local_bin(i.binary),
         "opencode" => opencode::find_opencode(),
         "omp" => omp::find_omp(),
         "qwen" => qwen::find_qwen(),
@@ -1915,9 +1917,11 @@ mod tests {
 
     #[test]
     fn a_muse_subcommand_it_does_not_run_is_refused_before_anything_starts() {
-        let args = launch_args(&["muse", "--model", "m", "--", "usage"]);
-        let err = run(&args).unwrap_err().to_string();
-        assert!(err.contains("run `muse usage` itself"), "{err}");
+        for name in ["muse", "muse-code"] {
+            let args = launch_args(&[name, "--model", "m", "--", "usage"]);
+            let err = run(&args).unwrap_err().to_string();
+            assert!(err.contains("run `muse usage` itself"), "{name}: {err}");
+        }
     }
 
     /// `print_integrations` pads each name into a 14-wide column and
@@ -2433,6 +2437,7 @@ mod tests {
     fn canonical_integration_resolves_case_and_aliases() {
         assert_eq!(canonical_integration("OpenCode"), Some("opencode"));
         assert_eq!(canonical_integration("copilot-cli"), Some("copilot"));
+        assert_eq!(canonical_integration("Muse-Code"), Some("muse"));
         assert_eq!(canonical_integration("nonesuch"), None);
         for i in INTEGRATIONS {
             assert_eq!(canonical_integration(i.name), Some(i.name));

@@ -614,7 +614,7 @@ installed:
 | `grok` | Grok Build (offered the first 300 models: it sends its list with every request) | yes |
 | `docker-agent` | Docker Agent | yes |
 | `vibe` | Mistral Vibe CLI | yes |
-| `muse` | Meta Muse Code (its session, `resume` and `exec`; run its other subcommands with `muse` directly) | yes |
+| `muse` | Meta Muse Code (also `muse-code`; its session, `resume` and `exec`; run its other subcommands with `muse` directly) | yes |
 | `hermes` | Hermes Agent | yes, but the daemon holds the key (below) |
 | `agy` | Antigravity CLI | yes |
 | `gemini` | Gemini CLI (one model: `/model` does not change it) | yes: its model calls go to `llmman serve`, and it holds a session token or the daemon's own key, never a provider key |

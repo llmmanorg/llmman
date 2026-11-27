@@ -1,4 +1,4 @@
-//! `llmman launch muse` (Meta's Muse Code).
+//! `llmman launch muse` (and the `muse-code` alias): Meta's Muse Code.
 //!
 //! Muse Code's `meta` provider speaks the Responses API to its base URL.
 //! llmman sets that base URL to the daemon with `-c`, which lasts for the

@@ -115,8 +115,8 @@ $ llmman launch opencode
 
 `provider`, `model` and `variant` are `--provider`, `--model` and
 `--variant`, all optional and checked as if typed. The table is named for
-an integration as `llmman launch` lists it (any case, and `copilot-cli`
-for `copilot`).
+an integration as `llmman launch` lists it (any case, `copilot-cli` for
+`copilot` and `muse-code` for `muse`).
 
 Flags you type win. `provider`, `model` and `variant` choose a model
 together, so typing `--provider`, `--model`, `--overflow-provider` or
