@@ -45,6 +45,7 @@ mod hermes;
 mod keys;
 mod kimi;
 mod models;
+mod muse;
 mod omp;
 mod openclaw;
 mod opencode;
@@ -197,6 +198,7 @@ pub fn run(args: &LaunchArgs) -> anyhow::Result<()> {
     if name.eq_ignore_ascii_case("copilot")
         || name.eq_ignore_ascii_case("copilot-cli")
         || name.eq_ignore_ascii_case("droid")
+        || name.eq_ignore_ascii_case("muse")
     {
         common::check_daemon_key_transport(name)?;
     }
@@ -237,6 +239,9 @@ pub fn run(args: &LaunchArgs) -> anyhow::Result<()> {
     // comes before the daemon starts and a model is pulled.
     if name.eq_ignore_ascii_case("docker-agent") {
         docker_agent::check_docker_agent_args(&args.extra_args)?;
+    }
+    if name.eq_ignore_ascii_case("muse") {
+        muse::check_muse_args(&args.extra_args)?;
     }
     if name.eq_ignore_ascii_case("kimi") && overflow.is_none() {
         kimi::check_kimi_args(args.model.as_deref(), &args.extra_args)?;
@@ -342,6 +347,7 @@ const MODEL_FLAG_FORWARDED: &[&str] = &[
     "copilot",
     "copilot-cli",
     "droid",
+    "muse",
 ];
 
 /// Says so when a `--model` after `--` is the one an integration in
@@ -366,7 +372,8 @@ fn check_model_flag(integration: &str, model: Option<&str>, extra_args: &[String
 /// claude spell it only `--model`; the other launchers also accept `-m`.
 fn has_forwarded_model_flag(integration: &str, extra_args: &[String]) -> bool {
     let name = integration.to_lowercase();
-    let short = (!matches!(name.as_str(), "copilot" | "copilot-cli" | "claude")).then_some("-m");
+    let short =
+        (!matches!(name.as_str(), "copilot" | "copilot-cli" | "claude" | "muse")).then_some("-m");
     MODEL_FLAG_FORWARDED.contains(&name.as_str())
         && has_flag(before_terminator(extra_args), "--model", short)
 }
@@ -647,6 +654,11 @@ const INTEGRATIONS: &[Integration] = &[
         description: "Mistral Vibe CLI",
         binary: "vibe",
     },
+    Integration {
+        name: "muse",
+        description: "Meta Muse Code",
+        binary: "muse",
+    },
 ];
 
 /// The registered name for a launch name (any case, or an alias): what
@@ -757,6 +769,7 @@ fn find_integration_binary(i: &Integration) -> Option<PathBuf> {
     match i.name {
         "copilot" => copilot::find_copilot(),
         "droid" => droid::find_droid(),
+        "muse" => common::find_on_path_or_local_bin("muse"),
         "opencode" => opencode::find_opencode(),
         "omp" => omp::find_omp(),
         "qwen" => qwen::find_qwen(),
@@ -837,6 +850,8 @@ const VARIANT_SPELLINGS: &[(&str, Option<&str>, &[&str])] = &[
     ("qwen", Some("none"), LOW_TO_MAX),
     ("grok", Some("none"), EFFORT_LEVELS),
     ("dsh", Some("off"), EFFORT_LEVELS),
+    // Muse Code's `meta` provider refuses `--reasoning-effort none`.
+    ("muse", None, EFFORT_LEVELS),
 ];
 
 /// `variant` as `integration` spells it. `thinking` (a switch-only
@@ -878,7 +893,8 @@ struct Effort<'a> {
 }
 
 /// The flags that start `integration` at `effort`; opencode, qwen and
-/// dsh take it in their configuration instead.
+/// dsh take it in their configuration instead, and muse's launcher adds
+/// its flag itself.
 fn effort_args(integration: &str, effort: &str) -> Vec<String> {
     let flags: &[&str] = match integration {
         "claude" | "grok" => &["--effort"],
@@ -1000,6 +1016,7 @@ fn launch(
         "grok" => grok::launch_grok(model, api_key, listed.as_ref(), models, extra_args),
         "docker-agent" => docker_agent::launch_docker_agent(model, api_key, models, extra_args),
         "vibe" => vibe::launch_vibe(model, api_key, context_window, models, extra_args),
+        "muse" => muse::launch_muse(model, api_key, effort, extra_args),
         other => Err(unknown_integration(other)),
     }
 }
@@ -1081,6 +1098,7 @@ fn sandbox_state(name: &str) -> anyhow::Result<Vec<sandbox::State>> {
         "vibe" => vec![Dir(
             env_dir("VIBE_HOME").unwrap_or_else(|| home.join(".vibe"))
         )],
+        "muse" => vec![Dir(config.join("muse")), Dir(data.join("muse"))],
         "gemini" => vec![Dir(home.join(".gemini"))],
         "agy" => vec![Dir(agy::agy_settings_dir()?)],
         "hermes" => vec![Dir(hermes::hermes_home()?)],
@@ -1873,6 +1891,35 @@ mod tests {
         assert!(!PROVIDER_NEEDS_DAEMON_KEY.contains(&"docker-agent"));
     }
 
+    /// Muse Code takes its key in `META_API_KEY` and writes no file, so
+    /// `--provider` and `--sandbox openshell` both work.
+    #[test]
+    fn muse_is_an_env_configured_integration_provider_can_drive() {
+        let entry = INTEGRATIONS
+            .iter()
+            .find(|i| i.name == "muse")
+            .expect("muse is not an integration");
+        assert_eq!(entry.binary, "muse");
+        assert!(MODEL_FLAG_FORWARDED.contains(&"muse"));
+        assert!(check_provider_supported("muse").is_ok());
+        assert!(!PROVIDER_NEEDS_DAEMON_KEY.contains(&"muse"));
+        assert!(!CONFIGURED_BY_FILE.contains(&"muse"));
+        assert_eq!(spell_variant("muse", "xhigh").unwrap(), "xhigh");
+        assert_eq!(spell_variant("muse", "thinking").unwrap(), "medium");
+        let none = spell_variant("muse", "none").unwrap_err().to_string();
+        assert!(
+            none.contains("muse cannot start at --variant none"),
+            "{none}"
+        );
+    }
+
+    #[test]
+    fn a_muse_subcommand_it_does_not_run_is_refused_before_anything_starts() {
+        let args = launch_args(&["muse", "--model", "m", "--", "usage"]);
+        let err = run(&args).unwrap_err().to_string();
+        assert!(err.contains("run `muse usage` itself"), "{err}");
+    }
+
     /// `print_integrations` pads each name into a 14-wide column and
     /// prints a space after it, so every description starts at the same
     /// place — including "goose-desktop", the longest at 13. A longer
@@ -1996,7 +2043,8 @@ mod tests {
         for i in INTEGRATIONS {
             let spelled = spell_variant(i.name, "thinking").is_ok();
             let refused = VARIANT_UNSUPPORTED.iter().any(|(id, _)| *id == i.name);
-            let configured = matches!(i.name, "opencode" | "qwen" | "dsh");
+            // These set the effort in their own launcher.
+            let configured = matches!(i.name, "opencode" | "qwen" | "dsh" | "muse");
             assert!(spelled != refused, "{}", i.name);
             assert!(
                 refused || configured || !effort_args(i.name, "medium").is_empty(),

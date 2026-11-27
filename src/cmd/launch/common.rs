@@ -4,6 +4,22 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 
+/// `name` on `PATH`, else in `~/.local/bin`, where installers such as Muse
+/// Code's put it. A shell started before the install lacks that on `PATH`.
+pub(super) fn find_on_path_or_local_bin(name: &str) -> Option<PathBuf> {
+    super::find_on_path(name).or_else(|| in_local_bin(&crate::config::home_dir()?, name))
+}
+
+fn in_local_bin(home: &Path, name: &str) -> Option<PathBuf> {
+    let file = if cfg!(windows) {
+        format!("{name}.exe")
+    } else {
+        name.to_string()
+    };
+    let candidate = home.join(".local").join("bin").join(file);
+    candidate.is_file().then_some(candidate)
+}
+
 /// Launchers that hand the daemon's real client key to another process must
 /// not send it to a remote cleartext endpoint. Call this before anything
 /// probes or starts the daemon; loopback HTTP and remote HTTPS remain valid.
@@ -370,6 +386,24 @@ pub(super) fn pi_model_entry(
 mod tests {
     use super::super::{pair_context_window, served_context_window};
     use super::*;
+
+    #[test]
+    fn local_bin_finds_the_installers_target() {
+        let home = super::super::test_temp_dir("local-bin");
+        for name in ["copilot", "droid", "muse"] {
+            let file = if cfg!(windows) {
+                format!("{name}.exe")
+            } else {
+                name.to_string()
+            };
+            let bin = home.join(".local").join("bin").join(file);
+            std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
+            assert_eq!(in_local_bin(&home, name), None);
+            std::fs::write(&bin, b"stub").unwrap();
+            assert_eq!(in_local_bin(&home, name), Some(bin));
+        }
+        std::fs::remove_dir_all(home).unwrap();
+    }
 
     #[test]
     fn no_proxy_adds_the_daemon_host_to_what_is_inherited() {

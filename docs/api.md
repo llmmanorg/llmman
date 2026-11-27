@@ -12,6 +12,7 @@ Ollama, OpenAI and Anthropic wire formats, plus a small API of its own.
 | llmman | `/llmman/providers`, `/llmman/providers/{id}`, `/llmman/providers/{id}/key`, `/llmman/models`, `/llmman/sessions`, `/llmman/node`, `/llmman/search`, `/llmman/search/model`, `/llmman/search/popular`, `/llmman/search/avatar`, `/llmman/shell` |
 | Web UI | `/`, `/ui/*` and, for a browser, any other path outside the prefixes above (`/models`, `/c/<id>`) — see [webui.md](webui.md) |
 | llama.cpp | `/props` |
+| Muse Code | `/muse-code/models` (the model catalog [`llmman launch muse`](providers.md) points Muse Code at) |
 | Prometheus | `/metrics` (off unless `LLMMAN_METRICS` is `1`, `true`, `yes` or `on`) |
 
 Every route but the web UI's own files requires an API key when the
