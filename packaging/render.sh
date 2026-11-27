@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Render the Homebrew formula and scoop manifest for one llmman release.
+# Render the Homebrew formulae and cask and the scoop manifest for one llmman release.
 # Used by the publish-packages CI job; standalone so it can be run locally:
 #
 #   packaging/render.sh --version 0.1.324 --checksums checksums.txt --out-dir /tmp/out
@@ -75,20 +75,26 @@ case "$TAG" in
 esac
 BASE_URL="https://github.com/$REPO/releases/download/$TAG"
 
-# One description for the crate, the formula and the scoop manifest.
-DESCRIPTION="$(awk '
-	/^\[package\]/ { in_pkg = 1; next }
-	/^\[/          { in_pkg = 0 }
-	in_pkg && /^[[:space:]]*description[[:space:]]*=/ {
-		gsub(/^[^"]*"|".*$/, "")
-		print
-		exit
-	}
-' "$REPO_ROOT/Cargo.toml")"
-[ -n "$DESCRIPTION" ] || die "could not read [package] description from $REPO_ROOT/Cargo.toml"
-case "$DESCRIPTION" in
-*[\"\\\|@]*) die "description contains a character render.sh cannot safely interpolate: $DESCRIPTION" ;;
-esac
+# The [package] description of Cargo.toml $1.
+description_of() {
+	local description
+	description="$(awk '
+		/^\[package\]/ { in_pkg = 1; next }
+		/^\[/          { in_pkg = 0 }
+		in_pkg && /^[[:space:]]*description[[:space:]]*=/ {
+			gsub(/^[^"]*"|".*$/, "")
+			print
+			exit
+		}
+	' "$1")"
+	[ -n "$description" ] || die "could not read [package] description from $1"
+	case "$description" in
+	*[\"\\\|@]*) die "description contains a character render.sh cannot safely interpolate: $description" ;;
+	esac
+	printf '%s' "$description"
+}
+DESCRIPTION="$(description_of "$REPO_ROOT/Cargo.toml")"
+DESKTOP_DESCRIPTION="$(description_of "$REPO_ROOT/desktop/Cargo.toml")"
 
 # Hashes come from the release's own checksums.txt, never recomputed, so
 # the packages and the published binaries cannot disagree.
@@ -109,6 +115,9 @@ SHA_LINUX_X86_64="$(sha_for llmman-x86_64-unknown-linux-gnu)"
 SHA_LINUX_AARCH64="$(sha_for llmman-aarch64-unknown-linux-gnu)"
 SHA_WINDOWS_X86_64="$(sha_for llmman-x86_64-pc-windows-msvc.exe)"
 SHA_WINDOWS_AARCH64="$(sha_for llmman-aarch64-pc-windows-msvc.exe)"
+SHA_DESKTOP_DMG="$(sha_for llmman-desktop-aarch64-apple-darwin.dmg)"
+SHA_DESKTOP_LINUX_X86_64="$(sha_for llmman-desktop-x86_64-unknown-linux-gnu)"
+SHA_DESKTOP_LINUX_AARCH64="$(sha_for llmman-desktop-aarch64-unknown-linux-gnu)"
 
 # `|` delimiter since several values are URLs; no value can contain a
 # placeholder (the description is checked above).
@@ -118,12 +127,16 @@ render() {
 		-e "s|@TAG@|$TAG|g" \
 		-e "s|@REPO@|$REPO|g" \
 		-e "s|@DESCRIPTION@|$DESCRIPTION|g" \
+		-e "s|@DESKTOP_DESCRIPTION@|$DESKTOP_DESCRIPTION|g" \
 		-e "s|@BASE_URL@|$BASE_URL|g" \
 		-e "s|@SHA_MACOS_ARM64@|$SHA_MACOS_ARM64|g" \
 		-e "s|@SHA_LINUX_X86_64@|$SHA_LINUX_X86_64|g" \
 		-e "s|@SHA_LINUX_AARCH64@|$SHA_LINUX_AARCH64|g" \
 		-e "s|@SHA_WINDOWS_X86_64@|$SHA_WINDOWS_X86_64|g" \
 		-e "s|@SHA_WINDOWS_AARCH64@|$SHA_WINDOWS_AARCH64|g" \
+		-e "s|@SHA_DESKTOP_DMG@|$SHA_DESKTOP_DMG|g" \
+		-e "s|@SHA_DESKTOP_LINUX_X86_64@|$SHA_DESKTOP_LINUX_X86_64|g" \
+		-e "s|@SHA_DESKTOP_LINUX_AARCH64@|$SHA_DESKTOP_LINUX_AARCH64|g" \
 		"$1"
 }
 

@@ -27,6 +27,7 @@ exclude = [
 	".github/",
 	"csi/",
 	"deploy/",
+	"desktop/",
 ]
 
 [lib]

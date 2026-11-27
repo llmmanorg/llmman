@@ -1,0 +1,40 @@
+[package]
+name = "llmman-desktop"
+# MAJOR.MINOR match the root Cargo.toml; CI sets PATCH (packaging/version.sh).
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.92"
+description = "Tray icon that opens llmman's web UI and keeps a local llmman serve running"
+license = "Apache-2.0"
+repository = "https://github.com/llmmanorg/llmman"
+publish = false
+
+# Its own workspace, so its dependencies stay out of the root lockfile.
+[workspace]
+
+[dependencies]
+open = "5.4.5"
+png = "0.18.1"
+
+# build.rs downloads and verifies the tray icons.
+[build-dependencies]
+sha2 = "0.10"
+hex = "0.4"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2.189"
+
+[target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
+tao = "0.38.0"
+tray-icon = "0.27.0"
+
+# StatusNotifierItem over pure-Rust D-Bus: no GTK.
+[target.'cfg(target_os = "linux")'.dependencies]
+ksni = { version = "0.3.8", default-features = false, features = ["blocking", "async-io"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

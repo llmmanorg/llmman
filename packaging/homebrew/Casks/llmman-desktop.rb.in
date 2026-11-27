@@ -1,0 +1,25 @@
+# GENERATED FILE -- DO NOT EDIT. Rendered from packaging/homebrew/Casks/llmman-desktop.rb.in
+# in github.com/llmmanorg/llmman and pushed here by its CI on every release.
+# macOS only: Linux installs the formula of the same name. llmman.app already
+# bundles llmman, so there is nothing to depend on.
+cask "llmman-desktop" do
+  version "@VERSION@"
+  sha256 "@SHA_DESKTOP_DMG@"
+
+  url "@BASE_URL@/llmman-desktop-aarch64-apple-darwin.dmg"
+  name "llmman"
+  desc "@DESKTOP_DESCRIPTION@"
+  homepage "https://github.com/@REPO@"
+
+  # No Intel build is published: fail with a clear error, not a 404.
+  depends_on arch: :arm64
+  # LSMinimumSystemVersion (11.0) in packaging/desktop-dmg.sh.
+  depends_on macos: ">= :big_sur"
+
+  app "llmman.app"
+
+  # Ad hoc signed, not notarized: without this Gatekeeper blocks a Launchpad launch.
+  postflight do
+    system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "#{appdir}/llmman.app"]
+  end
+end
