@@ -164,8 +164,6 @@ pub enum State {
 struct Active {
     sandbox: Sandbox,
     integration: String,
-    /// The daemon's URL as the guest reaches it.
-    server: String,
     workspace: PathBuf,
     home: PathBuf,
     image: Option<String>,
@@ -174,11 +172,19 @@ struct Active {
 
 static ACTIVE: OnceLock<Active> = OnceLock::new();
 
-/// The daemon's URL for the integration.
+/// The daemon's URL for the integration. Built when asked for, after the
+/// daemon has started: on port 0 the port is not known before.
 pub fn agent_server() -> String {
-    ACTIVE
-        .get()
-        .map_or_else(crate::daemon::server, |a| a.server.clone())
+    let server = crate::daemon::server();
+    match ACTIVE.get() {
+        Some(active) => agent_server_for(
+            &server,
+            active.sandbox.host_alias(cfg!(target_os = "linux")),
+        )
+        // prepare checked the same scheme and host; only the port differs.
+        .expect("checked in prepare"),
+        None => server,
+    }
 }
 
 /// Whether the image's copy of the integration runs, not the host's.
@@ -225,18 +231,15 @@ pub fn prepare(
         "--sandbox openshell takes the integration's environment only on its command line, \
          so it cannot be given an API key (--provider, --overflow-provider, LLMMAN_API_KEY)"
     );
-    anyhow::ensure!(
-        !crate::daemon::os_picks_port(),
-        "--sandbox needs llmman serve on a fixed port: LLMMAN_HOST lets the OS pick one, which \
-         is not known until the daemon starts"
-    );
     let daemon = crate::daemon::server();
     check_host(sandbox, &daemon)?;
     let image = sandbox
         .uses_image()
         .then(|| image(integration, std::env::var(IMAGE_ENV).ok().as_deref()))
         .transpose()?;
-    let server = agent_server_for(&daemon, sandbox.host_alias(cfg!(target_os = "linux")))?;
+    // Only checked here, before the daemon starts: agent_server builds the
+    // URL once the port is known.
+    agent_server_for(&daemon, sandbox.host_alias(cfg!(target_os = "linux")))?;
     let (cwd, home) = cwd_and_home()?;
     // A relative state path (`GROK_HOME=state`) is relative to the cwd,
     // which the guest shares; mount destinations must be absolute.
@@ -262,7 +265,6 @@ pub fn prepare(
         .set(Active {
             sandbox,
             integration: integration.to_string(),
-            server,
             workspace: workspace(&cwd, &home)?,
             home,
             image,
@@ -1084,7 +1086,7 @@ fn run_openshell(
         "--sandbox openshell cannot upload {workspace}: it contains ':'"
     );
     let image = active.image.as_deref().context("no sandbox image")?;
-    let endpoint = openshell_endpoint(&active.server)?;
+    let endpoint = openshell_endpoint(&agent_server())?;
     let openshell = |args: Vec<String>, what: &str| -> anyhow::Result<()> {
         let mut cmd = Command::new("openshell");
         cmd.args(args);
@@ -1503,7 +1505,6 @@ mod tests {
             let active = Active {
                 sandbox: Sandbox::Docker,
                 integration: format!("worktree-test-{}", std::process::id()),
-                server: "http://127.0.0.1:17434".into(),
                 workspace,
                 home,
                 image: Some("test/image".into()),
@@ -1611,7 +1612,6 @@ mod tests {
         let active = Active {
             sandbox: Sandbox::Docker,
             integration: format!("worktree-symlink-test-{}", std::process::id()),
-            server: "http://127.0.0.1:17434".into(),
             workspace: worktree.clone(),
             home,
             image: Some("test/image".into()),
@@ -1723,7 +1723,6 @@ mod tests {
         let active = Active {
             sandbox: Sandbox::Docker,
             integration: format!("worktree-shared-ancestor-test-{}", std::process::id()),
-            server: "http://127.0.0.1:17434".into(),
             workspace: worktree,
             home: dirs::home_dir().unwrap(),
             image: Some("test/image".into()),
@@ -1832,7 +1831,6 @@ mod tests {
         let active = Active {
             sandbox: Sandbox::Docker,
             integration: format!("worktree-ancestor-symlink-test-{}", std::process::id()),
-            server: "http://127.0.0.1:17434".into(),
             workspace: worktree,
             home: dirs::home_dir().unwrap(),
             image: Some("test/image".into()),
@@ -1866,7 +1864,6 @@ mod tests {
         let active = Active {
             sandbox: Sandbox::Docker,
             integration: format!("untrusted-git-pointer-test-{}", std::process::id()),
-            server: "http://127.0.0.1:17434".into(),
             workspace,
             home,
             image: Some("test/image".into()),
@@ -1894,7 +1891,6 @@ mod tests {
         let active = Active {
             sandbox: Sandbox::Docker,
             integration: format!("symlinked-git-directory-test-{}", std::process::id()),
-            server: "http://127.0.0.1:17434".into(),
             workspace,
             home,
             image: Some("test/image".into()),
@@ -1925,7 +1921,6 @@ mod tests {
         let active = Active {
             sandbox: Sandbox::Docker,
             integration: format!("untrusted-commondir-test-{}", std::process::id()),
-            server: "http://127.0.0.1:17434".into(),
             workspace,
             home,
             image: Some("test/image".into()),
@@ -2047,7 +2042,6 @@ mod tests {
         let active = Active {
             sandbox: Sandbox::Seatbelt,
             integration: "copilot".into(),
-            server: "http://127.0.0.1:17434".into(),
             workspace: root.clone(),
             home: root.join("home"),
             image: None,
