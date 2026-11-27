@@ -147,13 +147,15 @@ that started one is one any web page could send.
 
 `/v1/responses` implements the OpenAI Responses API (the dialect
 [OpenAI Codex](https://github.com/openai/codex) requires), including
-streaming SSE and function-tool-call re-mapping. For a local model this
-is a plain pass-through to `llama-server`'s own native `/v1/responses`
-support, so a recent enough `llama-server` build is required for it to
-work. For a [provider](providers.md) without the route, the daemon
-translates to and from `/v1/chat/completions` itself, and for a provider
-that speaks the Anthropic Messages API from there to `/v1/messages` (see
-[wire formats](providers.md#wire-formats)).
+streaming SSE and function-tool-call re-mapping. For a local model, and
+for a [provider](providers.md) without the route, the daemon translates
+to and from `/v1/chat/completions` itself; for a provider that speaks
+the Anthropic Messages API it goes on from there to `/v1/messages` (see
+[wire formats](providers.md#wire-formats)). Each function in a
+`namespace` tool is offered to the model as a function of its own, and
+a call to it comes back with its `namespace`. Fields outside the
+Responses API, such as `repeat_penalty` or `top_k`, still reach a local
+model.
 
 The `model` in a `/v1/chat/completions`, `/v1/completions` or `/v1/responses`
 reply (every streamed chunk too) is the one the client asked for, not the
@@ -163,10 +165,12 @@ A request bound for a provider loses llama-server's own fields
 (`repeat_penalty`, `top_k`, `min_p`, `chat_template_kwargs`, ...), which
 a strict provider would reject the whole request over; OpenAI's reasoning
 models get `max_completion_tokens` and lose the sampling overrides they
-refuse. `previous_response_id` is refused when `/v1/responses` has to be
-bridged through chat completions: nothing is stored to resolve it against.
+refuse. `previous_response_id` is refused when `/v1/responses` is
+bridged through chat completions, as it always is for a local model:
+nothing is stored to resolve it against.
 
-A local `/v1/chat/completions` with `reasoning_effort` also gets the
+A local `/v1/chat/completions` with `reasoning_effort`, or `/v1/responses`
+with `reasoning.effort`, also gets the
 `chat_template_kwargs` Ollama's `think` would (`none` →
 `enable_thinking: false`; a level → `enable_thinking: true` plus
 `reasoning_effort`), so it works on llama-server builds that do not read

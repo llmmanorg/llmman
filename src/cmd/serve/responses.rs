@@ -19,7 +19,8 @@
 //!   no `thinking` field to carry them back in.
 //! - Ollama's server-side `web_search`/`tool_search` tools are dropped.
 //! - `tool_choice` and `text.format` are forwarded (`/api/chat` has no
-//!   `tool_choice`).
+//!   `tool_choice`); an `allowed_tools` choice offers only the functions
+//!   it allows.
 //! - `namespace` members flatten to `namespace_member`, not
 //!   `namespace.member`: providers enforce `^[a-zA-Z0-9_-]{1,128}$`.
 //!
@@ -30,9 +31,10 @@
 //! the conversion only once that provider has answered the native route
 //! with a status [`falls_back_for`] treats as a missing or broken route
 //! (404/405/501 from any provider, or any 5xx from `opencode`), so one
-//! that implements the API keeps it.
+//! that implements the API keeps it. A local engine always gets the
+//! conversion.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{anyhow, Context};
 use axum::body::Bytes;
@@ -89,6 +91,7 @@ pub(super) fn from_responses_request(req: &Value) -> anyhow::Result<Value> {
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
+    let names = ToolNames::new(&available_tools);
     let mut messages: Vec<Value> = Vec::new();
 
     if let Some(instructions) = req.get("instructions").and_then(Value::as_str) {
@@ -104,7 +107,7 @@ pub(super) fn from_responses_request(req: &Value) -> anyhow::Result<Value> {
         Some(Value::Array(items)) => {
             for (i, item) in items.iter().enumerate() {
                 let next = items.get(i + 1);
-                push_input_item(&mut messages, item, next, &available_tools)?;
+                push_input_item(&mut messages, item, next, &names)?;
             }
         }
         _ => {}
@@ -117,14 +120,30 @@ pub(super) fn from_responses_request(req: &Value) -> anyhow::Result<Value> {
         "stream_options": { "include_usage": true },
     });
 
-    let mut tools: Vec<Value> = Vec::new();
-    for tool in &available_tools {
-        convert_tools(tool, &mut tools);
+    let mut tools = names.chat_tools();
+    let allowed = match req.get("tool_choice") {
+        Some(choice) => allowed_tools(choice, &names)?,
+        None => None,
+    };
+    if let Some(allowed) = &allowed {
+        tools.retain(|t| {
+            allowed
+                .wire_names
+                .contains(t["function"]["name"].as_str().unwrap_or(""))
+        });
+        anyhow::ensure!(
+            !(allowed.required && tools.is_empty()),
+            "tool_choice allowed_tools requires a call but allows none of the request's functions"
+        );
     }
     if !tools.is_empty() {
         chat["tools"] = Value::Array(tools);
         if let Some(choice) = req.get("tool_choice") {
-            chat["tool_choice"] = tool_choice(choice, &available_tools);
+            chat["tool_choice"] = match &allowed {
+                Some(allowed) if allowed.required => json!("required"),
+                Some(_) => json!("auto"),
+                None => tool_choice(choice, &names),
+            };
         }
         if let Some(parallel) = req.get("parallel_tool_calls").filter(|v| v.is_boolean()) {
             chat["parallel_tool_calls"] = parallel.clone();
@@ -173,11 +192,50 @@ pub(super) fn from_responses_request(req: &Value) -> anyhow::Result<Value> {
     Ok(chat)
 }
 
+/// An `allowed_tools` choice: the functions it allows, by wire name, and
+/// whether one must be called.
+struct AllowedTools {
+    wire_names: BTreeSet<String>,
+    required: bool,
+}
+
+/// `choice` as [`AllowedTools`] when it is one, or an error for a mode other
+/// than `auto` or `required`. Offering only the allowed functions holds every
+/// engine to them; a hosted tool it allows is dropped.
+fn allowed_tools(choice: &Value, names: &ToolNames) -> anyhow::Result<Option<AllowedTools>> {
+    if choice.get("type").and_then(Value::as_str) != Some("allowed_tools") {
+        return Ok(None);
+    }
+    let required = match choice.get("mode").and_then(Value::as_str) {
+        Some("auto") => false,
+        Some("required") => true,
+        mode => {
+            anyhow::bail!("tool_choice allowed_tools mode must be auto or required, not {mode:?}")
+        }
+    };
+    let wire_names = choice
+        .get("tools")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|tool| tool.get("type").and_then(Value::as_str) == Some("function"))
+        .map(|tool| {
+            let name = tool.get("name").and_then(Value::as_str).unwrap_or("");
+            let namespace = tool.get("namespace").and_then(Value::as_str).unwrap_or("");
+            names.wire_name_for_call(namespace, name)
+        })
+        .collect();
+    Ok(Some(AllowedTools {
+        wire_names,
+        required,
+    }))
+}
+
 /// `tool_choice` differs only in its object form: the Responses API
 /// names the function at the top level, chat completions nests it, under
-/// the name [`convert_tools`] gave it. A choice of a hosted tool
-/// [`convert_tools`] dropped becomes `auto`.
-fn tool_choice(choice: &Value, tools: &[Value]) -> Value {
+/// its wire name in [`ToolNames`]. A choice of a hosted tool, which
+/// [`ToolNames`] drops, becomes `auto`.
+fn tool_choice(choice: &Value, names: &ToolNames) -> Value {
     let Value::Object(o) = choice else {
         return choice.clone();
     };
@@ -185,11 +243,8 @@ fn tool_choice(choice: &Value, tools: &[Value]) -> Value {
         return json!("auto");
     }
     let name = o.get("name").and_then(Value::as_str).unwrap_or("");
-    let (namespace, name) = match o.get("namespace").and_then(Value::as_str) {
-        Some(ns) if !ns.is_empty() => (ns.to_string(), name.to_string()),
-        _ => responses_tool_call_name(tools, name),
-    };
-    json!({ "type": "function", "function": { "name": qualify_namespace_tool_name(&namespace, &name) } })
+    let namespace = o.get("namespace").and_then(Value::as_str).unwrap_or("");
+    json!({ "type": "function", "function": { "name": names.wire_name_for_call(namespace, name) } })
 }
 
 /// Appends the chat message(s) one `input` item stands for; `next` is the
@@ -198,7 +253,7 @@ fn push_input_item(
     messages: &mut Vec<Value>,
     item: &Value,
     next: Option<&Value>,
-    tools: &[Value],
+    names: &ToolNames,
 ) -> anyhow::Result<()> {
     let role = item.get("role").and_then(Value::as_str);
     // The `{"role", "content"}` shorthand has no `type`.
@@ -227,16 +282,11 @@ fn push_input_item(
             };
             let name = item.get("name").and_then(Value::as_str).unwrap_or("");
             let namespace = item.get("namespace").and_then(Value::as_str).unwrap_or("");
-            let (namespace, name) = if namespace.is_empty() {
-                responses_tool_call_name(tools, name)
-            } else {
-                (namespace.to_string(), name.to_string())
-            };
             let call = json!({
                 "id": item.get("call_id").cloned().unwrap_or(Value::Null),
                 "type": "function",
                 "function": {
-                    "name": qualify_namespace_tool_name(&namespace, &name),
+                    "name": names.wire_name_for_call(namespace, name),
                     "arguments": arguments,
                 },
             });
@@ -319,13 +369,145 @@ fn append_response_tool_call(messages: &mut Vec<Value>, call: Value) {
     messages.push(json!({ "role": "assistant", "tool_calls": [call] }));
 }
 
-/// Ollama's `convertTools`: a `namespace` tool becomes each of its
-/// members under a qualified name; non-function tools are dropped.
-fn convert_tools(tool: &Value, out: &mut Vec<Value>) {
+/// The function name each of a request's tools goes to the model under,
+/// unique within the request, and the way back from it. A top-level
+/// function keeps its own name. A `namespace` member gets
+/// [`qualify_namespace_tool_name`]'s, with `_2`, `_3`, ... added when
+/// another function already has it, shortened to keep within
+/// [`MAX_FUNCTION_NAME_CHARS`]. Non-function tools are dropped.
+struct ToolNames(Vec<OfferedFunction>);
+
+struct OfferedFunction {
+    placement: Placement,
+    /// `""` unless a member of a top-level namespace.
+    namespace: String,
+    name: String,
+    wire_name: String,
+    /// The function as the client sent it.
+    definition: Value,
+}
+
+#[derive(PartialEq)]
+enum Placement {
+    TopLevel,
+    Member,
+    /// A member of a namespace inside a namespace. Its calls come back
+    /// under its wire name, with no namespace.
+    Nested,
+}
+
+impl ToolNames {
+    fn new(tools: &[Value]) -> Self {
+        let mut offered = Vec::new();
+        for tool in tools {
+            offered_functions(tool, &mut offered);
+        }
+        let mut used_wire_names: BTreeSet<String> = offered
+            .iter()
+            .filter(|function| function.placement == Placement::TopLevel)
+            .map(|function| function.wire_name.clone())
+            .collect();
+        for function in offered
+            .iter_mut()
+            .filter(|function| function.placement != Placement::TopLevel)
+        {
+            let qualified = function.wire_name.clone();
+            let mut suffix = 1;
+            while !used_wire_names.insert(function.wire_name.clone()) {
+                suffix += 1;
+                let suffix = format!("_{suffix}");
+                let kept = MAX_FUNCTION_NAME_CHARS.saturating_sub(suffix.len());
+                function.wire_name = qualified.chars().take(kept).collect::<String>() + &suffix;
+            }
+            if function.placement == Placement::Nested {
+                function.name = function.wire_name.clone();
+            }
+        }
+        Self(offered)
+    }
+
+    /// The chat completions `tools`.
+    fn chat_tools(&self) -> Vec<Value> {
+        self.0
+            .iter()
+            .map(|offered| {
+                let mut function = json!({ "name": offered.wire_name });
+                for key in ["description", "parameters", "strict"] {
+                    if let Some(v) = offered.definition.get(key).filter(|v| !v.is_null()) {
+                        function[key] = v.clone();
+                    }
+                }
+                json!({ "type": "function", "function": function })
+            })
+            .collect()
+    }
+
+    /// The wire name of `name` in `namespace`; for a name not offered, the
+    /// qualified one.
+    fn wire_name(&self, namespace: &str, name: &str) -> String {
+        self.0
+            .iter()
+            .find(|function| function.namespace == namespace && function.name == name)
+            .map(|function| function.wire_name.clone())
+            .unwrap_or_else(|| qualify_namespace_tool_name(namespace, name))
+    }
+
+    /// The wire name of `name` in `namespace`, or, with no namespace, of
+    /// the tool [`Self::client_name`] finds for `name`.
+    fn wire_name_for_call(&self, namespace: &str, name: &str) -> String {
+        if namespace.is_empty() {
+            let (namespace, name) = self.client_name(name);
+            self.wire_name(&namespace, &name)
+        } else {
+            self.wire_name(namespace, name)
+        }
+    }
+
+    /// Ollama's `responsesToolCallName`: `(namespace, name)` for `called`,
+    /// a wire name or a member spelled `namespace.name` or
+    /// `namespace:name`; `("", called)` for anything else.
+    fn client_name(&self, called: &str) -> (String, String) {
+        if let Some(function) = self.0.iter().find(|function| function.wire_name == called) {
+            return (function.namespace.clone(), function.name.clone());
+        }
+        for function in self
+            .0
+            .iter()
+            .filter(|function| function.placement == Placement::Member)
+        {
+            if !function.namespace.is_empty()
+                && (called == format!("{}.{}", function.namespace, function.name)
+                    || called == format!("{}:{}", function.namespace, function.name))
+            {
+                return (function.namespace.clone(), function.name.clone());
+            }
+        }
+        (String::new(), called.to_string())
+    }
+}
+
+/// Ollama's `convertTools`: the functions `tool` offers, each under the
+/// name it would have without a clash.
+fn offered_functions(tool: &Value, out: &mut Vec<OfferedFunction>) {
+    let name_of = |t: &Value| {
+        t.get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string()
+    };
     match tool.get("type").and_then(Value::as_str) {
-        Some("function") => out.push(convert_tool(tool, "")),
+        Some("function") => {
+            let name = name_of(tool);
+            out.push(OfferedFunction {
+                placement: Placement::TopLevel,
+                namespace: String::new(),
+                wire_name: name.clone(),
+                name,
+                definition: tool.clone(),
+            });
+        }
         Some("namespace") => {
-            let namespace = tool.get("name").and_then(Value::as_str).unwrap_or("");
+            let namespace = name_of(tool);
             for member in tool
                 .get("tools")
                 .and_then(Value::as_array)
@@ -333,15 +515,26 @@ fn convert_tools(tool: &Value, out: &mut Vec<Value>) {
                 .flatten()
             {
                 match member.get("type").and_then(Value::as_str) {
-                    Some("function") => out.push(convert_tool(member, namespace)),
+                    Some("function") => {
+                        let name = name_of(member);
+                        out.push(OfferedFunction {
+                            placement: Placement::Member,
+                            wire_name: qualify_namespace_tool_name(&namespace, &name),
+                            namespace: namespace.clone(),
+                            name,
+                            definition: member.clone(),
+                        });
+                    }
                     Some("namespace") => {
                         let mut inner = Vec::new();
-                        convert_tools(member, &mut inner);
-                        for mut t in inner {
-                            let name = t["function"]["name"].as_str().unwrap_or("").to_string();
-                            t["function"]["name"] =
-                                Value::String(qualify_namespace_tool_name(namespace, &name));
-                            out.push(t);
+                        offered_functions(member, &mut inner);
+                        for mut function in inner {
+                            function.wire_name =
+                                qualify_namespace_tool_name(&namespace, &function.wire_name);
+                            function.placement = Placement::Nested;
+                            function.namespace = String::new();
+                            function.name = function.wire_name.clone();
+                            out.push(function);
                         }
                     }
                     _ => {}
@@ -352,17 +545,8 @@ fn convert_tools(tool: &Value, out: &mut Vec<Value>) {
     }
 }
 
-/// Ollama's `convertTool`, plus `strict`, which chat completions has too.
-fn convert_tool(tool: &Value, namespace: &str) -> Value {
-    let name = tool.get("name").and_then(Value::as_str).unwrap_or("");
-    let mut function = json!({ "name": qualify_namespace_tool_name(namespace, name) });
-    for key in ["description", "parameters", "strict"] {
-        if let Some(v) = tool.get(key).filter(|v| !v.is_null()) {
-            function[key] = v.clone();
-        }
-    }
-    json!({ "type": "function", "function": function })
-}
+/// The longest function name providers accept.
+const MAX_FUNCTION_NAME_CHARS: usize = 128;
 
 /// Ollama's `qualifyNamespaceToolName`, with `_` wherever Ollama has `.`:
 /// providers enforce `^[a-zA-Z0-9_-]{1,128}$` on function names (Anthropic
@@ -381,42 +565,6 @@ fn qualify_namespace_tool_name(namespace: &str, member: &str) -> String {
         return format!("{namespace}{member}");
     }
     format!("{namespace}_{member}")
-}
-
-/// Ollama's `responsesToolCallName`: `(namespace, name)` for a qualified
-/// member of one of the request's `namespace` tools, else `("", qualified)`.
-fn responses_tool_call_name(tools: &[Value], qualified: &str) -> (String, String) {
-    for tool in tools {
-        if tool.get("type").and_then(Value::as_str) != Some("namespace") {
-            continue;
-        }
-        let Some(namespace) = tool
-            .get("name")
-            .and_then(Value::as_str)
-            .filter(|n| !n.is_empty())
-        else {
-            continue;
-        };
-        for member in tool
-            .get("tools")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-        {
-            if member.get("type").and_then(Value::as_str) == Some("namespace") {
-                continue;
-            }
-            let name = member.get("name").and_then(Value::as_str).unwrap_or("");
-            let native = qualify_namespace_tool_name(namespace, name);
-            if qualified == native
-                || qualified == format!("{namespace}.{name}")
-                || qualified == format!("{namespace}:{name}")
-            {
-                return (namespace.to_string(), name.to_string());
-            }
-        }
-    }
-    (String::new(), qualified.to_string())
 }
 
 /// Ollama's `convertResponsesContent`: a bare string when all text (every
@@ -995,13 +1143,14 @@ impl StreamConverter {
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
+        let names = ToolNames::new(&tools);
         let suffix = self.response_id.trim_start_matches("resp_").to_string();
         let mut emitted = 0;
         for (i, call) in calls.into_values().enumerate() {
             let output_index = self.output_index + i;
             let fc_item_id = format!("fc_{suffix}_{i}");
             let call_id = call.id.unwrap_or_else(|| format!("call_{suffix}_{i}"));
-            let (namespace, name) = responses_tool_call_name(&tools, &call.name);
+            let (namespace, name) = names.client_name(&call.name);
 
             let mut in_progress = json!({
                 "id": fc_item_id,
@@ -1120,19 +1269,9 @@ fn now_unix() -> u64 {
 
 // -- OpenAI Responses API (/v1/responses) ------------------------------------
 //
-// llama-server (llama.cpp) has its own native /v1/responses implementation
-// that converts a Responses-API request into a Chat Completions request
-// internally (see server_chat_convert_responses_to_chatcmpl in
-// tools/server/server-chat.cpp) — including the exact SSE event sequence
-// Codex requires (response.created -> response.output_item.added ->
-// response.output_text.delta -> ... -> response.completed, no `[DONE]`) and
-// re-mapping of tool_calls into function_call output items. Re-implementing
-// that translation here would just duplicate — and risk drifting out of
-// sync with — llama.cpp's own logic, so for a local backend this is a plain
-// pass-through exactly like the /v1/* routes in the `openai` sibling
-// module, apart from filter_non_function_tools (see its own doc comment)
-// below. A remote provider without /v1/responses gets this module's own
-// translation instead (see `remote_responses`).
+// A local engine is sent this module's translation as a chat completion. A
+// remote provider gets the request as sent when it has /v1/responses, and
+// the translation when it doesn't (see `remote_responses`).
 pub(super) async fn handle_openai_responses(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1195,12 +1334,80 @@ pub(super) async fn remote_responses(
         );
     }
 
-    let chat_req =
-        from_responses_request(&req).map_err(|e| AppError(e, StatusCode::BAD_REQUEST))?;
+    let chat_req = translate_request(&req)?;
+    relay_translated(client, target, &req, chat_req, activity, canonical_model).await
+}
+
+/// [`from_responses_request`], its error a 400.
+pub(super) fn translate_request(req: &Value) -> Result<Value, AppError> {
+    from_responses_request(req).map_err(|e| AppError(e, StatusCode::BAD_REQUEST))
+}
+
+/// The fields [`carry_engine_fields`] leaves out: the Responses API's own,
+/// which [`from_responses_request`] translates or drops, and Codex's
+/// `client_metadata`, which carries its session ids.
+const UNCARRIED_FIELDS: &[&str] = &[
+    "background",
+    "client_metadata",
+    "conversation",
+    "include",
+    "input",
+    "instructions",
+    "max_output_tokens",
+    "max_tool_calls",
+    "metadata",
+    "model",
+    "parallel_tool_calls",
+    "previous_response_id",
+    "prompt",
+    "prompt_cache_key",
+    "prompt_cache_retention",
+    "reasoning",
+    "safety_identifier",
+    "service_tier",
+    "store",
+    "stream",
+    "stream_options",
+    "temperature",
+    "text",
+    "tool_choice",
+    "tools",
+    "top_logprobs",
+    "top_p",
+    "truncation",
+    "user",
+];
+
+/// Copies into `chat` each field of `req` outside [`UNCARRIED_FIELDS`] that
+/// `chat` lacks, such as `repeat_penalty` or `top_k`. llama-server's own
+/// Responses route passed them on, so a local model keeps them.
+pub(super) fn carry_engine_fields(req: &Value, chat: &mut Value) {
+    let (Some(request_fields), Some(chat_fields)) = (req.as_object(), chat.as_object_mut()) else {
+        return;
+    };
+    for (key, value) in request_fields {
+        if !UNCARRIED_FIELDS.contains(&key.as_str()) && !chat_fields.contains_key(key) {
+            chat_fields.insert(key.clone(), value.clone());
+        }
+    }
+}
+
+/// Sends `chat_req`, translated from `req`, and relays the reply as the
+/// Responses API reply to `req`, streamed or not as `req` asked. A 4xx, or
+/// any error from a local engine, goes back as the backend sent it, as the
+/// passthrough routes relay it.
+pub(super) async fn relay_translated(
+    client: &Client,
+    target: &Target,
+    req: &Value,
+    chat_req: Value,
+    activity: ActivityGuard,
+    canonical_model: String,
+) -> Result<Response, AppError> {
+    let streaming = req.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
     let upstream = send_chat_completion(client, target, &chat_req, &canonical_model).await?;
     let status = upstream.status;
-    if status.is_client_error() {
-        // The provider's own error object, intact for a client that reads it.
+    if status.is_client_error() || (!status.is_success() && matches!(target, Target::Local(_))) {
         return Ok(relay_chat_upstream(upstream, activity));
     }
     if !status.is_success() {
@@ -1211,7 +1418,7 @@ pub(super) async fn remote_responses(
         ));
     }
 
-    let converter = StreamConverter::new(&canonical_model, &req);
+    let converter = StreamConverter::new(&canonical_model, req);
     Ok(convert_upstream(upstream.body, activity, converter, streaming).await)
 }
 
@@ -1225,12 +1432,13 @@ pub(super) async fn handle_openai_responses_input_tokens(
     proxy_openai_passthrough(&state, &headers, body, "/v1/responses/input_tokens").await
 }
 
-/// Applies both `/v1/responses` request-shape workarounds below, to a
-/// body already parsed by `resolve_openai_request`.
+/// Applies both request-shape workarounds below to a local
+/// `/v1/responses/input_tokens` body already parsed by
+/// `resolve_openai_request`.
 ///
 /// Local targets only, and applied after the target is known rather than
 /// on the way in: both are workarounds for what *llama-server's*
-/// `/v1/responses` cannot accept. A provider that implements the
+/// Responses routes cannot accept. A provider that implements the
 /// Responses API natively accepts the request Codex actually sent, and
 /// forwarding a stripped one would silently cost it `web_search` and
 /// every other non-function tool.
@@ -1245,22 +1453,9 @@ pub(super) fn is_responses_route(llama_path: &str) -> bool {
 }
 
 /// Strips any entry from the request's top-level `tools` array whose
-/// `"type"` isn't `"function"` before proxying to llama-server.
-///
-/// Real Codex always includes Responses-API tool types llama-server's own
-/// `/v1/responses` doesn't understand — a `"namespace"`-typed sub-agent
-/// tool bundle, the bare `{"type":"web_search"}` entry, etc. — and, unlike
-/// this module's other passthrough routes, llama-server hard-rejects the
-/// *entire* request the moment even one such entry is present ("'type' of
-/// tool must be 'function'"), rather than skipping just that entry. Since
-/// Codex's own default toolset always includes at least one of these,
-/// every real `codex`/`codex exec` invocation would 400 on its very first
-/// turn without this filter. Nested sub-tools inside a dropped
-/// `"namespace"` entry (e.g. its own agent-management functions) are
-/// dropped along with it rather than hoisted to the top level: the local
-/// model losing access to those secondary tools is harmless, whereas
-/// guessing how to flatten them would risk silently changing their
-/// semantics.
+/// `"type"` isn't `"function"` before proxying to llama-server, which
+/// refuses the whole request over one (Codex's `web_search` and
+/// `namespace` tools, for example) rather than skipping it.
 pub(super) fn filter_non_function_tools(req: &mut serde_json::Value) {
     if let Some(tools) = req.get_mut("tools").and_then(|t| t.as_array_mut()) {
         tools.retain(|t| t.get("type").and_then(|v| v.as_str()) == Some("function"));
@@ -1291,11 +1486,10 @@ pub(super) fn filter_non_function_tools(req: &mut serde_json::Value) {
 /// ggml-org/llama.cpp#20733, ggml-org/llama.cpp#23423; a fix was proposed
 /// and abandoned in ggml-org/llama.cpp#20079) rather than anything this
 /// module's own /v1/messages-style message-building does, so it can't be
-/// fixed the same way — this route is a pass-through by design (see the
-/// module doc comment above). Folding every developer/system input item
-/// into `instructions` here instead keeps the request in a shape
-/// llama-server can never turn into more than one system message,
-/// regardless of that upstream gap.
+/// fixed the same way: this request goes to llama-server as sent. Folding
+/// every developer/system input item into `instructions` here instead
+/// keeps the request in a shape llama-server can never turn into more than
+/// one system message, regardless of that upstream gap.
 pub(super) fn consolidate_responses_instructions(req: &mut serde_json::Value) {
     let mut instructions = req
         .get("instructions")
@@ -1699,8 +1893,8 @@ mod tests {
             "required"
         );
 
-        // A forced namespace member is named as convert_tools named it,
-        // whether the namespace is explicit or in the name.
+        // A forced namespace member gets the name the model is offered it
+        // under, whether the namespace is explicit or in the name.
         let ns_tools = json!([{ "type": "namespace", "name": "ns", "tools": [{ "type": "function", "name": "f" }] }]);
         for choice in [
             json!({ "type": "function", "namespace": "ns", "name": "f" }),
@@ -1713,7 +1907,7 @@ mod tests {
                 "ns_f"
             );
         }
-        // A choice of a hosted tool convert_tools dropped is `auto`.
+        // A choice of a dropped hosted tool is `auto`.
         let req = json!({ "model": "m", "input": "x",
             "tools": [{ "type": "function", "name": "f" }, { "type": "web_search" }],
             "tool_choice": { "type": "web_search" } });
@@ -2300,6 +2494,155 @@ mod tests {
             usage_of(&json!({ "prompt_tokens": 7, "completion_tokens": 5, "total_tokens": 99 }));
         assert_eq!(usage["total_tokens"], 12);
         assert_eq!(usage["input_tokens_details"]["cached_tokens"], 0);
+    }
+
+    /// The translation's own fields win; the Responses API's are not
+    /// carried; anything else is.
+    #[test]
+    fn carried_fields_never_replace_the_translations_own() {
+        let req = json!({
+            "model": "m", "input": "hi", "stream": true, "store": true,
+            "max_output_tokens": 9, "max_tokens": 5, "top_k": 3, "seed": 7,
+            "client_metadata": { "session_id": "s" }
+        });
+        let mut chat = from_responses_request(&req).unwrap();
+        carry_engine_fields(&req, &mut chat);
+        assert_eq!(chat["max_tokens"], 9);
+        assert_eq!(chat["top_k"], 3);
+        assert_eq!(chat["seed"], 7);
+        assert!(chat.get("store").is_none());
+        assert!(chat.get("input").is_none());
+        assert!(chat.get("max_output_tokens").is_none());
+        assert!(chat.get("client_metadata").is_none());
+    }
+
+    /// A standalone `muse_write_file` and `write_file` in namespace `muse`
+    /// would both be `muse_write_file`; the member gets `_2`, and each
+    /// call, replay and forced choice keeps to its own tool.
+    #[test]
+    fn a_member_named_like_a_standalone_function_gets_its_own_name() {
+        let req = json!({
+            "model": "m",
+            "tools": [
+                { "type": "namespace", "name": "muse", "tools": [
+                    { "type": "function", "name": "write_file" }
+                ]},
+                { "type": "function", "name": "muse_write_file" }
+            ],
+            "tool_choice": { "type": "function", "name": "write_file", "namespace": "muse" },
+            "input": [
+                { "role": "user", "content": "go" },
+                { "type": "function_call", "call_id": "c1", "name": "muse_write_file", "arguments": "{}" },
+                { "type": "function_call_output", "call_id": "c1", "output": "ok" },
+                { "type": "function_call", "call_id": "c2", "name": "write_file", "namespace": "muse", "arguments": "{}" },
+                { "type": "function_call_output", "call_id": "c2", "output": "ok" }
+            ]
+        });
+        let chat = from_responses_request(&req).unwrap();
+        let offered: Vec<&str> = chat["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["function"]["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(offered, ["muse_write_file_2", "muse_write_file"]);
+        assert_eq!(chat["tool_choice"]["function"]["name"], "muse_write_file_2");
+        let replayed: Vec<&str> = chat["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|m| m["tool_calls"].as_array())
+            .flatten()
+            .map(|c| c["function"]["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(replayed, ["muse_write_file", "muse_write_file_2"]);
+
+        let names = ToolNames::new(req["tools"].as_array().unwrap());
+        assert_eq!(
+            names.client_name("muse_write_file"),
+            (String::new(), "muse_write_file".into())
+        );
+        assert_eq!(
+            names.client_name("muse_write_file_2"),
+            ("muse".into(), "write_file".into())
+        );
+        assert_eq!(
+            names.client_name("muse.write_file"),
+            ("muse".into(), "write_file".into())
+        );
+    }
+
+    /// Only the allowed functions are offered, and the mode becomes the
+    /// chat completions `tool_choice`.
+    #[test]
+    fn allowed_tools_offers_only_the_functions_it_allows() {
+        let tools = json!([
+            { "type": "function", "name": "read_file" },
+            { "type": "function", "name": "delete_file" },
+            { "type": "namespace", "name": "muse", "tools": [{ "type": "function", "name": "bash" }] },
+            { "type": "web_search" }
+        ]);
+        let translate = |choice: Value| {
+            from_responses_request(&json!({
+                "model": "m", "input": "x", "tools": tools, "tool_choice": choice
+            }))
+        };
+        let offered = |chat: &Value| -> Vec<String> {
+            chat["tools"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|t| t["function"]["name"].as_str().unwrap().to_string())
+                .collect()
+        };
+
+        let chat = translate(
+            json!({ "type": "allowed_tools", "mode": "required", "tools": [
+                { "type": "function", "name": "read_file" },
+                { "type": "function", "name": "bash", "namespace": "muse" }
+            ]}),
+        )
+        .unwrap();
+        assert_eq!(offered(&chat), ["read_file", "muse_bash"]);
+        assert_eq!(chat["tool_choice"], "required");
+
+        let chat = translate(json!({ "type": "allowed_tools", "mode": "auto", "tools": [
+            { "type": "function", "name": "read_file" }
+        ]}))
+        .unwrap();
+        assert_eq!(offered(&chat), ["read_file"]);
+        assert_eq!(chat["tool_choice"], "auto");
+
+        // Allowing only a hosted tool leaves no tools and no choice.
+        let chat = translate(json!({ "type": "allowed_tools", "mode": "auto", "tools": [
+            { "type": "web_search" }
+        ]}))
+        .unwrap();
+        assert!(chat.get("tools").is_none(), "{chat}");
+        assert!(chat.get("tool_choice").is_none(), "{chat}");
+
+        for refused in [
+            json!({ "type": "allowed_tools", "mode": "required", "tools": [{ "type": "web_search" }] }),
+            json!({ "type": "allowed_tools", "mode": "none", "tools": [] }),
+        ] {
+            assert!(translate(refused.clone()).is_err(), "{refused}");
+        }
+    }
+
+    /// A clash on a name at the limit still gives a name within it.
+    #[test]
+    fn a_suffixed_name_stays_within_the_limit() {
+        let member = "f".repeat(MAX_FUNCTION_NAME_CHARS - 3);
+        let qualified = format!("ns_{member}");
+        let names = ToolNames::new(&[
+            json!({ "type": "function", "name": qualified }),
+            json!({ "type": "namespace", "name": "ns", "tools": [{ "type": "function", "name": member }] }),
+        ]);
+        let wire = names.wire_name("ns", &member);
+        assert_eq!(wire.chars().count(), MAX_FUNCTION_NAME_CHARS);
+        assert!(wire.ends_with("_2"), "{wire}");
+        assert_ne!(wire, qualified);
+        assert_eq!(names.client_name(&wire), ("ns".into(), member));
     }
 
     #[test]
