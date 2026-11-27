@@ -7,7 +7,7 @@
 //! `llama-server` backing it, and the real third-party CLI under test
 //! (`claude`, `agy`, `opencode`, `pi`, `omp`, `codex`, `copilot`, `droid`, `cline`,
 //! `grok`, `qwen`, `hermes`,
-//! `openclaw`, `dsh`, `goose`, `vibe`) — not mocks. The one exception is
+//! `openclaw`, `dsh`, `goose`, `vibe`, `muse`) — not mocks. The one exception is
 //! [`launch_goose_desktop_env`]: Goose Desktop is a GUI with no headless
 //! mode, so it stubs its binary.
 //! That's the only way this actually verifies anything: every one of the
@@ -906,7 +906,10 @@ fn launch_command(
         .env("AGY_CLI_DISABLE_AUTO_UPDATE", "true")
         // Cline likewise reinstalls itself as `latest` (CI's pinned 2.18.0
         // became 3.0.x within ~20s), so a retry ran a different Cline.
-        .env("CLINE_NO_AUTO_UPDATE", "1");
+        .env("CLINE_NO_AUTO_UPDATE", "1")
+        // Muse Code's `muse` script updates its binary in the background,
+        // so a retry could run a different one.
+        .env("MUSE_NO_AUTO_UPDATE", "1");
     cmd
 }
 
@@ -2508,6 +2511,26 @@ fn launch_vibe_with_model() {
 
     // `-p`: vibe's headless mode, one prompt in, reply out.
     launch_and_assert("vibe", &["-p", PROMPT]);
+}
+
+#[test]
+fn launch_muse_with_model() {
+    eprintln!("[test] launch_muse_with_model: acquiring SERIAL");
+    let _guard = lock_serial();
+    eprintln!("[test] launch_muse_with_model: acquired SERIAL");
+    if !on_path("llama-server") {
+        eprintln!("skipping: llama-server not on PATH (required to serve any model)");
+        return;
+    }
+    if !on_path("muse") {
+        eprintln!("skipping: muse not on PATH — https://dev.meta.ai/docs/muse-code");
+        return;
+    }
+
+    // Muse Code's reminder agents keep `exec` open until each makes a tool
+    // call, which the test model does not reliably do. `launch muse` leaves
+    // them as the user has them.
+    launch_and_assert("muse", &["exec", "--disable-reminders", PROMPT]);
 }
 
 /// goose exits 0 even when no request reached a model — verified against

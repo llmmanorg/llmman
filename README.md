@@ -374,7 +374,7 @@ ran" model llmman reads; the others go to the loaded or latest pulled model.)
 Run `llmman launch` with no arguments to list the supported integrations
 (Claude Code, OpenCode, Codex, GitHub Copilot CLI, Factory Droid, Pi, OMP, Cline, Aider,
 Qwen Code, Gemini CLI, Grok Build, AGY, DeepSeek Harness, Docker Agent,
-Mistral Vibe, goose, goose Desktop, ...) and whether
+Mistral Vibe, Meta Muse Code, goose, goose Desktop, ...) and whether
 each is installed. Installing an
 integration is up to you; llmman only execs what is already on your
 machine, except that a missing Cline can be installed with npm after an

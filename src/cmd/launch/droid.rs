@@ -9,7 +9,7 @@ use anyhow::Context;
 use super::common;
 use super::models::{ModelEntry, ModelList};
 use super::pi::default_effort;
-use super::{exec_with_env, find_on_path, has_forwarded_model_flag, server};
+use super::{exec_with_env, has_forwarded_model_flag, server};
 
 /// Droid expands this reference in `settings.json` from the child process's
 /// environment, so a real daemon/provider credential is never persisted.
@@ -35,7 +35,8 @@ pub(super) fn launch_droid(
     models: &ModelList,
     extra_args: &[String],
 ) -> anyhow::Result<()> {
-    let bin = find_droid().ok_or_else(|| anyhow::anyhow!("droid is not installed"))?;
+    let bin = common::find_on_path_or_local_bin("droid")
+        .ok_or_else(|| anyhow::anyhow!("droid is not installed"))?;
     let base_url = format!("{}/v1", server());
     let model_id = write_droid_settings(model, &base_url, models)?;
     exec_with_env(
@@ -43,18 +44,6 @@ pub(super) fn launch_droid(
         &droid_args(&model_id, extra_args),
         &[(DROID_API_KEY_ENV, api_key)],
     )
-}
-
-/// The official standalone installer writes to `~/.local/bin`, which a
-/// current non-login shell may not have picked up yet.
-pub(super) fn find_droid() -> Option<PathBuf> {
-    find_on_path("droid").or_else(|| droid_fallback(&crate::config::home_dir()?))
-}
-
-fn droid_fallback(home: &Path) -> Option<PathBuf> {
-    let bin = if cfg!(windows) { "droid.exe" } else { "droid" };
-    let candidate = home.join(".local").join("bin").join(bin);
-    candidate.is_file().then_some(candidate)
 }
 
 pub(super) fn droid_home() -> anyhow::Result<PathBuf> {
@@ -591,17 +580,5 @@ mod tests {
         );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
         std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn fallback_finds_the_official_installers_target() {
-        let home = super::super::test_temp_dir("droid-bin");
-        let name = if cfg!(windows) { "droid.exe" } else { "droid" };
-        let bin = home.join(".local").join("bin").join(name);
-        std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
-        assert_eq!(droid_fallback(&home), None);
-        std::fs::write(&bin, b"stub").unwrap();
-        assert_eq!(droid_fallback(&home), Some(bin));
-        std::fs::remove_dir_all(home).unwrap();
     }
 }
