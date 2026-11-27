@@ -45,6 +45,7 @@ mod managed;
 mod media;
 mod messages;
 pub(crate) mod mounted;
+mod muse;
 mod ollama;
 mod openai;
 mod realtime;
@@ -5151,6 +5152,8 @@ fn build_router(app_state: AppState, metrics_enabled: bool) -> Router {
         .merge(ollama_router())
         // OpenAI API
         .route("/v1/models", get(handle_openai_models))
+        // Muse Code's catalog, at its provider's origin.
+        .route(muse::MUSE_MODELS_ROUTE, get(muse::handle_muse_models))
         .route("/v1/embeddings", post(handle_openai_embeddings))
         .route(
             "/v1/systemone",

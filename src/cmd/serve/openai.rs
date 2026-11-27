@@ -41,6 +41,15 @@ pub(super) async fn handle_openai_models(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, AppError> {
+    Ok(Json(openai_model_list(&state, &headers).await?))
+}
+
+/// The model list `GET /v1/models` returns. `handle_openai_models` sends
+/// it as is, and `/muse-code/models` reshapes it into Muse Code's catalog.
+pub(super) async fn openai_model_list(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<serde_json::Value, AppError> {
     let (store_path, cache_path) = (state.0.store_path.clone(), state.0.cache_path.clone());
     let mounted = state.0.mounted.clone();
     // Off the worker: an uncached header is blocking reads.
@@ -94,7 +103,7 @@ pub(super) async fn handle_openai_models(
             if let Some(trained) = facts.context_length() {
                 entry["meta"] = serde_json::json!({ "n_ctx_train": trained });
                 if serving.is_none() && !user_sizes_slots {
-                    if let Some(n_ctx) = facts.starting_context_window(&state, gguf_engine) {
+                    if let Some(n_ctx) = facts.starting_context_window(state, gguf_engine) {
                         entry["meta"]["n_ctx"] = n_ctx.into();
                     }
                 }
@@ -112,8 +121,8 @@ pub(super) async fn handle_openai_models(
         })
         .collect();
     // As `handle_tags`; loaded anywhere counts as loaded.
-    if aggregation::aggregates(&state, &headers) {
-        for (_, peer) in aggregation::poll::<serde_json::Value>(&state, "/v1/models").await {
+    if aggregation::aggregates(state, headers) {
+        for (_, peer) in aggregation::poll::<serde_json::Value>(state, "/v1/models").await {
             for m in peer["data"].as_array().into_iter().flatten() {
                 match data.iter_mut().find(|have| have["id"] == m["id"]) {
                     // Loaded only there: its live facts too.
@@ -137,7 +146,7 @@ pub(super) async fn handle_openai_models(
             }
         }
     }
-    Ok(Json(serde_json::json!({ "object": "list", "data": data })))
+    Ok(serde_json::json!({ "object": "list", "data": data }))
 }
 
 /// The `meta` and `architecture` a running llama-server reports for its
