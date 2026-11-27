@@ -122,6 +122,9 @@ pub(super) fn test_inner(store_path: PathBuf) -> Inner {
         auth: auth::Policy::default(),
         peer_key: None,
         client: Client::new(),
+        media_loads: Default::default(),
+        video_handover: Default::default(),
+        stashed_videos: Default::default(),
     }
 }
 
@@ -226,6 +229,7 @@ pub(super) fn running_model_fixture(
         thinking: None,
         trained_ctx: None,
         retiring: Default::default(),
+        media: false,
     }
 }
 
@@ -256,6 +260,7 @@ pub(super) fn running_model_fixture_with_engine(
         thinking: None,
         trained_ctx: None,
         retiring: Default::default(),
+        media: false,
     }
 }
 

@@ -308,6 +308,7 @@ pub(super) async fn reap_idle_models(state: AppState) {
 /// driven directly (without waiting on real wall-clock ticks) by
 /// `reap_idle_models_unloads_only_idle_expired_models_not_in_flight_or_forever`.
 pub(super) async fn reap_idle_models_once(state: &AppState) {
+    super::media::prune_stashed(state);
     // Find-then-remove under one held lock, not two separate acquisitions:
     // a `begin_activity` could otherwise land in between (bumping
     // `in_flight` and refreshing `keep_alive`/`last_active` for a request

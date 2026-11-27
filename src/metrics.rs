@@ -81,6 +81,9 @@ pub(crate) enum UnloadReason {
     /// `retire_for_context`: replaced by a load of the same model at the
     /// context window a request's `options.num_ctx` asked for.
     Reloaded,
+    /// `evict_idle_media_models`: an idle image or video model unloaded
+    /// for another, as they load one at a time.
+    Switched,
 }
 
 impl UnloadReason {
@@ -92,6 +95,7 @@ impl UnloadReason {
             Self::Oom => "oom",
             Self::Evicted => "evicted",
             Self::Reloaded => "reloaded",
+            Self::Switched => "switched",
         }
     }
 }
@@ -1084,13 +1088,22 @@ mod tests {
             UnloadReason::Oom,
             UnloadReason::Evicted,
             UnloadReason::Reloaded,
+            UnloadReason::Switched,
         ]
         .iter()
         .map(|r| r.as_str())
         .collect();
         assert_eq!(
             unloads,
-            ["idle", "requested", "crashed", "oom", "evicted", "reloaded"]
+            [
+                "idle",
+                "requested",
+                "crashed",
+                "oom",
+                "evicted",
+                "reloaded",
+                "switched"
+            ]
         );
 
         let retries: Vec<&str> = [

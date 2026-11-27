@@ -3057,6 +3057,40 @@ async fn evict_other_models_evicts_everything_except_the_target_and_in_flight_mo
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn an_image_model_load_unloads_only_idle_image_models() {
+    let _serialised = metrics::GLOBAL_COUNTER_TEST_LOCK.lock().await;
+    let state = test_state();
+    let media = |in_flight| {
+        let mut m = running_model_fixture(None, Duration::ZERO, in_flight);
+        m.media = true;
+        m
+    };
+    {
+        let mut mgr = state.0.manager.lock().await;
+        mgr.running.insert("idle-image".into(), media(0));
+        mgr.running.insert("busy-image".into(), media(1));
+        mgr.running.insert(
+            "idle-chat".into(),
+            running_model_fixture(None, Duration::ZERO, 0),
+        );
+    }
+    let slot = super::media::evict_idle_media_models(&state, "new-image").await;
+    {
+        let mgr = state.0.manager.lock().await;
+        assert!(!mgr.running.contains_key("idle-image"));
+        assert!(mgr.running.contains_key("busy-image"));
+        assert!(mgr.running.contains_key("idle-chat"));
+        // the freed slot is the new load's, reserved in the same step
+        assert_eq!(mgr.pending_loads, 1);
+    }
+    assert!(slot.is_some());
+    // nothing to unload: nothing reserved
+    assert!(super::media::evict_idle_media_models(&state, "new-image")
+        .await
+        .is_none());
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn evict_other_models_reports_nothing_evicted_when_nothing_is_evictable() {
     let state = test_state();
     {

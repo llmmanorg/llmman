@@ -602,6 +602,13 @@ async fn videos(State(s): State<Shared>, body: axum::body::Bytes) -> Result<Resp
     Ok(Json(job).into_response())
 }
 
+/// GET /v1/videos: the stored videos' job objects, oldest first.
+async fn video_list(State(s): State<Shared>) -> Response {
+    let v = s.videos.lock().unwrap_or_else(|e| e.into_inner());
+    let data: Vec<Value> = v.iter().map(|v| v.meta.clone()).collect();
+    Json(json!({"object": "list", "data": data})).into_response()
+}
+
 async fn video_get(State(s): State<Shared>, AxPath(id): AxPath<String>) -> Result<Response, Error> {
     let v = s.videos.lock().unwrap_or_else(|e| e.into_inner());
     let vid = v
@@ -706,7 +713,7 @@ pub fn router(ctx: Context, model_name: String, model_path: String) -> Router {
     let discovery = discovery(&s, model_path);
     Router::new()
         .route("/v1/images/generations", post(images))
-        .route("/v1/videos", post(videos))
+        .route("/v1/videos", post(videos).get(video_list))
         // reference images and conditioning video ride in the JSON body, as base64
         .layer(axum::extract::DefaultBodyLimit::max(
             GENERATION_BODY_LIMIT_BYTES,

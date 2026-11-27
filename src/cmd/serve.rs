@@ -42,6 +42,7 @@ mod config;
 mod gemini;
 mod hybrid;
 mod managed;
+mod media;
 mod messages;
 pub(crate) mod mounted;
 mod ollama;
@@ -360,6 +361,13 @@ struct Inner {
     // Presented to peers — see `aggregation`; `None` sends the hop alone.
     peer_key: Option<String>,
     client: Client,
+    // Held while an image or video model loads — see the `media` module.
+    media_loads: tokio::sync::Mutex<()>,
+    // Held while a worker hands its videos over (write) and while a video
+    // GET looks for one (read) — see `media`.
+    video_handover: tokio::sync::RwLock<()>,
+    // Finished videos of workers unloaded for another — see `media`.
+    stashed_videos: std::sync::Mutex<std::collections::VecDeque<media::StashedVideo>>,
 }
 
 impl Inner {
@@ -452,6 +460,8 @@ struct RunningModel {
     trained_ctx: Option<u32>,
     /// Set while [`retire_for_context`] waits on this model: nothing new joins.
     retiring: Arc<std::sync::atomic::AtomicBool>,
+    /// An image or video model in a mediagen worker ([`ModelPath::Diffusion`]).
+    media: bool,
 }
 
 /// Which engine is actually serving requests for a [`RunningModel`] — surfaced
@@ -1406,27 +1416,49 @@ async fn check_running_by_digest(
 /// Returns `true` if anything was evicted, so a caller only gained by
 /// this knows whether retrying is actually worth it.
 async fn evict_other_models(state: &AppState, model_ref: &str) -> bool {
-    let mut mgr = state.0.manager.lock().await;
-    let other_keys: Vec<String> = mgr
-        .running
-        .iter()
-        .filter(|(k, m)| k.as_str() != model_ref && m.in_flight == 0)
-        .map(|(k, _)| k.clone())
-        .collect();
-    let mut evicted: Vec<(String, RunningModel)> = Vec::with_capacity(other_keys.len());
-    for key in other_keys {
-        if let Some(running) = mgr.running.remove(&key) {
-            metrics::record_model_unload(&key, UnloadReason::Oom);
-            evicted.push((key, running));
-        }
-    }
-    drop(mgr); // release the lock before the (possibly slow) stops below
+    let (evicted, _) = take_idle(state, model_ref, |_| true, UnloadReason::Oom, false).await;
     let any = !evicted.is_empty();
     for (name, mut running) in evicted {
         eprintln!("[llmman] evicting {name} to free memory before retrying {model_ref}");
         running.process.stop_and_wait().await;
     }
     any
+}
+
+/// Removes from `running` every model but `model_ref` that `pick` selects
+/// and no request is using, recording each unload as `reason`. The caller
+/// stops them (see `ModelProcess::stop_and_wait`) to free their memory.
+/// With `reserve`, a slot freed this way is reserved for `model_ref`'s load
+/// under the same lock, as `retire_for_context` does.
+async fn take_idle(
+    state: &AppState,
+    model_ref: &str,
+    pick: impl Fn(&RunningModel) -> bool,
+    reason: UnloadReason,
+    reserve: bool,
+) -> (Vec<(String, RunningModel)>, Option<PendingLoadGuard>) {
+    let mut mgr = state.0.manager.lock().await;
+    let keys: Vec<String> = mgr
+        .running
+        .iter()
+        .filter(|(k, m)| k.as_str() != model_ref && m.in_flight == 0 && pick(m))
+        .map(|(k, _)| k.clone())
+        .collect();
+    let mut taken = Vec::with_capacity(keys.len());
+    for key in keys {
+        if let Some(running) = mgr.running.remove(&key) {
+            metrics::record_model_unload(&key, reason);
+            taken.push((key, running));
+        }
+    }
+    let slot = (reserve && !taken.is_empty()).then(|| {
+        mgr.pending_loads += 1;
+        PendingLoadGuard {
+            state: state.clone(),
+            armed: true,
+        }
+    });
+    (taken, slot)
 }
 
 /// Marks a model as retiring while it lives, and clears the mark on drop, so
@@ -2596,11 +2628,26 @@ async fn resolve_target(
             backend::ds4_server_on_path,
         );
     let load_ctx = ctx_for_load(opts.ctx, &model_path, ds4);
+    // One image or video model at a time (see the `media` module): held
+    // until this load's worker is running, so concurrent loads see it, and
+    // before the slot below, which an unloaded one may free.
+    let (_media_load, media_slot) = match model_path {
+        ModelPath::Diffusion(_) => {
+            let lock = state.0.media_loads.lock().await;
+            let slot = media::evict_idle_media_models(state, model_ref).await;
+            (Some(lock), slot)
+        }
+        _ => (None, None),
+    };
     // A model loaded with another window goes first, and its slot is this
-    // load's. See enforce_max_loaded_models: held for the rest of this function.
+    // load's, as is one an unloaded image model freed. See
+    // enforce_max_loaded_models: held for the rest of this function.
     let mut pending_load_guard = match retire_for_context(state, model_ref, load_ctx).await {
         Some(reserved) => reserved,
-        None => enforce_max_loaded_models(state, state.0.max_loaded_models).await?,
+        None => match media_slot {
+            Some(reserved) => reserved,
+            None => enforce_max_loaded_models(state, state.0.max_loaded_models).await?,
+        },
     };
     // OOM retry loop — on a llama-server load that fails with a
     // memory-allocation-looking error, tries progressively more invasive
@@ -3056,6 +3103,7 @@ async fn resolve_target(
             thinking,
             trained_ctx,
             retiring: Default::default(),
+            media: matches!(model_path, ModelPath::Diffusion(_)),
         },
     );
     // Same locked step as the insert, so this load is never both in
@@ -5633,6 +5681,9 @@ async fn serve_async(_args: &ServeArgs) -> anyhow::Result<()> {
         auth,
         peer_key: crate::auth::peer_key(),
         client,
+        media_loads: Default::default(),
+        video_handover: Default::default(),
+        stashed_videos: Default::default(),
     }));
 
     // Managed routes have their own mandatory auth and bypass prompt logging
