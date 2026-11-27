@@ -587,6 +587,45 @@ async fn a_local_responses_request_is_translated_to_a_chat_completion() {
     assert_eq!(call["item"]["arguments"], r#"{"path":"a.txt"}"#);
 }
 
+/// A local engine's error reaches the client with its own status, headers
+/// and body, as the passthrough routes relay it.
+#[tokio::test]
+async fn a_local_engines_error_keeps_its_status_and_retry_after() {
+    use axum::routing::post;
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(|| async {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                [("retry-after", "3"), ("content-type", "application/json")],
+                r#"{"error":{"code":503,"message":"Loading model","type":"unavailable_error"}}"#,
+            )
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let state = test_state();
+    let resp = proxy_openai_generation_to(
+        &state,
+        &HeaderMap::new(),
+        serde_json::json!({ "model": "qwen3.5:0.8b", "input": "hi", "stream": true }),
+        RESPONSES_ROUTE,
+        "qwen3.5:0.8b",
+        "qwen3.5:0.8b".to_string(),
+        Target::Local(port),
+        ActivityGuard::new(&state, "qwen3.5:0.8b"),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("{:#}", e.0));
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(resp.headers()["retry-after"], "3");
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert!(String::from_utf8_lossy(&body).contains("Loading model"));
+}
+
 /// Nothing is stored to resolve `previous_response_id` against, so a local
 /// request naming one is refused before the engine is asked.
 #[tokio::test]

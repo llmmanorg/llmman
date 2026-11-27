@@ -19,7 +19,8 @@
 //!   no `thinking` field to carry them back in.
 //! - Ollama's server-side `web_search`/`tool_search` tools are dropped.
 //! - `tool_choice` and `text.format` are forwarded (`/api/chat` has no
-//!   `tool_choice`).
+//!   `tool_choice`); an `allowed_tools` choice offers only the functions
+//!   it allows.
 //! - `namespace` members flatten to `namespace_member`, not
 //!   `namespace.member`: providers enforce `^[a-zA-Z0-9_-]{1,128}$`.
 //!
@@ -119,11 +120,30 @@ pub(super) fn from_responses_request(req: &Value) -> anyhow::Result<Value> {
         "stream_options": { "include_usage": true },
     });
 
-    let tools = names.chat_tools();
+    let mut tools = names.chat_tools();
+    let allowed = match req.get("tool_choice") {
+        Some(choice) => allowed_tools(choice, &names)?,
+        None => None,
+    };
+    if let Some(allowed) = &allowed {
+        tools.retain(|t| {
+            allowed
+                .wire_names
+                .contains(t["function"]["name"].as_str().unwrap_or(""))
+        });
+        anyhow::ensure!(
+            !(allowed.required && tools.is_empty()),
+            "tool_choice allowed_tools requires a call but allows none of the request's functions"
+        );
+    }
     if !tools.is_empty() {
         chat["tools"] = Value::Array(tools);
         if let Some(choice) = req.get("tool_choice") {
-            chat["tool_choice"] = tool_choice(choice, &names);
+            chat["tool_choice"] = match &allowed {
+                Some(allowed) if allowed.required => json!("required"),
+                Some(_) => json!("auto"),
+                None => tool_choice(choice, &names),
+            };
         }
         if let Some(parallel) = req.get("parallel_tool_calls").filter(|v| v.is_boolean()) {
             chat["parallel_tool_calls"] = parallel.clone();
@@ -170,6 +190,45 @@ pub(super) fn from_responses_request(req: &Value) -> anyhow::Result<Value> {
         }
     }
     Ok(chat)
+}
+
+/// An `allowed_tools` choice: the functions it allows, by wire name, and
+/// whether one must be called.
+struct AllowedTools {
+    wire_names: BTreeSet<String>,
+    required: bool,
+}
+
+/// `choice` as [`AllowedTools`] when it is one, or an error for a mode other
+/// than `auto` or `required`. Offering only the allowed functions holds every
+/// engine to them; a hosted tool it allows is dropped.
+fn allowed_tools(choice: &Value, names: &ToolNames) -> anyhow::Result<Option<AllowedTools>> {
+    if choice.get("type").and_then(Value::as_str) != Some("allowed_tools") {
+        return Ok(None);
+    }
+    let required = match choice.get("mode").and_then(Value::as_str) {
+        Some("auto") => false,
+        Some("required") => true,
+        mode => {
+            anyhow::bail!("tool_choice allowed_tools mode must be auto or required, not {mode:?}")
+        }
+    };
+    let wire_names = choice
+        .get("tools")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|tool| tool.get("type").and_then(Value::as_str) == Some("function"))
+        .map(|tool| {
+            let name = tool.get("name").and_then(Value::as_str).unwrap_or("");
+            let namespace = tool.get("namespace").and_then(Value::as_str).unwrap_or("");
+            names.wire_name_for_call(namespace, name)
+        })
+        .collect();
+    Ok(Some(AllowedTools {
+        wire_names,
+        required,
+    }))
 }
 
 /// `tool_choice` differs only in its object form: the Responses API
@@ -314,7 +373,8 @@ fn append_response_tool_call(messages: &mut Vec<Value>, call: Value) {
 /// unique within the request, and the way back from it. A top-level
 /// function keeps its own name. A `namespace` member gets
 /// [`qualify_namespace_tool_name`]'s, with `_2`, `_3`, ... added when
-/// another function already has it. Non-function tools are dropped.
+/// another function already has it, shortened to keep within
+/// [`MAX_FUNCTION_NAME_CHARS`]. Non-function tools are dropped.
 struct ToolNames(Vec<OfferedFunction>);
 
 struct OfferedFunction {
@@ -355,7 +415,9 @@ impl ToolNames {
             let mut suffix = 1;
             while !used_wire_names.insert(function.wire_name.clone()) {
                 suffix += 1;
-                function.wire_name = format!("{qualified}_{suffix}");
+                let suffix = format!("_{suffix}");
+                let kept = MAX_FUNCTION_NAME_CHARS.saturating_sub(suffix.len());
+                function.wire_name = qualified.chars().take(kept).collect::<String>() + &suffix;
             }
             if function.placement == Placement::Nested {
                 function.name = function.wire_name.clone();
@@ -482,6 +544,9 @@ fn offered_functions(tool: &Value, out: &mut Vec<OfferedFunction>) {
         _ => {}
     }
 }
+
+/// The longest function name providers accept.
+const MAX_FUNCTION_NAME_CHARS: usize = 128;
 
 /// Ollama's `qualifyNamespaceToolName`, with `_` wherever Ollama has `.`:
 /// providers enforce `^[a-zA-Z0-9_-]{1,128}$` on function names (Anthropic
@@ -1328,8 +1393,9 @@ pub(super) fn carry_engine_fields(req: &Value, chat: &mut Value) {
 }
 
 /// Sends `chat_req`, translated from `req`, and relays the reply as the
-/// Responses API reply to `req`, streamed or not as `req` asked. A 4xx goes
-/// back as the backend's own error.
+/// Responses API reply to `req`, streamed or not as `req` asked. A 4xx, or
+/// any error from a local engine, goes back as the backend sent it, as the
+/// passthrough routes relay it.
 pub(super) async fn relay_translated(
     client: &Client,
     target: &Target,
@@ -1341,8 +1407,7 @@ pub(super) async fn relay_translated(
     let streaming = req.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
     let upstream = send_chat_completion(client, target, &chat_req, &canonical_model).await?;
     let status = upstream.status;
-    if status.is_client_error() {
-        // The provider's own error object, intact for a client that reads it.
+    if status.is_client_error() || (!status.is_success() && matches!(target, Target::Local(_))) {
         return Ok(relay_chat_upstream(upstream, activity));
     }
     if !status.is_success() {
@@ -2505,6 +2570,79 @@ mod tests {
             names.client_name("muse.write_file"),
             ("muse".into(), "write_file".into())
         );
+    }
+
+    /// Only the allowed functions are offered, and the mode becomes the
+    /// chat completions `tool_choice`.
+    #[test]
+    fn allowed_tools_offers_only_the_functions_it_allows() {
+        let tools = json!([
+            { "type": "function", "name": "read_file" },
+            { "type": "function", "name": "delete_file" },
+            { "type": "namespace", "name": "muse", "tools": [{ "type": "function", "name": "bash" }] },
+            { "type": "web_search" }
+        ]);
+        let translate = |choice: Value| {
+            from_responses_request(&json!({
+                "model": "m", "input": "x", "tools": tools, "tool_choice": choice
+            }))
+        };
+        let offered = |chat: &Value| -> Vec<String> {
+            chat["tools"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|t| t["function"]["name"].as_str().unwrap().to_string())
+                .collect()
+        };
+
+        let chat = translate(
+            json!({ "type": "allowed_tools", "mode": "required", "tools": [
+                { "type": "function", "name": "read_file" },
+                { "type": "function", "name": "bash", "namespace": "muse" }
+            ]}),
+        )
+        .unwrap();
+        assert_eq!(offered(&chat), ["read_file", "muse_bash"]);
+        assert_eq!(chat["tool_choice"], "required");
+
+        let chat = translate(json!({ "type": "allowed_tools", "mode": "auto", "tools": [
+            { "type": "function", "name": "read_file" }
+        ]}))
+        .unwrap();
+        assert_eq!(offered(&chat), ["read_file"]);
+        assert_eq!(chat["tool_choice"], "auto");
+
+        // Allowing only a hosted tool leaves no tools and no choice.
+        let chat = translate(json!({ "type": "allowed_tools", "mode": "auto", "tools": [
+            { "type": "web_search" }
+        ]}))
+        .unwrap();
+        assert!(chat.get("tools").is_none(), "{chat}");
+        assert!(chat.get("tool_choice").is_none(), "{chat}");
+
+        for refused in [
+            json!({ "type": "allowed_tools", "mode": "required", "tools": [{ "type": "web_search" }] }),
+            json!({ "type": "allowed_tools", "mode": "none", "tools": [] }),
+        ] {
+            assert!(translate(refused.clone()).is_err(), "{refused}");
+        }
+    }
+
+    /// A clash on a name at the limit still gives a name within it.
+    #[test]
+    fn a_suffixed_name_stays_within_the_limit() {
+        let member = "f".repeat(MAX_FUNCTION_NAME_CHARS - 3);
+        let qualified = format!("ns_{member}");
+        let names = ToolNames::new(&[
+            json!({ "type": "function", "name": qualified }),
+            json!({ "type": "namespace", "name": "ns", "tools": [{ "type": "function", "name": member }] }),
+        ]);
+        let wire = names.wire_name("ns", &member);
+        assert_eq!(wire.chars().count(), MAX_FUNCTION_NAME_CHARS);
+        assert!(wire.ends_with("_2"), "{wire}");
+        assert_ne!(wire, qualified);
+        assert_eq!(names.client_name(&wire), ("ns".into(), member));
     }
 
     #[test]
