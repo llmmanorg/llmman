@@ -1,9 +1,8 @@
 //! `llmman launch copilot` (and the `copilot-cli` alias).
 
+use super::common::find_on_path_or_local_bin;
 use super::models::ModelList;
-use std::path::{Path, PathBuf};
-
-use super::{exec_with_env_removing, find_on_path, has_forwarded_model_flag, server};
+use super::{exec_with_env_removing, has_forwarded_model_flag, server};
 
 const COPILOT_ENV_TO_CLEAR: &[&str] = &[
     "COPILOT_PROVIDER_API_KEY_COMMAND",
@@ -19,7 +18,8 @@ pub(super) fn launch_copilot(
     _models: &ModelList,
     extra_args: &[String],
 ) -> anyhow::Result<()> {
-    let bin = find_copilot().ok_or_else(|| anyhow::anyhow!("copilot is not installed"))?;
+    let bin = find_on_path_or_local_bin("copilot")
+        .ok_or_else(|| anyhow::anyhow!("copilot is not installed"))?;
     let base_url = format!("{}/v1", server());
     exec_with_env_removing(
         &bin,
@@ -27,22 +27,6 @@ pub(super) fn launch_copilot(
         &copilot_env(model, api_key, &base_url),
         COPILOT_ENV_TO_CLEAR,
     )
-}
-
-/// The standalone CLI's own installer writes to `~/.local/bin`, which is
-/// commonly absent from the current shell's PATH until it is restarted.
-pub(super) fn find_copilot() -> Option<PathBuf> {
-    find_on_path("copilot").or_else(|| copilot_fallback(&crate::config::home_dir()?))
-}
-
-fn copilot_fallback(home: &Path) -> Option<PathBuf> {
-    let bin = if cfg!(windows) {
-        "copilot.exe"
-    } else {
-        "copilot"
-    };
-    let candidate = home.join(".local").join("bin").join(bin);
-    candidate.is_file().then_some(candidate)
 }
 
 /// A caller-supplied model after `--` is Copilot's explicit override.
@@ -108,21 +92,5 @@ mod tests {
                 "COPILOT_PROVIDER_BEARER_TOKEN"
             ]
         );
-    }
-
-    #[test]
-    fn fallback_finds_the_installers_target() {
-        let home = super::super::test_temp_dir("copilot");
-        let name = if cfg!(windows) {
-            "copilot.exe"
-        } else {
-            "copilot"
-        };
-        let bin = home.join(".local").join("bin").join(name);
-        std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
-        assert_eq!(copilot_fallback(&home), None);
-        std::fs::write(&bin, b"stub").unwrap();
-        assert_eq!(copilot_fallback(&home), Some(bin));
-        std::fs::remove_dir_all(home).unwrap();
     }
 }

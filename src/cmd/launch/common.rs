@@ -4,8 +4,9 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 
-/// `name` on `PATH`, else in `~/.local/bin`, where installers such as Muse
-/// Code's put it. A shell started before the install lacks that on `PATH`.
+/// `name` on `PATH`, else in `~/.local/bin`, where standalone installers put
+/// it: a shell started before the install does not have that directory on
+/// `PATH` yet.
 pub(super) fn find_on_path_or_local_bin(name: &str) -> Option<PathBuf> {
     super::find_on_path(name).or_else(|| in_local_bin(&crate::config::home_dir()?, name))
 }
