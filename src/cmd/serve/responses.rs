@@ -119,7 +119,7 @@ pub(super) fn from_responses_request(req: &Value) -> anyhow::Result<Value> {
         "stream_options": { "include_usage": true },
     });
 
-    let tools = names.functions();
+    let tools = names.chat_tools();
     if !tools.is_empty() {
         chat["tools"] = Value::Array(tools);
         if let Some(choice) = req.get("tool_choice") {
@@ -185,7 +185,7 @@ fn tool_choice(choice: &Value, names: &ToolNames) -> Value {
     }
     let name = o.get("name").and_then(Value::as_str).unwrap_or("");
     let namespace = o.get("namespace").and_then(Value::as_str).unwrap_or("");
-    json!({ "type": "function", "function": { "name": names.call_wire(namespace, name) } })
+    json!({ "type": "function", "function": { "name": names.wire_name_for_call(namespace, name) } })
 }
 
 /// Appends the chat message(s) one `input` item stands for; `next` is the
@@ -227,7 +227,7 @@ fn push_input_item(
                 "id": item.get("call_id").cloned().unwrap_or(Value::Null),
                 "type": "function",
                 "function": {
-                    "name": names.call_wire(namespace, name),
+                    "name": names.wire_name_for_call(namespace, name),
                     "arguments": arguments,
                 },
             });
@@ -315,19 +315,20 @@ fn append_response_tool_call(messages: &mut Vec<Value>, call: Value) {
 /// function keeps its own name. A `namespace` member gets
 /// [`qualify_namespace_tool_name`]'s, with `_2`, `_3`, ... added when
 /// another function already has it. Non-function tools are dropped.
-struct ToolNames(Vec<ToolName>);
+struct ToolNames(Vec<OfferedFunction>);
 
-struct ToolName {
-    kind: ToolKind,
+struct OfferedFunction {
+    placement: Placement,
     /// `""` unless a member of a top-level namespace.
     namespace: String,
     name: String,
-    wire: String,
-    tool: Value,
+    wire_name: String,
+    /// The function as the client sent it.
+    definition: Value,
 }
 
 #[derive(PartialEq)]
-enum ToolKind {
+enum Placement {
     TopLevel,
     Member,
     /// A member of a namespace inside a namespace. Its calls come back
@@ -337,37 +338,40 @@ enum ToolKind {
 
 impl ToolNames {
     fn new(tools: &[Value]) -> Self {
-        let mut found = Vec::new();
+        let mut offered = Vec::new();
         for tool in tools {
-            offered_functions(tool, &mut found);
+            offered_functions(tool, &mut offered);
         }
-        let mut taken: BTreeSet<String> = found
+        let mut used_wire_names: BTreeSet<String> = offered
             .iter()
-            .filter(|f| f.kind == ToolKind::TopLevel)
-            .map(|f| f.wire.clone())
+            .filter(|function| function.placement == Placement::TopLevel)
+            .map(|function| function.wire_name.clone())
             .collect();
-        for f in found.iter_mut().filter(|f| f.kind != ToolKind::TopLevel) {
-            let base = f.wire.clone();
-            let mut n = 1;
-            while !taken.insert(f.wire.clone()) {
-                n += 1;
-                f.wire = format!("{base}_{n}");
+        for function in offered
+            .iter_mut()
+            .filter(|function| function.placement != Placement::TopLevel)
+        {
+            let qualified = function.wire_name.clone();
+            let mut suffix = 1;
+            while !used_wire_names.insert(function.wire_name.clone()) {
+                suffix += 1;
+                function.wire_name = format!("{qualified}_{suffix}");
             }
-            if f.kind == ToolKind::Nested {
-                f.name = f.wire.clone();
+            if function.placement == Placement::Nested {
+                function.name = function.wire_name.clone();
             }
         }
-        Self(found)
+        Self(offered)
     }
 
     /// The chat completions `tools`.
-    fn functions(&self) -> Vec<Value> {
+    fn chat_tools(&self) -> Vec<Value> {
         self.0
             .iter()
-            .map(|f| {
-                let mut function = json!({ "name": f.wire });
+            .map(|offered| {
+                let mut function = json!({ "name": offered.wire_name });
                 for key in ["description", "parameters", "strict"] {
-                    if let Some(v) = f.tool.get(key).filter(|v| !v.is_null()) {
+                    if let Some(v) = offered.definition.get(key).filter(|v| !v.is_null()) {
                         function[key] = v.clone();
                     }
                 }
@@ -378,38 +382,42 @@ impl ToolNames {
 
     /// The wire name of `name` in `namespace`; for a name not offered, the
     /// qualified one.
-    fn wire(&self, namespace: &str, name: &str) -> String {
+    fn wire_name(&self, namespace: &str, name: &str) -> String {
         self.0
             .iter()
-            .find(|f| f.namespace == namespace && f.name == name)
-            .map(|f| f.wire.clone())
+            .find(|function| function.namespace == namespace && function.name == name)
+            .map(|function| function.wire_name.clone())
             .unwrap_or_else(|| qualify_namespace_tool_name(namespace, name))
     }
 
     /// The wire name of `name` in `namespace`, or, with no namespace, of
-    /// the tool [`Self::resolve`] finds for `name`.
-    fn call_wire(&self, namespace: &str, name: &str) -> String {
+    /// the tool [`Self::client_name`] finds for `name`.
+    fn wire_name_for_call(&self, namespace: &str, name: &str) -> String {
         if namespace.is_empty() {
-            let (namespace, name) = self.resolve(name);
-            self.wire(&namespace, &name)
+            let (namespace, name) = self.client_name(name);
+            self.wire_name(&namespace, &name)
         } else {
-            self.wire(namespace, name)
+            self.wire_name(namespace, name)
         }
     }
 
     /// Ollama's `responsesToolCallName`: `(namespace, name)` for `called`,
     /// a wire name or a member spelled `namespace.name` or
     /// `namespace:name`; `("", called)` for anything else.
-    fn resolve(&self, called: &str) -> (String, String) {
-        if let Some(f) = self.0.iter().find(|f| f.wire == called) {
-            return (f.namespace.clone(), f.name.clone());
+    fn client_name(&self, called: &str) -> (String, String) {
+        if let Some(function) = self.0.iter().find(|function| function.wire_name == called) {
+            return (function.namespace.clone(), function.name.clone());
         }
-        for f in self.0.iter().filter(|f| f.kind == ToolKind::Member) {
-            if !f.namespace.is_empty()
-                && (called == format!("{}.{}", f.namespace, f.name)
-                    || called == format!("{}:{}", f.namespace, f.name))
+        for function in self
+            .0
+            .iter()
+            .filter(|function| function.placement == Placement::Member)
+        {
+            if !function.namespace.is_empty()
+                && (called == format!("{}.{}", function.namespace, function.name)
+                    || called == format!("{}:{}", function.namespace, function.name))
             {
-                return (f.namespace.clone(), f.name.clone());
+                return (function.namespace.clone(), function.name.clone());
             }
         }
         (String::new(), called.to_string())
@@ -418,7 +426,7 @@ impl ToolNames {
 
 /// Ollama's `convertTools`: the functions `tool` offers, each under the
 /// name it would have without a clash.
-fn offered_functions(tool: &Value, out: &mut Vec<ToolName>) {
+fn offered_functions(tool: &Value, out: &mut Vec<OfferedFunction>) {
     let name_of = |t: &Value| {
         t.get("name")
             .and_then(Value::as_str)
@@ -426,13 +434,16 @@ fn offered_functions(tool: &Value, out: &mut Vec<ToolName>) {
             .to_string()
     };
     match tool.get("type").and_then(Value::as_str) {
-        Some("function") => out.push(ToolName {
-            kind: ToolKind::TopLevel,
-            namespace: String::new(),
-            name: name_of(tool),
-            wire: name_of(tool),
-            tool: tool.clone(),
-        }),
+        Some("function") => {
+            let name = name_of(tool);
+            out.push(OfferedFunction {
+                placement: Placement::TopLevel,
+                namespace: String::new(),
+                wire_name: name.clone(),
+                name,
+                definition: tool.clone(),
+            });
+        }
         Some("namespace") => {
             let namespace = name_of(tool);
             for member in tool
@@ -444,23 +455,24 @@ fn offered_functions(tool: &Value, out: &mut Vec<ToolName>) {
                 match member.get("type").and_then(Value::as_str) {
                     Some("function") => {
                         let name = name_of(member);
-                        out.push(ToolName {
-                            kind: ToolKind::Member,
-                            wire: qualify_namespace_tool_name(&namespace, &name),
+                        out.push(OfferedFunction {
+                            placement: Placement::Member,
+                            wire_name: qualify_namespace_tool_name(&namespace, &name),
                             namespace: namespace.clone(),
                             name,
-                            tool: member.clone(),
+                            definition: member.clone(),
                         });
                     }
                     Some("namespace") => {
                         let mut inner = Vec::new();
                         offered_functions(member, &mut inner);
-                        for mut f in inner {
-                            f.wire = qualify_namespace_tool_name(&namespace, &f.wire);
-                            f.kind = ToolKind::Nested;
-                            f.namespace = String::new();
-                            f.name = f.wire.clone();
-                            out.push(f);
+                        for mut function in inner {
+                            function.wire_name =
+                                qualify_namespace_tool_name(&namespace, &function.wire_name);
+                            function.placement = Placement::Nested;
+                            function.namespace = String::new();
+                            function.name = function.wire_name.clone();
+                            out.push(function);
                         }
                     }
                     _ => {}
@@ -1073,7 +1085,7 @@ impl StreamConverter {
             let output_index = self.output_index + i;
             let fc_item_id = format!("fc_{suffix}_{i}");
             let call_id = call.id.unwrap_or_else(|| format!("call_{suffix}_{i}"));
-            let (namespace, name) = names.resolve(&call.name);
+            let (namespace, name) = names.client_name(&call.name);
 
             let mut in_progress = json!({
                 "id": fc_item_id,
@@ -1266,10 +1278,10 @@ pub(super) fn translate_request(req: &Value) -> Result<Value, AppError> {
     from_responses_request(req).map_err(|e| AppError(e, StatusCode::BAD_REQUEST))
 }
 
-/// The Responses API's own request fields, which [`from_responses_request`]
-/// translates or drops, and Codex's `client_metadata`, which carries its
-/// session ids.
-const RESPONSES_FIELDS: &[&str] = &[
+/// The fields [`carry_engine_fields`] leaves out: the Responses API's own,
+/// which [`from_responses_request`] translates or drops, and Codex's
+/// `client_metadata`, which carries its session ids.
+const UNCARRIED_FIELDS: &[&str] = &[
     "background",
     "client_metadata",
     "conversation",
@@ -1301,16 +1313,16 @@ const RESPONSES_FIELDS: &[&str] = &[
     "user",
 ];
 
-/// Copies into `chat` each field of `req` outside [`RESPONSES_FIELDS`] that
+/// Copies into `chat` each field of `req` outside [`UNCARRIED_FIELDS`] that
 /// `chat` lacks, such as `repeat_penalty` or `top_k`. llama-server's own
 /// Responses route passed them on, so a local model keeps them.
 pub(super) fn carry_engine_fields(req: &Value, chat: &mut Value) {
-    let (Some(from), Some(to)) = (req.as_object(), chat.as_object_mut()) else {
+    let (Some(request_fields), Some(chat_fields)) = (req.as_object(), chat.as_object_mut()) else {
         return;
     };
-    for (key, value) in from {
-        if !RESPONSES_FIELDS.contains(&key.as_str()) && !to.contains_key(key) {
-            to.insert(key.clone(), value.clone());
+    for (key, value) in request_fields {
+        if !UNCARRIED_FIELDS.contains(&key.as_str()) && !chat_fields.contains_key(key) {
+            chat_fields.insert(key.clone(), value.clone());
         }
     }
 }
@@ -1816,8 +1828,8 @@ mod tests {
             "required"
         );
 
-        // A forced namespace member is named as convert_tools named it,
-        // whether the namespace is explicit or in the name.
+        // A forced namespace member gets the name the model is offered it
+        // under, whether the namespace is explicit or in the name.
         let ns_tools = json!([{ "type": "namespace", "name": "ns", "tools": [{ "type": "function", "name": "f" }] }]);
         for choice in [
             json!({ "type": "function", "namespace": "ns", "name": "f" }),
@@ -1830,7 +1842,7 @@ mod tests {
                 "ns_f"
             );
         }
-        // A choice of a hosted tool convert_tools dropped is `auto`.
+        // A choice of a dropped hosted tool is `auto`.
         let req = json!({ "model": "m", "input": "x",
             "tools": [{ "type": "function", "name": "f" }, { "type": "web_search" }],
             "tool_choice": { "type": "web_search" } });
@@ -2482,15 +2494,15 @@ mod tests {
 
         let names = ToolNames::new(req["tools"].as_array().unwrap());
         assert_eq!(
-            names.resolve("muse_write_file"),
+            names.client_name("muse_write_file"),
             (String::new(), "muse_write_file".into())
         );
         assert_eq!(
-            names.resolve("muse_write_file_2"),
+            names.client_name("muse_write_file_2"),
             ("muse".into(), "write_file".into())
         );
         assert_eq!(
-            names.resolve("muse.write_file"),
+            names.client_name("muse.write_file"),
             ("muse".into(), "write_file".into())
         );
     }

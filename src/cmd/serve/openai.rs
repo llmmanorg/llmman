@@ -650,7 +650,7 @@ pub(super) async fn proxy_openai_generation_to(
         let mut chat_req = translate_request(&req)?;
         carry_engine_fields(&req, &mut chat_req);
         apply_default_repeat_penalty(&mut chat_req);
-        adjust_local_chat_request(state, &target, &mut chat_req).await;
+        fit_chat_to_template(state, &target, &mut chat_req).await;
         return relay_translated(
             &state.0.client,
             &target,
@@ -674,7 +674,7 @@ pub(super) async fn proxy_openai_generation_to(
         _ => {
             apply_default_repeat_penalty(&mut req);
             if llama_path == CHAT_COMPLETIONS_ROUTE {
-                adjust_local_chat_request(state, &target, &mut req).await;
+                fit_chat_to_template(state, &target, &mut req).await;
             }
         }
     }
@@ -710,7 +710,7 @@ pub(super) async fn proxy_openai_generation_to(
 /// form the model's template reads, a thinking budget at `minimal` and `low`
 /// where the template only turns thinking on or off, and one merged system
 /// message.
-async fn adjust_local_chat_request(state: &AppState, target: &Target, req: &mut serde_json::Value) {
+async fn fit_chat_to_template(state: &AppState, target: &Target, req: &mut serde_json::Value) {
     apply_reasoning_effort(req);
     if req.get("reasoning_effort").is_some() {
         if let Some(message) = effort_budget_for(state, target).await {

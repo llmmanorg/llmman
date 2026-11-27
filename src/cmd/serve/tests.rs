@@ -468,13 +468,13 @@ async fn remote_responses_falls_back_only_on_a_missing_or_broken_route() {
 async fn fake_local_chat() -> (u16, Arc<std::sync::Mutex<Option<serde_json::Value>>>) {
     use axum::routing::post;
     let seen = Arc::new(std::sync::Mutex::new(None));
-    let keep = seen.clone();
+    let seen_by_engine = seen.clone();
     let app = Router::new().route(
         "/v1/chat/completions",
         post(move |Json(body): Json<serde_json::Value>| {
-            let keep = keep.clone();
+            let seen_by_engine = seen_by_engine.clone();
             async move {
-                *keep.lock().unwrap() = Some(body);
+                *seen_by_engine.lock().unwrap() = Some(body);
                 (
                     [("content-type", "text/event-stream")],
                     "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"muse_write_file\",\"arguments\":\"{\\\"path\\\":\\\"a.txt\\\"}\"}}]},\"finish_reason\":null}]}\n\n\
