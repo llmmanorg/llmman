@@ -798,19 +798,16 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn the_azure_cli_is_an_external_token_source() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let az = dir.path().join("az");
         let log = dir.path().join("args");
-        std::fs::write(
+        crate::testscript::write_executable(
             &az,
             format!(
                 "#!/bin/sh\necho \"$@\" > {}\nprintf '{{\"accessToken\":\"eyJ.cli\",\"expires_on\":4102444800,\"tokenType\":\"Bearer\"}}'\n",
                 log.display()
             ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&az, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
         std::fs::create_dir_all(dir.path().join(".azure")).unwrap();
         std::fs::write(dir.path().join(".azure").join("azureProfile.json"), "{}").unwrap();
         let rt = rt(&[], dir.path(), "http://127.0.0.1:1", az.to_str().unwrap());
@@ -823,7 +820,7 @@ mod tests {
             format!("account get-access-token --scope {DEFAULT_SCOPE} --output json")
         );
         // A failing `az` is an error that does not print its output.
-        std::fs::write(&az, "#!/bin/sh\necho sk-cli-leak\nexit 1\n").unwrap();
+        crate::testscript::write_executable(&az, "#!/bin/sh\necho sk-cli-leak\nexit 1\n");
         let cached_elsewhere = AzureChain {
             scope: Some("https://ai.azure.com/.default".into()),
             ..AzureChain::default()

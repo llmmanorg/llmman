@@ -518,11 +518,17 @@ struct DaemonIdentity {
 }
 
 impl DaemonIdentity {
+    fn version(&self) -> Option<&str> {
+        self.version.as_deref().filter(|v| !v.is_empty())
+    }
+
+    fn exe(&self) -> Option<&str> {
+        self.exe.as_deref().filter(|exe| !exe.is_empty())
+    }
+
     /// Any nonzero pid counts: a containerised daemon reports pid 1.
     fn is_llmman(&self) -> bool {
-        self.version.as_deref().is_some_and(|v| !v.is_empty())
-            && self.exe.as_deref().is_some_and(|exe| !exe.is_empty())
-            && self.pid.is_some_and(|pid| pid > 0)
+        self.version().is_some() && self.exe().is_some() && self.pid.is_some_and(|pid| pid > 0)
     }
 }
 
@@ -611,8 +617,7 @@ fn is_local_host(host: &str) -> bool {
 /// an exe, or (a daemon from before identity existed) llmman-only
 /// `/llmman/providers` answers to `probe`. Ollama sends at most a `version`.
 fn is_llmman_daemon(identity: &DaemonIdentity, probe: impl FnOnce() -> bool) -> bool {
-    let has_exe = identity.exe.as_deref().is_some_and(|exe| !exe.is_empty());
-    identity.is_llmman() || has_exe || probe()
+    identity.is_llmman() || identity.exe().is_some() || probe()
 }
 
 /// Whether the server at `LLMMAN_HOST` positively answers as something
@@ -2212,6 +2217,70 @@ pub fn launch_models() -> anyhow::Result<Option<LaunchModels>> {
     Ok(Some(resp.json().context("parse /llmman/models")?))
 }
 
+/// Names the server at `LLMMAN_HOST` for an error about what it cannot do, and how to stop it.
+pub fn describe_server_to_stop() -> String {
+    let identity = daemon_identity().ok();
+    let killable = identity
+        .as_ref()
+        .and_then(|i| Some((i.pid.filter(|&pid| pid > 1)?, i.exe.as_deref()?)))
+        .filter(|&(pid, exe)| host_is_local() && pid_runs_exe(pid, Path::new(exe)))
+        .map(|(pid, _)| pid);
+    describe_server_to_stop_from(identity.as_ref(), &server(), killable)
+}
+
+/// `killable` is a pid verified as running the daemon's exe on this machine.
+fn describe_server_to_stop_from(
+    identity: Option<&DaemonIdentity>,
+    server: &str,
+    killable: Option<u32>,
+) -> String {
+    let what = match identity.filter(|i| i.exe().is_some()) {
+        Some(i) => format!(
+            "the llmman serve {} at {server}",
+            i.version().unwrap_or("of unknown version")
+        ),
+        None => format!("the server at {server}"),
+    };
+    let stop = match killable {
+        Some(pid) => format!("Stop it (`kill {pid}`) and launch again"),
+        None => "Stop it, or point LLMMAN_HOST at a current llmman serve, and launch again".into(),
+    };
+    format!("{what} has no model list. {stop}.")
+}
+
+/// The executable `pid` runs, where the platform can say; a container's pid names another process.
+#[cfg(target_os = "linux")]
+fn process_exe(pid: u32) -> Option<PathBuf> {
+    std::fs::read_link(format!("/proc/{pid}/exe")).ok()
+}
+
+#[cfg(target_os = "macos")]
+fn process_exe(pid: u32) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStringExt;
+    let mut buf = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+    // SAFETY: proc_pidpath writes at most `buf.len()` bytes into `buf`.
+    let len = unsafe {
+        libc::proc_pidpath(
+            i32::try_from(pid).ok()?,
+            buf.as_mut_ptr().cast(),
+            buf.len() as u32,
+        )
+    };
+    buf.truncate(usize::try_from(len).ok().filter(|&len| len > 0)?);
+    Some(std::ffi::OsString::from_vec(buf).into())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn process_exe(_: u32) -> Option<PathBuf> {
+    None
+}
+
+/// Whether `pid` is a process here running `exe`; false where the platform cannot say.
+pub(crate) fn pid_runs_exe(pid: u32, exe: &Path) -> bool {
+    let canonical = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    process_exe(pid).is_some_and(|running| canonical(&running) == canonical(exe))
+}
+
 /// Registers `keys` (provider id to key) with the daemon for one agent
 /// session and returns the token the agent sends in their place (see
 /// `cmd::serve::sessions`). Only over [`connects_securely`], which every
@@ -3178,6 +3247,27 @@ mod tests {
 
     fn identity_from(body: &str) -> anyhow::Result<DaemonIdentity> {
         Ok(serde_json::from_str(body)?)
+    }
+
+    #[test]
+    fn a_server_without_a_model_list_is_named_with_the_command_that_stops_it() {
+        let old =
+            identity_from(r#"{"version":"0.1.571 (d76ad9e)","exe":"/bin/llmman","pid":25805}"#)
+                .unwrap();
+        let host = "http://127.0.0.1:17434";
+        assert_eq!(
+            describe_server_to_stop_from(Some(&old), host, Some(25805)),
+            "the llmman serve 0.1.571 (d76ad9e) at http://127.0.0.1:17434 has no model list. \
+             Stop it (`kill 25805`) and launch again."
+        );
+        let ollama = identity_from(r#"{"version":"0.40.13"}"#).unwrap();
+        for identity in [Some(&old), Some(&ollama), None] {
+            let said = describe_server_to_stop_from(identity, host, None);
+            assert!(
+                !said.contains("kill") && said.contains("LLMMAN_HOST"),
+                "{said}"
+            );
+        }
     }
 
     /// Ollama answers a bare version and a 404 for llmman's own routes; a

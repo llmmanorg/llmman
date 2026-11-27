@@ -64,15 +64,19 @@ fn remembered_model(integration: &str) -> Option<String> {
 
 /// The model list for a launch that asked for none, in the one request the daemon answers it in. A
 /// daemon that predates `GET /llmman/models` is read for the one provider `--provider` names and no
-/// stored model, and said to need a restart for the rest.
-fn fetch_models(provider: Option<(&str, Option<&str>)>) -> anyhow::Result<LaunchModels> {
+/// stored model, with a warning; a launch with nothing else to start on (`!can_continue`) fails.
+fn fetch_models(
+    provider: Option<(&str, Option<&str>)>,
+    can_continue: bool,
+) -> anyhow::Result<LaunchModels> {
     if let Some(models) = daemon::launch_models()? {
         return Ok(models);
     }
-    eprintln!(
-        "[llmman] this llmman serve predates the model list: restart it (llmman stop) to offer \
-         every model"
-    );
+    let stale = daemon::describe_server_to_stop();
+    if !can_continue {
+        anyhow::bail!("{stale}");
+    }
+    eprintln!("[llmman] {stale}");
     let providers = match provider {
         Some((id, model)) => vec![daemon::provider(id, model)?],
         None => Vec::new(),
@@ -147,7 +151,10 @@ pub(super) fn resolve(
         });
     }
 
-    let mut catalog = fetch_models(provider.map(|p| (p, model_flag)))?;
+    let mut catalog = fetch_models(
+        provider.map(|p| (p, model_flag)),
+        provider.is_some() || local.is_some() || own_model,
+    )?;
     if let Some(provider) = provider {
         ensure_provider_listed(&mut catalog, provider, model_flag)?;
     }

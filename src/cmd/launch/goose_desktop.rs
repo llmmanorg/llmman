@@ -183,7 +183,7 @@ fn single_instance_lock_holder(user_data: &Path, bin: &Path) -> GooseInstance {
     else {
         return GooseInstance::Free;
     };
-    // `kill` and `/proc` take a signed pid. A number too large to be one
+    // `kill` and the exe lookup take a signed pid. A number too large to be one
     // is not a pid Chromium wrote, and `pid_alive` rejects zero.
     let Ok(signed) = i32::try_from(pid) else {
         return GooseInstance::Free;
@@ -218,8 +218,9 @@ fn pid_alive(pid: i32) -> bool {
     std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
-/// Whether `pid` is running `bin`, by the executable `/proc/<pid>/exe`
-/// resolves to — what the Windows side matches as `ExecutablePath`.
+/// Whether `pid` is running `bin`, by the executable the OS reports for it
+/// (`/proc/<pid>/exe` on Linux, `proc_pidpath` on macOS) — what the Windows
+/// side matches as `ExecutablePath`.
 ///
 /// This is the bar for *signalling*, not for refusing. `SingletonLock`
 /// outlives an app that was hard-killed, and its pid may since have been
@@ -228,21 +229,14 @@ fn pid_alive(pid: i32) -> bool {
 /// for a lock written on another machine over a shared home directory,
 /// whose pid means nothing here.
 ///
-/// Only Linux has `/proc/<pid>/exe`; an unreadable one — another user's
-/// process, or any other unix — counts as not it. The launch is still
+/// Only Linux and macOS can say what a pid runs; an unreadable one — another
+/// user's process, or any other unix — counts as not it. The launch is still
 /// refused in that case, as [`GooseInstance::Held`]; it is only the
 /// SIGTERM that is withheld. That costs macOS nothing, since
 /// [`goose_desktop_instance`] never reads a lock there.
 #[cfg(not(windows))]
 fn process_is(pid: i32, bin: &Path) -> bool {
-    if pid <= 0 {
-        return false;
-    }
-    let Ok(exe) = std::fs::read_link(format!("/proc/{pid}/exe")) else {
-        return false;
-    };
-    let canonical = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
-    canonical(&exe) == canonical(bin)
+    u32::try_from(pid).is_ok_and(|pid| pid > 0 && crate::daemon::pid_runs_exe(pid, bin))
 }
 
 /// Whether a Goose Desktop already holds the single-instance lock. `bin`
@@ -987,11 +981,11 @@ mod tests {
             single_instance_lock_holder(&user_data, elsewhere),
             GooseInstance::Held
         );
-        // `/proc/<pid>/exe` is what confirms the binary, and only Linux
-        // has it. Elsewhere the holder is real but unconfirmable, which
-        // costs macOS nothing since it never takes the lock.
+        // Linux (`/proc/<pid>/exe`) and macOS (`proc_pidpath`) can say what
+        // a pid runs, which is what confirms the binary. Elsewhere the
+        // holder is real but unconfirmable.
         let confirmed = single_instance_lock_holder(&user_data, &this_exe);
-        if cfg!(target_os = "linux") {
+        if cfg!(any(target_os = "linux", target_os = "macos")) {
             assert_eq!(confirmed, GooseInstance::Confirmed(me as u32));
         } else {
             assert_eq!(confirmed, GooseInstance::Held);
@@ -1049,7 +1043,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&user_data);
         if unsafe { libc::geteuid() } == 0 {
             // root reads it regardless of the mode, so a holder is found —
-            // `Confirmed` only where `/proc` can back that up.
+            // `Confirmed` only where the OS can say what the pid runs
+            // (Linux and macOS).
             assert!(
                 matches!(found, GooseInstance::Confirmed(p) if p == me)
                     || found == GooseInstance::Held,

@@ -975,8 +975,10 @@ mod tests {
             )
         };
         let bin = dir.join(file);
+        #[cfg(unix)]
+        crate::testscript::write_executable(&bin, body);
+        #[cfg(not(unix))]
         std::fs::write(&bin, body).unwrap();
-        crate::llama_release::mark_executable(&bin).unwrap();
         bin
     }
 

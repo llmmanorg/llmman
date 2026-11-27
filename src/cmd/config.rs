@@ -988,12 +988,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn an_editor_with_spaces_and_flags_reaches_the_file() {
-        use std::os::unix::fs::PermissionsExt;
-
         let dir = scratch("editor");
         let script = dir.join("my editor.sh");
-        std::fs::write(&script, "#!/bin/sh\nprintf '%s\\n' \"$1\" > \"$2\"\n").expect("write");
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+        crate::testscript::write_executable(&script, "#!/bin/sh\nprintf '%s\\n' \"$1\" > \"$2\"\n");
         let out = dir.join("out");
 
         let status = editor_command(&format!("\"{}\" --flag", script.display()), &out)

@@ -39,6 +39,8 @@ pub mod shortnames;
 pub mod sources;
 pub mod speech;
 pub mod storage;
+#[cfg(all(test, unix))]
+pub(crate) mod testscript;
 #[cfg(test)]
 pub(crate) mod testserver;
 pub mod thinking;
