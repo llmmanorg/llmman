@@ -69,6 +69,8 @@ pub struct DiffusionPaths {
     pub text_proj: Option<PathBuf>,
     /// Text encoder GGUF (`--text-encoder`).
     pub text_encoder: Option<PathBuf>,
+    /// Vision tower GGUF (an mmproj) of the text encoder.
+    pub vision_encoder: Option<PathBuf>,
     /// Every raw layer by its `org.cncf.model.filepath` (tokenizer, configs, ...).
     pub files: std::collections::BTreeMap<String, PathBuf>,
 }
@@ -806,7 +808,8 @@ pub fn resolve_model(
                 "audio_vae" => paths.audio_vae = Some(p),
                 "text_proj" => paths.text_proj = Some(p),
                 "text_encoder" => paths.text_encoder = Some(p),
-                // Cosmos3 sidecars its generation path does not use
+                // Cosmos3's is safetensors its generation path does not use
+                "vision_encoder" if is_gguf_layer(l) => paths.vision_encoder = Some(p),
                 "vision_encoder" | "sound_tokenizer" => {}
                 other => {
                     eprintln!("[llmman] {model_ref}: ignoring layer with unknown role {other:?}")

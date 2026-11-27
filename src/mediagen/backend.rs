@@ -314,6 +314,7 @@ ops! {
     silu => ggml_silu(a: Tensor<'o>);
     relu => ggml_relu(a: Tensor<'o>);
     gelu => ggml_gelu(a: Tensor<'o>);
+    gelu_erf => ggml_gelu_erf(a: Tensor<'o>);
     sigmoid => ggml_sigmoid(a: Tensor<'o>);
     tanh => ggml_tanh(a: Tensor<'o>);
     sin => ggml_sin(a: Tensor<'o>);

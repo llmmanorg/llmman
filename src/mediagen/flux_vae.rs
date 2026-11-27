@@ -173,18 +173,11 @@ impl<'g> Dec<'g> {
         let (q, k, v) = (proj("q")?, proj("k")?, proj("v")?);
         // F32 attention (flash attention's F16 keys/values can overflow here), in query chunks
         // so the score matrix stays at ATTN_CHUNK x tokens (1 GiB at 2048x2048, not 16 GiB)
-        let n = w * h;
-        let nb = q.strides()[1];
-        let mut a: Option<Tensor<'g>> = None;
-        for s in (0..n).step_by(ATTN_CHUNK as usize) {
-            let qs = g.view_2d(q, c, ATTN_CHUNK.min(n - s), nb, s as usize * nb);
-            let part = super::cosmos3::dit::sdpa_gqa(g, qs, k, v, 1, 1, None, false);
-            a = Some(match a {
-                Some(prev) => g.concat(prev, part, 1),
-                None => part,
-            });
-        }
-        let a = a.expect("at least one token");
+        use super::cosmos3::dit::{attend_in_chunks, query_chunks, sdpa_gqa};
+        let chunks = query_chunks(0, w * h, ATTN_CHUNK);
+        let a = attend_in_chunks(g, q, chunks, |qs, _| {
+            sdpa_gqa(g, qs, k, v, 1, 1, None, false)
+        });
         let ko = self.w.get(&format!("{p}.proj_out.weight"))?;
         let bo = self.w.get(&format!("{p}.proj_out.bias"))?;
         let o = g.linear(a, g.reshape_2d(ko, c, c), Some(bo));
@@ -304,22 +297,16 @@ pub fn decode(w: &Weights, be: &Backend, z: &[f32], h: i64, wd: i64) -> Result<I
     })
 }
 
-/// Encodes an image (`[h][w][3]` bytes, sides multiples of 8) to the
+/// Encodes an image (`[h][w][3]` in `[-1, 1]`, sides multiples of 8) to the
 /// posterior's mean `[C][h/8][w/8]`, VAE space.
-pub fn encode(w: &Weights, be: &Backend, rgb: &[u8], h: i64, wd: i64) -> Result<Vec<f32>> {
-    let px: Vec<f32> = rgb.iter().map(|&v| v as f32 / 127.5 - 1.0).collect();
-    encode_f32(w, be, &px, h, wd)
-}
-
-/// [`encode`] of `[h][w][3]` pixels already in `[-1, 1]`.
-pub fn encode_f32(w: &Weights, be: &Backend, rgb: &[f32], h: i64, wd: i64) -> Result<Vec<f32>> {
+pub fn encode(w: &Weights, be: &Backend, rgb: &[f32], h: i64, wd: i64) -> Result<Vec<f32>> {
     if h % 8 != 0 || wd % 8 != 0 || rgb.len() as i64 != h * wd * 3 {
         bail!("encode needs a {wd}x{h} RGB image with sides multiple of 8");
     }
     if !w.has("encoder.conv_in.weight") {
         bail!("the VAE has no encoder");
     }
-    // [h][w][3] bytes -> [3][h][w] in [-1, 1], ggml's [W, H, 3, 1]
+    // [h][w][3] -> [3][h][w], ggml's [W, H, 3, 1]
     let px = (h * wd) as usize;
     let mut planar = vec![0f32; 3 * px];
     for (i, p) in rgb.chunks(3).enumerate() {

@@ -486,7 +486,7 @@ impl Model {
         let x0 = match &cond_rgb {
             Some((rgb, nf)) => {
                 let t0 = Instant::now();
-                let frames = vae::encode(&self.vae, be, rgb, *nf, h, w)?;
+                let frames = vae::encode(&self.vae, be, rgb, *nf, h, w, 3, &vae::Layout::wan22())?;
                 be.release_compute()?;
                 eprintln!(
                     "[llmman] mediagen: encoded {nf} conditioning frame(s) in {:.2} s",

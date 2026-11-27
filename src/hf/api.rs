@@ -414,11 +414,14 @@ fn is_weights_file(lower: &str) -> bool {
 /// True when the repo ships a diffusion model: a transformer GGUF next to
 /// VAE / text projection sidecars (e.g. `unsloth/LTX-2.3-GGUF`).
 pub fn is_diffusion_repo(files: &[HfFile]) -> bool {
-    // Z-Image and FLUX.2 [klein] GGUFs ship without sidecars; their family is in the file name
+    // Z-Image, FLUX.2 [klein] and Qwen-Image 2.1 GGUFs ship without sidecars;
+    // their family is in the file name
     let zimage = files.iter().any(|f| {
         f.kind == "file"
             && is_model_gguf(&f.path)
-            && (is_zimage_file(&f.path) || is_flux2_klein_file(&f.path))
+            && (is_zimage_file(&f.path)
+                || is_flux2_klein_file(&f.path)
+                || is_qwen_image21_file(&f.path))
     });
     zimage
         || files.iter().any(|f| {
@@ -443,6 +446,19 @@ fn is_flux2_klein_file(path: &str) -> bool {
     ["flux-2-klein", "flux.2-klein", "flux2-klein", "flux2_klein"]
         .iter()
         .any(|k| name.contains(k))
+}
+
+/// A Qwen-Image 2.1 transformer file (base or Turbo).
+fn is_qwen_image21_file(path: &str) -> bool {
+    let name = basename_lower(path);
+    [
+        "qwen-image-2.1",
+        "qwen_image_2.1",
+        "qwen-image-2-1",
+        "qwen_image_2_1",
+    ]
+    .iter()
+    .any(|k| name.contains(k))
 }
 
 fn basename_lower(path: &str) -> String {
@@ -583,6 +599,15 @@ const FLUX2_VAE: (&str, &str) = (
     "vae/diffusion_pytorch_model.safetensors",
 );
 
+/// The official Qwen-Image 2.1 repository's VAE (Diffusers layout, not gated).
+const QWEN_IMAGE21_VAE: (&str, &str) = (
+    "Qwen/Qwen-Image-2.1",
+    "vae/diffusion_pytorch_model.safetensors",
+);
+
+/// The Qwen3-VL-8B vision tower Qwen-Image 2.1 reads reference images with.
+const QWEN3_VL_VISION: (&str, &str) = ("unsloth/Qwen3-VL-8B-Instruct-GGUF", "mmproj-F16.gguf");
+
 /// The official Z-Image-Turbo repository's FLUX.1 VAE (Diffusers layout, not gated).
 const ZIMAGE_VAE: (&str, &str) = (
     "Tongyi-MAI/Z-Image-Turbo",
@@ -629,6 +654,13 @@ pub fn diffusion_plan(files: &[HfFile], model_path: &str) -> DiffusionPlan {
                     .iter()
                     .any(|k| name.contains(k))
             },
+        })
+    } else if is_qwen_image21_file(model_path) {
+        plan.external
+            .push(("vision_encoder", QWEN3_VL_VISION.0, QWEN3_VL_VISION.1));
+        Some(FamilyVae {
+            official: QWEN_IMAGE21_VAE,
+            same_family: is_qwen_image21_file,
         })
     } else {
         None
@@ -688,10 +720,10 @@ pub fn sidecar_layer(mut d: oci::Descriptor, file: &HfFile, role: &str) -> oci::
     d
 }
 
-/// The layer of a file taken from another repository: a text encoder keeps
-/// its GGUF media type, anything else is a [`sidecar_layer`].
+/// The layer of a file taken from another repository: a GGUF (text encoder,
+/// vision tower) keeps its GGUF media type, anything else is a [`sidecar_layer`].
 pub fn borrowed_layer(mut d: oci::Descriptor, file: &HfFile, role: &str) -> oci::Descriptor {
-    if role != "text_encoder" {
+    if !file.path.to_lowercase().ends_with(".gguf") {
         return sidecar_layer(d, file, role);
     }
     let name = file.path.rsplit('/').next().unwrap_or(&file.path);
@@ -745,6 +777,10 @@ pub fn diffusion_default_text_encoder(model_path: &str) -> Option<&'static str> 
         } else {
             "unsloth/Qwen3-4B-GGUF:Q8_0"
         });
+    }
+    if is_qwen_image21_file(model_path) {
+        // Qwen3-VL-8B's language model (its last hidden state)
+        return Some("unsloth/Qwen3-VL-8B-Instruct-GGUF:Q8_0");
     }
     if name.contains("ltx-2.5") || name.contains("ltx-2-5") {
         return None;
@@ -1175,6 +1211,36 @@ mod tests {
         assert_eq!(
             diffusion_default_text_encoder("flux-2-klein-4b-Q4_K_M.gguf"),
             Some("unsloth/Qwen3-4B-GGUF:Q8_0")
+        );
+    }
+
+    #[test]
+    fn qwen_image21_repo_gets_its_text_encoder_vision_tower_and_vae() {
+        let files = vec![
+            file("qwen-image-2.1-turbo-Q4_K_M.gguf", 2),
+            file("qwen-image-2.1-turbo-Q8_0.gguf", 3),
+        ];
+        assert!(is_diffusion_repo(&files));
+        let plan = diffusion_plan(&files, "qwen-image-2.1-turbo-Q8_0.gguf");
+        assert_eq!(plan.outputs, ["image"]);
+        assert_eq!(
+            plan.text_encoder,
+            Some("unsloth/Qwen3-VL-8B-Instruct-GGUF:Q8_0")
+        );
+        assert_eq!(
+            plan.external,
+            [
+                (
+                    "vision_encoder",
+                    "unsloth/Qwen3-VL-8B-Instruct-GGUF",
+                    "mmproj-F16.gguf"
+                ),
+                (
+                    "vae",
+                    "Qwen/Qwen-Image-2.1",
+                    "vae/diffusion_pytorch_model.safetensors"
+                )
+            ]
         );
     }
 

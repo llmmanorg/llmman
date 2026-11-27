@@ -226,7 +226,7 @@ pub fn check_size(p: &GenParams, flash: bool) -> Result<(i64, i64)> {
 }
 
 /// A reference image's pixels match its size.
-fn check_reference(f: &super::Frames) -> Result<()> {
+pub(super) fn check_reference(f: &super::Frames) -> Result<()> {
     if f.width <= 0 || f.height <= 0 || f.rgb.len() as i64 != f.width * f.height * 3 {
         bail!(
             "reference image: bad size {}x{} or pixel buffer",
@@ -604,7 +604,7 @@ impl Model {
         .into_iter()
         .map(|v| v * 2.0 - 1.0)
         .collect();
-        let z = flux_vae::encode_f32(&self.vae, be, &rgb, h, w)?;
+        let z = flux_vae::encode(&self.vae, be, &rgb, h, w)?;
         let (lh, lw) = (h / SCALE, w / SCALE);
         let c = self.hp.in_channels as usize;
         let n = (lh * lw) as usize;

@@ -15,7 +15,7 @@ already exists for the model format it finds, and runs it unmodified.
 | safetensors | [`mlx_lm.server`](https://github.com/ml-explore/mlx-lm) | macOS: llmman's own `uv`-installed copy, installed when the daemon starts, or the one on your `PATH` — per `--runtime`, as for `llama-server`; preferred over `vllm` |
 | GGUF diffusion (LTX-2) | llmman itself, on ggml | The `libggml`/`libllama` next to `llama-server`; see [the blog post](https://llmmanorg.github.io/blog/image-audio-and-video-generation/) |
 | GGUF diffusion (FLUX.2 [klein]) | llmman itself, on ggml | The same libraries; see [below](#flux2-klein) |
-| Diffusers safetensors (Qwen-Image 2.1) | llmman itself, on ggml | The same libraries; see [below](#qwen-image-21) |
+| Diffusers safetensors or GGUF (Qwen-Image 2.1) | llmman itself, on ggml | The same libraries; see [below](#qwen-image-21) |
 | Diffusers safetensors | [`vllm serve --omni`](https://github.com/vllm-project/vllm-omni) | Your `PATH`'s `vllm` with the `vllm-omni` package installed |
 | Diffusers safetensors | `vllm serve --omni` in a container | `--runtime docker` / `podman` (Linux only): the `vllm/vllm-omni` image (CUDA only) |
 
@@ -374,37 +374,44 @@ e.g. `v0.28.0`). `--pull-only <model>` picks it for a pulled Diffusers model.
 ### Qwen-Image 2.1
 
 `QwenImage21Pipeline` repositories (`docker.io/ai/qwen-image-2.1`,
-`Qwen/Qwen-Image-2.1`) run in llmman on the same ggml libraries, straight
-from their bf16 safetensors:
+`docker.io/ai/qwen-image-2.1-turbo`, `Qwen/Qwen-Image-2.1`,
+`Qwen/Qwen-Image-2.1-Turbo`) run in llmman on the same ggml libraries,
+straight from their bf16 safetensors, and so do the transformer GGUFs
+(`ai/qwen-image-2.1:q8_0`, `ai/qwen-image-2.1-turbo:q8_0` and the other
+quants). Their pull adds the VAE, the Qwen3-VL-8B text encoder and its vision
+tower:
 
 ```sh
 llmman run qwen-image-2.1 "A manatee in a sunlit lagoon"
+llmman run qwen-image-2.1-turbo:q8_0 "A manatee in a sunlit lagoon"
 ```
 
-Text to image only: 1024x1024, 40 steps, RGBA PNG. The text encoder and the
-transformer load on first use and take turns when both do not fit.
+1024x1024 RGBA PNGs; 40 steps, or Turbo's own 8. The GGUFs also edit: pass
+reference images as `images` on `/v1/images/generations` (they are fitted
+to the output's area). The text encoder and the transformer load on first
+use and take turns when both do not fit.
 
 ### FLUX.2 [klein]
 
-FLUX.2 [klein] 4B and 9B GGUFs (`hf.co/unsloth/FLUX.2-klein-9B-GGUF:Q8_0`)
-run in llmman on the same ggml libraries. The pull adds the FLUX.2 VAE and
-the Qwen3 text encoder (Qwen3-4B for 4B, Qwen3-8B for 9B):
+FLUX.2 [klein] 4B and 9B GGUFs (`docker.io/ai/flux.2-klein`: `4b`, `9b-q8_0`,
+`9b-base`, ...) run in llmman on the same ggml libraries. The pull adds the
+FLUX.2 VAE and the Qwen3 text encoder (Qwen3-4B for 4B, Qwen3-8B for 9B):
 
 ```sh
-llmman run hf.co/unsloth/FLUX.2-klein-9B-GGUF:Q8_0 "A manatee in a sunlit lagoon"
+llmman run flux.2-klein:9b-q8_0 "A manatee in a sunlit lagoon"
 ```
 
 Text to image and editing: pass up to 8 reference images (PNG or JPEG, base64
 or data URLs) as `images` on `/v1/images/generations`. The distilled models
 default to 4 steps without CFG, the base models to 50 steps at CFG 4. Up to
-2048x2048; reference images are scaled to the output's area, at most
-1024x1024.
+2048x2048; reference images are scaled to about the output's area, at most
+about 1024x1024 (their sides are rounded to multiples of 16).
 
 ### Seeds
 
-The ggml image models (Z-Image, FLUX.2) draw their starting noise, sigmas
-and reference image sizes the way stable-diffusion.cpp's server does, so a
-seed gives the same image in both.
+The ggml image models (Z-Image, FLUX.2, Qwen-Image 2.1) draw their starting
+noise, sigmas and reference image sizes the way stable-diffusion.cpp's
+server does, so a seed gives the same image in both.
 
 ### `vllm serve` from llmman's store
 
