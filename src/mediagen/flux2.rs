@@ -226,7 +226,7 @@ pub fn check_size(p: &GenParams, flash: bool) -> Result<(i64, i64)> {
 }
 
 /// A reference image's pixels match its size.
-fn check_reference(f: &super::Frames) -> Result<()> {
+pub(super) fn check_reference(f: &super::Frames) -> Result<()> {
     if f.width <= 0 || f.height <= 0 || f.rgb.len() as i64 != f.width * f.height * 3 {
         bail!(
             "reference image: bad size {}x{} or pixel buffer",

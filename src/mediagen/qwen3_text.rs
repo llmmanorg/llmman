@@ -1,4 +1,4 @@
-//! A Qwen3 text model from its llama.cpp GGUF, run in mediagen's own graph
+//! A Qwen3 (or Qwen3-VL language) text model from its llama.cpp GGUF, run in mediagen's own graph
 //! (`cosmos3::dit`'s decoder) rather than through llama.cpp, so that any
 //! attention mask applies: padded prompts mask their padding the way the
 //! Transformers reference does. llama.cpp only tokenizes (vocabulary only).
@@ -12,10 +12,14 @@ use super::backend::Backend;
 use super::cosmos3::{self, dit};
 use super::ffi::Api;
 use super::ltx::text::Vocab;
-use super::weights::{read_index, LoadOpts, Weights};
+use super::weights::{read_index, Index, LoadOpts, Weights};
 
-/// Qwen3's `rope_theta` (llama.cpp keeps it as a numeric KV, not read here).
+/// `rope_theta` of Qwen3 and Qwen3-VL (llama.cpp keeps it as a numeric KV,
+/// which the index does not read).
 const ROPE_THETA: f64 = 1_000_000.0;
+const VL_ROPE_THETA: f64 = 5_000_000.0;
+/// Qwen3-VL's interleaved mRoPE sections (time, height, width).
+const VL_MROPE_SECTION: [i64; 3] = [24, 20, 20];
 
 pub struct Qwen3Text {
     pub hp: cosmos3::Hparams,
@@ -48,6 +52,33 @@ pub fn tensor_name(n: &str) -> Option<String> {
     Some(format!("layers.{l}.{to}"))
 }
 
+/// The text model's hyperparameters from a `qwen3` or `qwen3vl` GGUF index.
+pub fn hparams(idx: &Index, path: &Path) -> Result<cosmos3::Hparams> {
+    let arch = idx.metadata.get("general.architecture").map(String::as_str);
+    let vl = match arch {
+        Some("qwen3") => false,
+        Some("qwen3vl") => true,
+        _ => bail!("{}: expected a qwen3 GGUF, got {arch:?}", path.display()),
+    };
+    let ne = |n: &str, i: usize| idx.dim(n, i).with_context(|| path.display().to_string());
+    let hidden = ne("token_embd.weight", 0)?;
+    let head_dim = ne("blk.0.attn_q_norm.weight", 0)?;
+    let n_layers = idx.count("blk.");
+    cosmos3::Hparams::from_config(&json!({
+        "hidden_size": hidden,
+        "num_hidden_layers": n_layers,
+        "num_attention_heads": ne("blk.0.attn_q.weight", 1)? / head_dim,
+        "num_key_value_heads": ne("blk.0.attn_k.weight", 1)? / head_dim,
+        "head_dim": head_dim,
+        "rms_norm_eps": 1e-6,
+        "rope_theta": if vl { VL_ROPE_THETA } else { ROPE_THETA },
+        // Qwen3: one position for every axis, plain 1-D RoPE; Qwen3-VL:
+        // text tokens too, image tokens their (t, h, w) grid
+        "rope_axes_dim": if vl { VL_MROPE_SECTION } else { [head_dim / 2, 0, 0] },
+        "qk_norm_for_text": true,
+    }))
+}
+
 impl Qwen3Text {
     /// `layers`: load only the first ones, for callers that never read past them.
     pub fn load(
@@ -57,27 +88,9 @@ impl Qwen3Text {
         layers: Option<usize>,
     ) -> Result<Qwen3Text> {
         let idx = read_index(path)?;
-        let arch = idx.metadata.get("general.architecture").map(String::as_str);
-        if arch != Some("qwen3") {
-            bail!("{}: expected a qwen3 GGUF, got {arch:?}", path.display());
-        }
-        let ne = |n: &str, i: usize| idx.dim(n, i).with_context(|| path.display().to_string());
-        let hidden = ne("token_embd.weight", 0)?;
-        let head_dim = ne("blk.0.attn_q_norm.weight", 0)?;
-        let n_layers = idx.count("blk.");
-        let keep = layers.map_or(n_layers, |l| (l as i64).min(n_layers));
-        let hp = cosmos3::Hparams::from_config(&json!({
-            "hidden_size": hidden,
-            "num_hidden_layers": keep,
-            "num_attention_heads": ne("blk.0.attn_q.weight", 1)? / head_dim,
-            "num_key_value_heads": ne("blk.0.attn_k.weight", 1)? / head_dim,
-            "head_dim": head_dim,
-            "rms_norm_eps": 1e-6,
-            "rope_theta": ROPE_THETA,
-            // text only: one position for every axis, plain 1-D RoPE
-            "rope_axes_dim": [head_dim / 2, 0, 0],
-            "qk_norm_for_text": true,
-        }))?;
+        let mut hp = hparams(&idx, path)?;
+        let keep = layers.map_or(hp.n_layers, |l| (l as i64).min(hp.n_layers));
+        hp.n_layers = keep;
         let w = Weights::load(
             api,
             path,

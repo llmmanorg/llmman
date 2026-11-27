@@ -545,29 +545,37 @@ impl<'a> Build<'a, '_> {
         Ok(x)
     }
 
-    /// The encoder over one chunk of pixel frames `[W, H, 3, F]` (F = 1, then 4):
-    /// the mean of the posterior, `[W/16, H/16, 48, T]`.
-    fn encoder(&mut self, img: Tensor<'a>) -> Result<Tensor<'a>> {
-        let mut x = self.patchify(img);
+    /// The encoder over one chunk of pixel frames `[W, H, C, F]` (F = 1, then 4):
+    /// the mean of the posterior, `[W/16, H/16, Z, T]`. Every down block is
+    /// residual: an `AvgDown3D` shortcut where it resamples (in time too when
+    /// it has a time conv), identity where it does not.
+    fn encoder(&mut self, img: Tensor<'a>, layout: &Layout) -> Result<Tensor<'a>> {
+        let mut x = if layout.patch {
+            self.patchify(img)
+        } else {
+            img
+        };
         x = self.cconv("encoder.conv_in", x, 1)?;
-        for b in 0..4 {
+        for b in 0.. {
             let p = format!("encoder.down_blocks.{b}");
-            let x_copy = x;
-            for r in 0..2 {
-                x = self.resnet(&format!("{p}.resnets.{r}"), x)?;
+            if !self.w.has(&format!("{p}.resnets.0.norm1.gamma")) {
+                break;
             }
-            match b {
-                0 => {
-                    x = self.downsample(&format!("{p}.downsampler"), x, false)?;
-                    let short = self.avg_down(x_copy, false);
-                    x = self.g().add(x, short);
+            let x_copy = x;
+            for r in 0.. {
+                let rp = format!("{p}.resnets.{r}");
+                if !self.w.has(&format!("{rp}.norm1.gamma")) {
+                    break;
                 }
-                1 | 2 => {
-                    x = self.downsample(&format!("{p}.downsampler"), x, true)?;
-                    let short = self.avg_down(x_copy, true);
-                    x = self.g().add(x, short);
-                }
-                _ => x = self.g().add(x, x_copy),
+                x = self.resnet(&rp, x)?;
+            }
+            if self.w.has(&format!("{p}.downsampler.resample.1.weight")) {
+                let time = self.w.has(&format!("{p}.downsampler.time_conv.weight"));
+                x = self.downsample(&format!("{p}.downsampler"), x, time)?;
+                let short = self.avg_down(x_copy, time);
+                x = self.g().add(x, short);
+            } else {
+                x = self.g().add(x, x_copy);
             }
         }
         x = self.resnet("encoder.mid_block.resnets.0", x)?;
@@ -575,11 +583,11 @@ impl<'a> Build<'a, '_> {
         x = self.resnet("encoder.mid_block.resnets.1", x)?;
         let x = self.norm(x, "encoder.norm_out.gamma")?;
         let x = self.cconv("encoder.conv_out", self.g().silu(x), 1)?;
-        let x = self.conv1("quant_conv", x)?; // [w, h, 96, t]: mean, then log-variance
+        let x = self.conv1("quant_conv", x)?; // [w, h, 2z, t]: mean, then log-variance
         let g = self.g();
-        let [w, h, _, t] = x.shape();
+        let [w, h, z2, t] = x.shape();
         let nb = x.strides();
-        Ok(g.cont(g.view_4d(x, w, h, 48, t, nb[1], nb[2], nb[3], 0)))
+        Ok(g.cont(g.view_4d(x, w, h, z2 / 2, t, nb[1], nb[2], nb[3], 0)))
     }
 
     fn decoder(&mut self, z: Tensor<'a>, layout: &Layout) -> Result<Tensor<'a>> {
@@ -713,9 +721,11 @@ pub fn decode(
     Ok(out)
 }
 
-/// Encodes RGB frames (`[f][h][w][3]`, in `[-1, 1]`, `F = 4k + 1`) to the posterior
-/// mean, one latent frame `[48][H/16][W/16]` per 4 pixel frames after the first,
-/// chunked as the reference does (frame 0 alone, then groups of 4).
+/// Encodes frames of `ch` channels (`[f][h][w][ch]`, in `[-1, 1]`, `F = 4k + 1`;
+/// RGB, or RGBA for Qwen-Image 2.1) to the posterior mean, one latent frame
+/// `[Z][H/16][W/16]` per 4 pixel frames after the first, chunked as the
+/// reference does (frame 0 alone, then groups of 4).
+#[allow(clippy::too_many_arguments)]
 pub fn encode(
     w: &Weights,
     be: &Backend,
@@ -723,6 +733,8 @@ pub fn encode(
     frames: i64,
     h: i64,
     wd: i64,
+    ch: usize,
+    layout: &Layout,
 ) -> Result<Vec<Vec<f32>>> {
     if frames < 1 || (frames - 1) % 4 != 0 {
         bail!("the encoder takes 4k + 1 frames, got {frames}");
@@ -735,20 +747,20 @@ pub fn encode(
     let mut first = true;
     while (f0 as i64) < frames {
         let n = if first { 1 } else { 4 };
-        // [f][h][w][3] -> ggml [W, H, 3, n]
-        let mut x = vec![0f32; wu * hu * 3 * n];
+        // [f][h][w][ch] -> ggml [W, H, ch, n]
+        let mut x = vec![0f32; wu * hu * ch * n];
         for fi in 0..n {
             for y in 0..hu {
                 for xx in 0..wu {
-                    for ch in 0..3 {
-                        x[xx + wu * (y + hu * (ch + 3 * fi))] =
-                            rgb[(((f0 + fi) * hu + y) * wu + xx) * 3 + ch];
+                    for c in 0..ch {
+                        x[xx + wu * (y + hu * (c + ch * fi))] =
+                            rgb[(((f0 + fi) * hu + y) * wu + xx) * ch + c];
                     }
                 }
             }
         }
         let gr = Graph::new(be.api, 16 * 1024)?;
-        let img = gr.input_f32(&[wd, h, 3, n as i64], &x, "img");
+        let img = gr.input_f32(&[wd, h, ch as i64, n as i64], &x, "img");
         let mut b = Build {
             gr: &gr,
             w,
@@ -758,7 +770,7 @@ pub fn encode(
             filled: Vec::new(),
             first_chunk: first,
         };
-        let z = b.encoder(img)?;
+        let z = b.encoder(img, layout)?;
         b.gr.mark_output(z);
         let filled = std::mem::take(&mut b.filled);
         drop(b);

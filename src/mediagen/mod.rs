@@ -14,6 +14,7 @@ pub mod flux_vae;
 pub mod http;
 pub mod ltx;
 pub mod qwen3_text;
+pub mod qwen3_vision;
 pub mod qwen_image;
 pub mod server;
 pub mod wan_vae;
@@ -40,6 +41,8 @@ pub struct ContextParams {
     pub text_proj: Option<PathBuf>,
     /// Text encoder GGUF; LTX needs one, Cosmos3 has none.
     pub text_model: Option<PathBuf>,
+    /// The text encoder's vision tower GGUF (Qwen-Image 2.1 edits).
+    pub vision_model: Option<PathBuf>,
     /// Every named file of the model pack (`vae/config.json`, `tokenizer.json`, ...).
     pub files: BTreeMap<String, PathBuf>,
     pub use_gpu: bool,
@@ -230,6 +233,7 @@ fn is_ltx(arch: &str) -> bool {
 pub fn is_diffusion_model(path: &Path) -> bool {
     weights::read_index(path).ok().is_some_and(|i| {
         flux2::is_flux2(&i)
+            || qwen_image::is_qwen_image21(&i)
             || i.metadata
                 .get("general.architecture")
                 .is_some_and(|a| is_ltx(a) || cosmos3::is_cosmos3(a) || zimage::is_zimage(a))
@@ -239,12 +243,18 @@ pub fn is_diffusion_model(path: &Path) -> bool {
 /// Environment the backend process running `path` needs, set by its parent
 /// (setting it here, with the runtime's threads up, would race their reads).
 ///
-/// FLUX.2: ggml's Metal graph optimizer (node reordering for concurrency)
-/// miscomputes the transformer graph into noise on Apple GPUs, while the
-/// same graph is right on CPU and with the optimizer off (M3 Max, llama.cpp
-/// b12359), at no measurable cost; one process hosts one model.
+/// FLUX.2 and Qwen-Image 2.1: ggml's Metal graph optimizer (node reordering
+/// for concurrency) miscomputes their transformer graphs into noise on Apple
+/// GPUs, while the same graphs are right on CPU and with the optimizer off
+/// (M3 Max, llama.cpp b12359), at no measurable cost; one process hosts one
+/// model.
 pub fn backend_env(path: &Path) -> &'static [(&'static str, &'static str)] {
-    if cfg!(target_os = "macos") && weights::read_index(path).is_ok_and(|i| flux2::is_flux2(&i)) {
+    let affected = || {
+        qwen_image::is_pipeline_index(path)
+            || weights::read_index(path)
+                .is_ok_and(|i| flux2::is_flux2(&i) || qwen_image::is_qwen_image21(&i))
+    };
+    if cfg!(target_os = "macos") && affected() {
         &[("GGML_METAL_GRAPH_OPTIMIZE_DISABLE", "1")]
     } else {
         &[]
@@ -440,6 +450,19 @@ impl Context {
             )?;
             be.release_compute()?;
             Inner::ZImage(Box::new(m))
+        } else if qwen_image::is_qwen_image21(&idx) {
+            let m = qwen_image::Model::load_gguf(
+                api,
+                &be,
+                &idx,
+                &p.model,
+                p.vae.as_deref(),
+                p.text_model.as_deref(),
+                p.vision_model.as_deref(),
+                p.flash_attn,
+            )?;
+            be.release_compute()?;
+            Inner::QwenImage(Box::new(m))
         } else if flux2::is_flux2(&idx) {
             let m = flux2::Model::load(
                 api,
@@ -467,7 +490,11 @@ impl Context {
 
     /// Takes reference images (`GenParams::ref_images`) for image generation.
     pub fn supports_reference_images(&self) -> bool {
-        matches!(self.inner, Inner::Flux2(_))
+        match &self.inner {
+            Inner::Flux2(_) => true,
+            Inner::QwenImage(m) => m.supports_refs(),
+            _ => false,
+        }
     }
 
     pub fn supports_video(&self) -> bool {
@@ -501,7 +528,7 @@ impl Context {
         match &self.inner {
             Inner::Ltx(_) => 0,
             Inner::Cosmos3(_) => cosmos3::DEFAULT_STEPS,
-            Inner::QwenImage(_) => qwen_image::DEFAULT_STEPS,
+            Inner::QwenImage(m) => m.default_steps(),
             Inner::ZImage(_) => zimage::DEFAULT_STEPS,
             Inner::Flux2(m) => m.default_steps(),
         }
@@ -523,6 +550,7 @@ impl Context {
                 let flash = m.flash();
                 Box::new(move |p| flux2::check_size(p, flash).map(drop))
             }
+            Inner::QwenImage(_) => Box::new(qwen_image::check_refs),
             _ => Box::new(|_| Ok(())),
         }
     }

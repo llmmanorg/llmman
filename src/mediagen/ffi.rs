@@ -389,6 +389,7 @@ api! {
     fn ggml_silu(ctx: *mut GgmlContext, a: TensorPtr) -> TensorPtr;
     fn ggml_relu(ctx: *mut GgmlContext, a: TensorPtr) -> TensorPtr;
     fn ggml_gelu(ctx: *mut GgmlContext, a: TensorPtr) -> TensorPtr;
+    fn ggml_gelu_erf(ctx: *mut GgmlContext, a: TensorPtr) -> TensorPtr;
     fn ggml_sigmoid(ctx: *mut GgmlContext, a: TensorPtr) -> TensorPtr;
     fn ggml_tanh(ctx: *mut GgmlContext, a: TensorPtr) -> TensorPtr;
     fn ggml_sin(ctx: *mut GgmlContext, a: TensorPtr) -> TensorPtr;

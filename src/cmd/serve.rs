@@ -4934,6 +4934,7 @@ async fn mediagen_backend(
         audio_vae: paths.audio_vae.clone(),
         text_proj: paths.text_proj.clone(),
         text_model: paths.text_encoder.clone(),
+        vision_model: paths.vision_encoder.clone(),
         files: paths.files.clone(),
         use_gpu: true,
         // llama.cpp's own env var for -ngl

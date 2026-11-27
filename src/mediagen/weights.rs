@@ -63,7 +63,13 @@ impl Index {
 
     /// How many numbered blocks `{prefix}{k}.` there are: the largest `k` + 1.
     pub fn count(&self, prefix: &str) -> i64 {
-        self.tensors
+        self.numbered(prefix).last().map_or(0, |m| m + 1)
+    }
+
+    /// The numbers `k` of the blocks `{prefix}{k}.`, ascending.
+    pub fn numbered(&self, prefix: &str) -> Vec<i64> {
+        let mut v: Vec<i64> = self
+            .tensors
             .iter()
             .filter_map(|d| {
                 d.name
@@ -73,8 +79,10 @@ impl Index {
                     .parse::<i64>()
                     .ok()
             })
-            .max()
-            .map_or(0, |m| m + 1)
+            .collect();
+        v.sort_unstable();
+        v.dedup();
+        v
     }
 }
 

@@ -189,6 +189,34 @@ pub fn sdpa_gqa<'g>(
     }
 }
 
+/// `(start, len)` runs of at most `chunk` queries covering `start..end`.
+pub fn query_chunks(start: i64, end: i64, chunk: i64) -> impl Iterator<Item = (i64, i64)> {
+    (start..end)
+        .step_by(chunk as usize)
+        .map(move |s| (s, chunk.min(end - s)))
+}
+
+/// Attention in query chunks, so a long sequence's dense scores need not fit
+/// at once: `attend(queries, i)` for each `(start, len)` of `chunks`
+/// (consecutive columns of `q`, `[dim, n]`), concatenated in order.
+pub fn attend_in_chunks<'g>(
+    g: &'g Graph<'g>,
+    q: Tensor<'g>,
+    chunks: impl IntoIterator<Item = (i64, i64)>,
+    mut attend: impl FnMut(Tensor<'g>, usize) -> Tensor<'g>,
+) -> Tensor<'g> {
+    let (dim, nb) = (q.shape()[0], q.strides()[1]);
+    let mut out: Option<Tensor<'g>> = None;
+    for (i, (s, c)) in chunks.into_iter().enumerate() {
+        let part = attend(g.view_2d(q, dim, c, nb, s as usize * nb), i);
+        out = Some(match out {
+            Some(prev) => g.concat(prev, part, 1),
+            None => part,
+        });
+    }
+    out.expect("at least one query")
+}
+
 /// `silu(gate) * up`.
 pub fn swiglu<'g>(g: &'g Graph<'g>, gate: Tensor<'g>, up: Tensor<'g>) -> Tensor<'g> {
     g.mul(g.silu(gate), up)
@@ -224,7 +252,30 @@ fn text_decoder<'g>(
 ) -> Result<Tensor<'g>> {
     check_prompt_len(ids.len())?;
     let mask = causal_mask(ids.len() as i64);
-    text_decoder_ext(hp, w, gr, ids, &mask, hp.n_layers, on_layer, |_, _| {})
+    text_decoder_ext(
+        hp,
+        w,
+        gr,
+        ids,
+        &mask,
+        None,
+        hp.n_layers,
+        on_layer,
+        |_, _| {},
+    )
+}
+
+/// Image tokens of a Qwen3-VL prompt: what replaces their embeddings, where
+/// they sit, and the DeepStack features added after the first layers.
+pub struct VisionInputs {
+    /// `[n][hidden]`: image embeddings at image tokens, zero elsewhere.
+    pub embeds: Vec<f32>,
+    /// `[n]`: 1 for a text token, 0 for an image token.
+    pub keep: Vec<f32>,
+    /// `[n][hidden]` per layer from the first: zero but at image tokens.
+    pub deepstack: Vec<Vec<f32>>,
+    /// `(t, h, w)` mRoPE positions of every token.
+    pub positions: Vec<[f64; 3]>,
 }
 
 /// [`text_decoder`] with an explicit `[Tk, Tq]` mask, stopping after
@@ -237,6 +288,7 @@ fn text_decoder_ext<'g>(
     gr: &'g Graph<'g>,
     ids: &[u32],
     mask: &[f32],
+    vision: Option<&VisionInputs>,
     n_layers: i64,
     mut on_layer: impl FnMut(&'g Graph<'g>, Tensor<'g>, Tensor<'g>),
     mut on_hidden: impl FnMut(usize, Tensor<'g>),
@@ -245,7 +297,10 @@ fn text_decoder_ext<'g>(
     let n = ids.len() as i64;
     let ids_i32: Vec<i32> = ids.iter().map(|&i| i as i32).collect();
     let ids_t = gr.input_i32(&[n], &ids_i32, "ids");
-    let (cos, sin) = mrope_tables(hp, &text_positions(n));
+    let (cos, sin) = match vision {
+        Some(v) => mrope_tables(hp, &v.positions),
+        None => mrope_tables(hp, &text_positions(n)),
+    };
     let half = hp.head_dim / 2;
     let cos_t = gr.input_f32(&[half, n], &cos, "cos");
     let sin_t = gr.input_f32(&[half, n], &sin, "sin");
@@ -258,6 +313,17 @@ fn text_decoder_ext<'g>(
     let eps = hp.rms_eps;
     let hd = hp.head_dim;
     let mut x = g.get_rows(w.get("embed_tokens.weight")?, ids_t);
+    let mut deepstack = Vec::new();
+    if let Some(v) = vision {
+        let keep = gr.input_f32(&[1, n], &v.keep, "keep");
+        x = g.add(
+            g.mul(x, keep),
+            gr.input_f32(&[hp.hidden, n], &v.embeds, "image_embeds"),
+        );
+        for (i, d) in v.deepstack.iter().enumerate() {
+            deepstack.push(gr.input_f32(&[hp.hidden, n], d, &format!("deepstack{i}")));
+        }
+    }
     for l in 0..n_layers.min(hp.n_layers) {
         let p = format!("layers.{l}");
         let h = rms(
@@ -305,13 +371,16 @@ fn text_decoder_ext<'g>(
             Some(w.get(&format!("{p}.post_attention_layernorm.weight"))?),
         );
         x = g.add(x, mlp(g, w, &format!("{p}.mlp"), h2, hp.relu2)?);
+        if let Some(&d) = deepstack.get(l as usize) {
+            x = g.add(x, d);
+        }
         on_hidden(l as usize + 1, x);
     }
     Ok(x)
 }
 
 /// Prompts run with an `n x n` mask: 1 to [`MAX_PROMPT_TOKENS`] tokens.
-fn check_prompt_len(n: usize) -> Result<()> {
+pub fn check_prompt_len(n: usize) -> Result<()> {
     if n == 0 || n as i64 > MAX_PROMPT_TOKENS {
         bail!("the prompt must be 1 to {MAX_PROMPT_TOKENS} tokens, got {n}");
     }
@@ -351,10 +420,29 @@ pub fn und_forward(hp: &Hparams, w: &Weights, be: &Backend, ids: &[u32]) -> Resu
     })
 }
 
-/// A Qwen3-VL text model's last hidden states `[n][hidden]`, before the final norm.
-pub fn text_hidden(hp: &Hparams, w: &Weights, be: &Backend, ids: &[u32]) -> Result<Vec<f32>> {
+/// A Qwen3-VL text model's last hidden states `[n][hidden]`, before the final
+/// norm, over a causal prompt with or without image tokens.
+pub fn text_hidden(
+    hp: &Hparams,
+    w: &Weights,
+    be: &Backend,
+    ids: &[u32],
+    vision: Option<&VisionInputs>,
+) -> Result<Vec<f32>> {
+    check_prompt_len(ids.len())?;
     let gr = text_graph(be, hp)?;
-    let x = text_decoder(hp, w, &gr, ids, |_, _, _| {})?;
+    let mask = causal_mask(ids.len() as i64);
+    let x = text_decoder_ext(
+        hp,
+        w,
+        &gr,
+        ids,
+        &mask,
+        vision,
+        hp.n_layers,
+        |_, _, _| {},
+        |_, _| {},
+    )?;
     let x = gr.cont(x);
     gr.mark_output(x);
     gr.compute(be)?;
@@ -394,6 +482,7 @@ pub fn text_hidden_states(
         &gr,
         ids,
         mask,
+        None,
         last as i64,
         |_, _, _| {},
         |i, x| {

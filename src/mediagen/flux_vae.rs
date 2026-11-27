@@ -173,18 +173,11 @@ impl<'g> Dec<'g> {
         let (q, k, v) = (proj("q")?, proj("k")?, proj("v")?);
         // F32 attention (flash attention's F16 keys/values can overflow here), in query chunks
         // so the score matrix stays at ATTN_CHUNK x tokens (1 GiB at 2048x2048, not 16 GiB)
-        let n = w * h;
-        let nb = q.strides()[1];
-        let mut a: Option<Tensor<'g>> = None;
-        for s in (0..n).step_by(ATTN_CHUNK as usize) {
-            let qs = g.view_2d(q, c, ATTN_CHUNK.min(n - s), nb, s as usize * nb);
-            let part = super::cosmos3::dit::sdpa_gqa(g, qs, k, v, 1, 1, None, false);
-            a = Some(match a {
-                Some(prev) => g.concat(prev, part, 1),
-                None => part,
-            });
-        }
-        let a = a.expect("at least one token");
+        use super::cosmos3::dit::{attend_in_chunks, query_chunks, sdpa_gqa};
+        let chunks = query_chunks(0, w * h, ATTN_CHUNK);
+        let a = attend_in_chunks(g, q, chunks, |qs, _| {
+            sdpa_gqa(g, qs, k, v, 1, 1, None, false)
+        });
         let ko = self.w.get(&format!("{p}.proj_out.weight"))?;
         let bo = self.w.get(&format!("{p}.proj_out.bias"))?;
         let o = g.linear(a, g.reshape_2d(ko, c, c), Some(bo));
