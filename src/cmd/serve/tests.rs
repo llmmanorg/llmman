@@ -2,7 +2,7 @@ use super::anthropic::relay_anthropic_messages;
 use super::backend::would_use_mlx;
 use super::hybrid::{request_pin, resolve_hybrid_side, with_hybrid_fallback};
 use super::openai::{
-    apply_default_repeat_penalty, decode_f32s, encode_f32s, handle_tts,
+    apply_default_repeat_penalty, decode_f32s, encode_f32s, handle_tts, proxy_openai_generation_to,
     DEFAULT_TRANSCRIPTION_PROMPT, EFFORT_BUDGET_MESSAGE,
 };
 use super::refusal::{explain_missing_route, unsupported_on_wire};
@@ -461,6 +461,199 @@ async fn remote_responses_falls_back_only_on_a_missing_or_broken_route() {
         // own headers reach the client either way.
         assert!(headers.contains_key("x-provider"), "{native}");
     }
+}
+
+/// A local engine's `/v1/chat/completions`, its only route: keeps the
+/// request it was sent and streams one call to `muse_write_file`.
+async fn fake_local_chat() -> (u16, Arc<std::sync::Mutex<Option<serde_json::Value>>>) {
+    use axum::routing::post;
+    let seen = Arc::new(std::sync::Mutex::new(None));
+    let keep = seen.clone();
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(move |Json(body): Json<serde_json::Value>| {
+            let keep = keep.clone();
+            async move {
+                *keep.lock().unwrap() = Some(body);
+                (
+                    [("content-type", "text/event-stream")],
+                    "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"muse_write_file\",\"arguments\":\"{\\\"path\\\":\\\"a.txt\\\"}\"}}]},\"finish_reason\":null}]}\n\n\
+                     data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n\
+                     data: {\"choices\":[],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":1}}\n\n\
+                     data: [DONE]\n\n",
+                )
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (port, seen)
+}
+
+/// A local `/v1/responses` request reaches the engine as a chat completion,
+/// with the three things llama-server's own route breaks on: a `namespace`
+/// tool, a `reasoning` item without `content`, and streamed events that
+/// need a `sequence_number`. The engine's own settings come along.
+#[tokio::test]
+async fn a_local_responses_request_is_translated_to_a_chat_completion() {
+    let req = serde_json::json!({
+        "model": "qwen3.5:0.8b",
+        "stream": true,
+        "repeat_penalty": 1.3,
+        "top_k": 20,
+        "reasoning_budget_tokens": 64,
+        "reasoning": {"effort": "none"},
+        "store": false,
+        "instructions": "You are Muse Code.",
+        "tools": [{
+            "type": "namespace",
+            "name": "muse",
+            "description": "Muse Code tool set.",
+            "tools": [
+                {"type": "function", "name": "read_file", "parameters": {"type": "object"}},
+                {"type": "function", "name": "write_file", "parameters": {"type": "object"}}
+            ]
+        }],
+        "input": [
+            {"type": "message", "role": "developer", "content": "Work in /tmp."},
+            {"type": "message", "role": "user", "content": "write a.txt"},
+            {"type": "reasoning", "id": "rs_1", "encrypted_content": "", "summary": []},
+            {"type": "function_call", "call_id": "call_0", "name": "write_file", "namespace": "muse", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "call_0", "output": "wrote 0 bytes"}
+        ]
+    });
+    let (port, seen) = fake_local_chat().await;
+    let state = test_state();
+    let resp = proxy_openai_generation_to(
+        &state,
+        &HeaderMap::new(),
+        req,
+        RESPONSES_ROUTE,
+        "qwen3.5:0.8b",
+        "qwen3.5:0.8b".to_string(),
+        Target::Local(port),
+        ActivityGuard::new(&state, "qwen3.5:0.8b"),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("{:#}", e.0));
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body = String::from_utf8_lossy(&body);
+
+    let sent = seen.lock().unwrap().clone().expect("the engine was asked");
+    let offered: Vec<&str> = sent["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["function"]["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(offered, ["muse_read_file", "muse_write_file"]);
+    let messages = sent["messages"].as_array().unwrap();
+    let roles: Vec<&str> = messages
+        .iter()
+        .map(|m| m["role"].as_str().unwrap())
+        .collect();
+    assert_eq!(roles, ["system", "user", "assistant", "tool"], "{sent:#}");
+    assert_eq!(
+        messages[2]["tool_calls"][0]["function"]["name"],
+        "muse_write_file"
+    );
+    assert_eq!(sent["repeat_penalty"], 1.3);
+    assert_eq!(sent["top_k"], 20);
+    assert_eq!(sent["reasoning_budget_tokens"], 64);
+    assert_eq!(sent["chat_template_kwargs"]["enable_thinking"], false);
+    assert!(sent.get("store").is_none(), "{sent:#}");
+    assert!(sent.get("input").is_none(), "{sent:#}");
+
+    let events: Vec<serde_json::Value> = body
+        .lines()
+        .filter_map(|l| l.strip_prefix("data: "))
+        .map(|d| serde_json::from_str(d).unwrap())
+        .collect();
+    let numbers: Vec<u64> = events
+        .iter()
+        .map(|e| e["sequence_number"].as_u64().expect("numbered"))
+        .collect();
+    assert_eq!(numbers, (0..events.len() as u64).collect::<Vec<_>>());
+    let call = events
+        .iter()
+        .find(|e| e["type"] == "response.output_item.done" && e["item"]["type"] == "function_call")
+        .expect("a function_call item");
+    assert_eq!(call["item"]["name"], "write_file", "{body}");
+    assert_eq!(call["item"]["namespace"], "muse", "{body}");
+    assert_eq!(call["item"]["arguments"], r#"{"path":"a.txt"}"#);
+}
+
+/// Nothing is stored to resolve `previous_response_id` against, so a local
+/// request naming one is refused before the engine is asked.
+#[tokio::test]
+async fn a_local_responses_request_with_a_previous_response_id_is_refused() {
+    let (port, seen) = fake_local_chat().await;
+    let state = test_state();
+    let req = serde_json::json!({
+        "model": "qwen3.5:0.8b",
+        "input": "and then?",
+        "previous_response_id": "resp_1"
+    });
+    let Err(err) = proxy_openai_generation_to(
+        &state,
+        &HeaderMap::new(),
+        req,
+        RESPONSES_ROUTE,
+        "qwen3.5:0.8b",
+        "qwen3.5:0.8b".to_string(),
+        Target::Local(port),
+        ActivityGuard::new(&state, "qwen3.5:0.8b"),
+    )
+    .await
+    else {
+        panic!("previous_response_id was accepted");
+    };
+    assert_eq!(err.1, StatusCode::BAD_REQUEST);
+    assert!(format!("{:#}", err.0).contains("previous_response_id"));
+    assert!(seen.lock().unwrap().is_none(), "the engine was asked");
+}
+
+/// A peer daemon translates for its own engine, so it gets the request as
+/// the client sent it, `namespace` tool included.
+#[tokio::test]
+async fn a_peer_gets_a_responses_request_as_sent() {
+    let (origin, seen) = mock_peer(node(0, &[], &[])).await;
+    let state = test_state();
+    let req = serde_json::json!({
+        "model": "qwen3.5:0.8b",
+        "input": "hi",
+        "tools": [{
+            "type": "namespace",
+            "name": "muse",
+            "tools": [{"type": "function", "name": "read_file"}]
+        }]
+    });
+    let target = Target::Peer(Arc::new(PeerTarget {
+        origin,
+        api_key: None,
+    }));
+    proxy_openai_generation_to(
+        &state,
+        &HeaderMap::new(),
+        req,
+        RESPONSES_ROUTE,
+        "qwen3.5:0.8b",
+        "qwen3.5:0.8b".to_string(),
+        target,
+        ActivityGuard::new(&state, "qwen3.5:0.8b"),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("{:#}", e.0));
+    let seen = seen.lock().await;
+    let (path, _, body) = seen.last().expect("the peer was asked");
+    assert_eq!(path, RESPONSES_ROUTE);
+    let body: serde_json::Value = serde_json::from_slice(body).unwrap();
+    assert_eq!(body["tools"][0]["type"], "namespace", "{body:#}");
+    assert!(body.get("messages").is_none(), "{body:#}");
 }
 
 /// A page the user merely visits can POST here — CORS gates reading
@@ -6571,38 +6764,27 @@ fn llama_server_standin() -> Router {
                 if req["stream"] != true {
                     return completion().into_response();
                 }
-                let chunk = |content: &str| {
+                let chunk = |content: &str, finish: Option<&str>| {
                     let chunk = serde_json::json!({
                         "id": "chatcmpl-1",
                         "object": "chat.completion.chunk",
                         "model": BACKEND_MODEL_PATH,
-                        "choices": [{ "index": 0, "delta": { "content": content } }],
+                        "choices": [{
+                            "index": 0,
+                            "delta": { "content": content },
+                            "finish_reason": finish,
+                        }],
                     });
                     format!("data: {chunk}\n\n")
                 };
-                sse(format!("{}{}data: [DONE]\n\n", chunk("Hel"), chunk("lo")))
-            }),
-        )
-        .route("/v1/completions", post(move || async move { completion() }))
-        .route(
-            "/v1/responses",
-            post(move |Json(req): Json<serde_json::Value>| async move {
-                let response = serde_json::json!({
-                    "id": "resp_1", "object": "response",
-                    "model": BACKEND_MODEL_PATH, "status": "completed",
-                });
-                if req["stream"] != true {
-                    return Json(response).into_response();
-                }
-                // The model rides inside `response`, as Codex reads it.
-                let created =
-                    serde_json::json!({ "type": "response.created", "response": response });
                 sse(format!(
-                    "event: response.created\ndata: {created}\n\n\
-                     event: response.output_text.delta\ndata: {{\"delta\":\"Hi\"}}\n\n"
+                    "{}{}data: [DONE]\n\n",
+                    chunk("Hel", None),
+                    chunk("lo", Some("stop"))
                 ))
             }),
         )
+        .route("/v1/completions", post(move || async move { completion() }))
         .route(
             "/v1/embeddings",
             post(|Json(req): Json<serde_json::Value>| async move {

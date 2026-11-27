@@ -25,7 +25,8 @@ use super::relay::{
     stream_rewriting_model,
 };
 use super::responses::{
-    is_responses_route, remote_responses, sanitize_responses_request, RESPONSES_ROUTE,
+    carry_engine_fields, is_responses_route, relay_translated, remote_responses,
+    sanitize_responses_request, translate_request, RESPONSES_ROUTE,
 };
 use super::sched::{begin_activity, resolve_keep_alive, ActivityGuard};
 use super::types::*;
@@ -606,7 +607,7 @@ pub(super) async fn proxy_openai_generation(
 /// [`proxy_openai_generation`] against one resolved target; the reply
 /// names `model_ref`, the model as the client wrote it.
 #[allow(clippy::too_many_arguments)]
-async fn proxy_openai_generation_to(
+pub(super) async fn proxy_openai_generation_to(
     state: &AppState,
     headers: &HeaderMap,
     req: serde_json::Value,
@@ -642,8 +643,23 @@ async fn proxy_openai_generation_to(
         let upstream = send_chat_completion(&state.0.client, &target, &req, &reply_model).await?;
         return Ok(relay_chat_upstream(upstream, activity));
     }
-    if is_responses_route(llama_path) && !target.is_remote() {
-        sanitize_responses_request(&mut req);
+    // A local engine gets a chat completion: llama-server's own Responses
+    // route breaks clients that follow the API strictly, and mlx_lm.server
+    // has none. A peer translates for its own engine.
+    if llama_path == RESPONSES_ROUTE && matches!(target, Target::Local(_)) {
+        let mut chat_req = translate_request(&req)?;
+        carry_engine_fields(&req, &mut chat_req);
+        apply_default_repeat_penalty(&mut chat_req);
+        adjust_local_chat_request(state, &target, &mut chat_req).await;
+        return relay_translated(
+            &state.0.client,
+            &target,
+            &req,
+            chat_req,
+            activity,
+            reply_model,
+        )
+        .await;
     }
     if (llama_path == CHAT_COMPLETIONS_ROUTE || llama_path == "/v1/completions")
         && asks_for_usage(state, &target).await
@@ -658,13 +674,7 @@ async fn proxy_openai_generation_to(
         _ => {
             apply_default_repeat_penalty(&mut req);
             if llama_path == CHAT_COMPLETIONS_ROUTE {
-                apply_reasoning_effort(&mut req);
-                if req.get("reasoning_effort").is_some() {
-                    if let Some(message) = effort_budget_for(state, &target).await {
-                        apply_effort_budget(&mut req, message);
-                    }
-                }
-                consolidate_chat_system_messages(&mut req);
+                adjust_local_chat_request(state, &target, &mut req).await;
             }
         }
     }
@@ -694,6 +704,20 @@ async fn proxy_openai_generation_to(
         .await
     }?;
     Ok(explain_missing_route(&target, llama_path, resp))
+}
+
+/// What llmman adds to a local chat completion: `reasoning_effort` in the
+/// form the model's template reads, a thinking budget at `minimal` and `low`
+/// where the template only turns thinking on or off, and one merged system
+/// message.
+async fn adjust_local_chat_request(state: &AppState, target: &Target, req: &mut serde_json::Value) {
+    apply_reasoning_effort(req);
+    if req.get("reasoning_effort").is_some() {
+        if let Some(message) = effort_budget_for(state, target).await {
+            apply_effort_budget(req, message);
+        }
+    }
+    consolidate_chat_system_messages(req);
 }
 
 /// Whether a stream's usage has to be asked for. Not of llama-server
