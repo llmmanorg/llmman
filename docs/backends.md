@@ -393,19 +393,19 @@ use and take turns when both do not fit.
 
 ### FLUX.2 [klein]
 
-FLUX.2 [klein] 4B and 9B GGUFs (`hf.co/unsloth/FLUX.2-klein-9B-GGUF:Q8_0`)
-run in llmman on the same ggml libraries. The pull adds the FLUX.2 VAE and
-the Qwen3 text encoder (Qwen3-4B for 4B, Qwen3-8B for 9B):
+FLUX.2 [klein] 4B and 9B GGUFs (`docker.io/ai/flux.2-klein`: `4b`, `9b-q8_0`,
+`9b-base`, ...) run in llmman on the same ggml libraries. The pull adds the
+FLUX.2 VAE and the Qwen3 text encoder (Qwen3-4B for 4B, Qwen3-8B for 9B):
 
 ```sh
-llmman run hf.co/unsloth/FLUX.2-klein-9B-GGUF:Q8_0 "A manatee in a sunlit lagoon"
+llmman run flux.2-klein:9b-q8_0 "A manatee in a sunlit lagoon"
 ```
 
 Text to image and editing: pass up to 8 reference images (PNG or JPEG, base64
 or data URLs) as `images` on `/v1/images/generations`. The distilled models
 default to 4 steps without CFG, the base models to 50 steps at CFG 4. Up to
-2048x2048; reference images are scaled to the output's area, at most
-1024x1024.
+2048x2048; reference images are scaled to about the output's area, at most
+about 1024x1024 (their sides are rounded to multiples of 16).
 
 ### Seeds
 

@@ -604,7 +604,7 @@ impl Model {
         .into_iter()
         .map(|v| v * 2.0 - 1.0)
         .collect();
-        let z = flux_vae::encode_f32(&self.vae, be, &rgb, h, w)?;
+        let z = flux_vae::encode(&self.vae, be, &rgb, h, w)?;
         let (lh, lw) = (h / SCALE, w / SCALE);
         let c = self.hp.in_channels as usize;
         let n = (lh * lw) as usize;
