@@ -397,7 +397,14 @@ llmman run hf.co/unsloth/FLUX.2-klein-9B-GGUF:Q8_0 "A manatee in a sunlit lagoon
 Text to image and editing: pass up to 8 reference images (PNG or JPEG, base64
 or data URLs) as `images` on `/v1/images/generations`. The distilled models
 default to 4 steps without CFG, the base models to 50 steps at CFG 4. Up to
-2048x2048; reference images are scaled to at most 1024x1024.
+2048x2048; reference images are scaled to the output's area, at most
+1024x1024.
+
+### Seeds
+
+The ggml image models (Z-Image, FLUX.2) draw their starting noise, sigmas
+and reference image sizes the way stable-diffusion.cpp's server does, so a
+seed gives the same image in both.
 
 ### `vllm serve` from llmman's store
 
