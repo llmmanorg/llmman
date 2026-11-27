@@ -1476,31 +1476,58 @@ async fn omni_videos(
 /// `GET /v1/videos/:id[/content]`: a completed video lives in the
 /// backend that generated it, and the job id names no model — so this
 /// asks every running local backend in turn and relays the first answer
-/// that is not a 404.
+/// that is not a 404, else the videos kept for workers unloaded for another
+/// model (see the `media` module).
 pub(super) async fn handle_openai_video_get(
     State(state): State<AppState>,
     axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
 ) -> Result<Response, AppError> {
-    let ports: Vec<u16> = {
-        let mgr = state.0.manager.lock().await;
-        mgr.running.values().map(|m| m.port).collect()
+    // a worker handing its videos over is out of `running` before they are
+    // in the stash: wait for it (the guard is dropped before the body streams)
+    let _handover = state.0.video_handover.read().await;
+    // the image and video workers are claimed while they answer, so none is
+    // unloaded for another model mid-download
+    let (ports, mut claims) = {
+        let mut mgr = state.0.manager.lock().await;
+        let ports: Vec<u16> = mgr.running.values().map(|m| m.port).collect();
+        let claims: Vec<(u16, ActivityGuard)> = mgr
+            .running
+            .iter_mut()
+            .filter(|(_, m)| m.media)
+            .map(|(key, m)| {
+                m.in_flight += 1;
+                (m.port, ActivityGuard::new(&state, key))
+            })
+            .collect();
+        (ports, claims)
     };
     let path = uri.path();
     // all backends at once, so one stalled backend does not delay the rest
     let probes = ports.into_iter().map(|port| {
-        state
+        let send = state
             .0
             .client
             .get(format!("http://127.0.0.1:{port}{path}"))
             .timeout(Duration::from_secs(30))
-            .send()
+            .send();
+        async move { (port, send.await) }
     });
     let found = futures::future::join_all(probes)
         .await
         .into_iter()
-        .flatten()
-        .find(|r| r.status() != reqwest::StatusCode::NOT_FOUND);
-    if let Some(resp) = found {
+        .find_map(|(port, r)| {
+            r.ok()
+                .filter(|r| r.status() != reqwest::StatusCode::NOT_FOUND)
+                .map(|r| (port, r))
+        });
+    let claim = found.as_ref().and_then(|(port, _)| {
+        let i = claims.iter().position(|(p, _)| p == port)?;
+        Some(claims.swap_remove(i).1)
+    });
+    for (_, other) in claims {
+        other.release_idle();
+    }
+    if let Some((_, resp)) = found {
         let status = resp.status();
         let mut builder = Response::builder().status(status);
         for name in ["content-type", "content-disposition"] {
@@ -1508,12 +1535,17 @@ pub(super) async fn handle_openai_video_get(
                 builder = builder.header(name, v);
             }
         }
-        let stream = resp
-            .bytes_stream()
-            .map(|item| item.map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>));
+        let stream = resp.bytes_stream().map(move |item| {
+            let _claim = &claim;
+            item.map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+        });
         return Ok(builder
             .body(Body::from_stream(stream))
             .context("build video response")?);
+    }
+    // a video of a worker unloaded for another image or video model
+    if let Some(resp) = super::media::stashed_response(&state, path) {
+        return Ok(resp);
     }
     let body = serde_json::json!({
         "error": { "message": "video not found", "type": "not_found_error" }
