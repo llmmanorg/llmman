@@ -4528,16 +4528,31 @@ async fn handle_show_reports_the_thinking_values_the_template_takes() {
             .get("thinking")
             .cloned()
     }
-    // Qwen3.5: a switch that starts on; llmman bounds the levels.
-    let qwen3_5 = "{%- if enable_thinking is defined and enable_thinking is false %}\
-                   <think></think>{%- endif %}";
-    assert_eq!(
-        thinking("showqwen35", qwen3_5).await,
-        Some(serde_json::json!({
-            "values": [false, "minimal", "low", "medium", "high"],
-            "default": "medium",
-        }))
-    );
+    // A switch is reported as thinking whichever way the template reads
+    // it, since llama-server defines `enable_thinking` itself (#888):
+    // Qwen3 0.6B's `is false`, Qwen3.5 0.8B's `is true`. llmman bounds
+    // the levels either way.
+    for (name, template) in [
+        (
+            "showqwen3",
+            "{%- if enable_thinking is defined and enable_thinking is false %}\
+             <think></think>{%- endif %}",
+        ),
+        (
+            "showqwen35",
+            "{%- if enable_thinking is defined and enable_thinking is true %}<think>\
+             {%- else %}<think></think>{%- endif %}",
+        ),
+    ] {
+        assert_eq!(
+            thinking(name, template).await,
+            Some(serde_json::json!({
+                "values": [false, "minimal", "low", "medium", "high"],
+                "default": "medium",
+            })),
+            "{name}"
+        );
+    }
     // Levels the template names are the only ones.
     let levels = "{%- if reasoning_effort not in ('low', 'medium', 'xhigh') %}\
                   {{ raise_exception('think') }}{%- endif %}";

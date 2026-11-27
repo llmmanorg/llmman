@@ -827,7 +827,6 @@ mod tests {
             thinks: true,
             enable_thinking: true,
             efforts: vec![],
-            default_on: false,
             default_effort: None,
         };
         assert_eq!(

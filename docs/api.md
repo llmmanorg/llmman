@@ -83,7 +83,10 @@ that has that encoder, `tools` when the chat template renders a request's
 `tools`, and `thinking` when it handles reasoning. A llama-server model that thinks also gets Ollama's
 `thinking: {"values": [...], "default": ...}`: `false` plus the levels its
 template names (Qwen3.8: `low`, `medium`, `xhigh`), or `minimal`, `low`, `medium`
-and `high` for a switch-only template (Qwen3.5, Gemma 4). On `/api/chat` and
+and `high` for a switch-only template (Qwen3.5, Gemma 4). The `default` is
+what an omitted `think` does, which is thinking: llama-server defines
+`enable_thinking` itself before a model's own template runs, whatever
+default that template names. On `/api/chat` and
 `/api/generate` a `think` level outside `values` becomes the `default`, as in
 Ollama; a `think` that is not a boolean or string is a `400`.
 
