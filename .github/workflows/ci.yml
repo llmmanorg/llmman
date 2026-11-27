@@ -643,8 +643,8 @@ jobs:
           [ "$(plutil -extract LSUIElement raw "$app/Contents/Info.plist")" = true ] || { echo "::error::LSUIElement is not true"; exit 1; }
           [ -s "$app/Contents/Resources/llmman.icns" ] || { echo "::error::no icon"; exit 1; }
           codesign --verify --deep --strict --verbose=2 "$app"
-          lipo -verify_arch arm64 "$app/Contents/MacOS/llmman-desktop"
-          lipo -verify_arch arm64 "$app/Contents/MacOS/llmman"
+          lipo "$app/Contents/MacOS/llmman-desktop" -verify_arch arm64
+          lipo "$app/Contents/MacOS/llmman" -verify_arch arm64
           out="$("$app/Contents/MacOS/llmman-desktop" --version)"
           echo "$out"
           [ "$out" = "llmman-desktop $version" ] || { echo "::error::reports \"$out\""; exit 1; }
