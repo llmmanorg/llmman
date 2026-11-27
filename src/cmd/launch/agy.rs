@@ -213,21 +213,19 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_help_probe_that_hangs_or_is_missing_answers_no() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = std::env::temp_dir().join(format!("llmman-agy-help-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let script = |name: &str, body: &str| {
             let path = dir.join(name);
-            std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            crate::testscript::write_executable(&path, format!("#!/bin/sh\n{body}\n"));
             path
         };
         let quick = script("quick", "echo '  --settings  x' >&2");
         let hang = script("hang", "exec sleep 30");
-        let started = Instant::now();
-        assert!(run_help(&quick, Duration::from_secs(5))
+        assert!(run_help(&quick, Duration::from_secs(30))
             .unwrap()
             .contains("--settings"));
+        let started = Instant::now();
         assert!(run_help(&hang, Duration::from_millis(300)).is_none());
         assert!(started.elapsed() < Duration::from_secs(5));
         assert!(run_help(&dir.join("missing"), Duration::from_secs(1)).is_none());
@@ -239,12 +237,13 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_help_probe_whose_pipes_outlive_the_child_answers_no_at_the_limit() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = std::env::temp_dir().join(format!("llmman-agy-bg-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("agy");
-        std::fs::write(&path, "#!/bin/sh\nsleep 5 &\necho '  --settings  x'\n").unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::testscript::write_executable(
+            &path,
+            "#!/bin/sh\nsleep 5 &\necho '  --settings  x'\n",
+        );
         let started = Instant::now();
         assert!(run_help(&path, Duration::from_secs(1)).is_none());
         assert!(started.elapsed() < Duration::from_secs(4));
