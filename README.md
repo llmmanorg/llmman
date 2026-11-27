@@ -88,6 +88,17 @@ scoop install llmman
 To start `llmman serve` at every logon, see
 [Run in the background](packaging/scoop/README.md#run-in-the-background).
 
+**Desktop app** (a tray icon that opens the web UI and keeps `llmman serve` running; see [desktop/README.md](desktop/README.md)):
+
+- Linux: `brew install llmmanorg/tap/llmman-desktop`, then launch llmman from the application menu.
+- macOS (Apple Silicon): `brew install --cask llmmanorg/tap/llmman-desktop`, or open
+  [llmman-desktop-aarch64-apple-darwin.dmg](https://github.com/llmmanorg/llmman/releases/latest/download/llmman-desktop-aarch64-apple-darwin.dmg)
+  (right-click, Open the first time); launch llmman from Launchpad.
+- Windows: install [llmman-desktop.msixbundle](https://github.com/llmmanorg/llmman/releases/latest/download/llmman-desktop.msixbundle);
+  launch llmman from the Start menu.
+
+All include `llmman`.
+
 **Cargo:**
 
 ```sh

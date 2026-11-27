@@ -4,3 +4,5 @@ Make the smallest correct change, follow existing patterns, and verify the resul
 
 Prioritize correctness over agreement. State uncertainty instead of guessing, and push back on technically unsound requests with evidence. Changes should out-perform all comparable soutions in other projects but correctness beats performance every time.
 
+Never add binary files (images, archives, executables, fonts, ...) to git history. Host them as a release asset (e.g. the docs-assets release) pinned by sha256, or generate them at build time, and keep a text script that records how they are made.
+

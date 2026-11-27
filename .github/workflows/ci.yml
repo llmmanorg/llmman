@@ -453,6 +453,336 @@ jobs:
     steps: *build-steps
 
   # --------------------------------------------------------------------------
+  # llmman-desktop (desktop/): its own crate and lockfile, released with
+  # llmman at the same version. PRs build dev; main builds --release (Linux
+  # in manylinux_2_28, like `build`). Only --version runs headless. Windows
+  # legs upload an exe for desktop-msix under a name `release` skips; the
+  # others upload the release asset. aarch64 Windows is main-only, as in
+  # build-windows-arm.
+  # --------------------------------------------------------------------------
+  desktop:
+    name: Desktop (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    env: &desktop-env
+      PROFILE_FLAG: ${{ github.event_name != 'pull_request' && '--release' || '' }}
+      PROFILE_DIR: ${{ github.event_name != 'pull_request' && 'release' || 'debug' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-24.04
+            binary: llmman-desktop
+            staged: llmman-desktop-x86_64-unknown-linux-gnu
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+            binary: llmman-desktop
+            staged: llmman-desktop-aarch64-unknown-linux-gnu
+          - target: aarch64-apple-darwin
+            runner: macos-15
+            binary: llmman-desktop
+            staged: llmman-desktop-aarch64-apple-darwin
+          - target: x86_64-pc-windows-msvc
+            runner: windows-2025
+            binary: llmman-desktop.exe
+            staged: llmman-desktop.exe
+            artifact: desktop-exe-x86_64-pc-windows-msvc
+    steps: &desktop-steps
+      # version.sh needs the full history.
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set release version
+        shell: bash
+        run: packaging/version.sh --apply
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          targets: ${{ matrix.target }}
+          components: clippy, rustfmt
+
+      - name: Cache Rust build artefacts
+        uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+        with:
+          key: desktop-${{ matrix.target }}
+          workspaces: desktop
+
+      - name: cargo fmt --check
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        working-directory: desktop
+        run: cargo fmt --check
+
+      - name: cargo clippy
+        working-directory: desktop
+        run: cargo clippy ${{ env.PROFILE_FLAG }} --locked --target ${{ matrix.target }} --all-targets -- -D warnings
+
+      - name: cargo test
+        working-directory: desktop
+        run: cargo test ${{ env.PROFILE_FLAG }} --locked --target ${{ matrix.target }}
+
+      - name: Build
+        working-directory: desktop
+        run: cargo build ${{ env.PROFILE_FLAG }} --locked --target ${{ matrix.target }}
+
+      # The runner links glibc 2.39: rebuild in manylinux_2_28, fail on a
+      # newer glibc symbol, and start it on a few distros.
+      - name: Rebuild for glibc 2.28 (Linux)
+        if: runner.os == 'Linux' && github.event_name != 'pull_request'
+        shell: bash
+        run: |
+          set -euo pipefail
+          pull() { for _ in 1 2 3 4; do docker pull -q "$1" >/dev/null && return; sleep 5; done; return 1; }
+          case "$(uname -m)" in
+          x86_64) image=quay.io/pypa/manylinux_2_28_x86_64@sha256:55a36963bc0504cdf004011001c1072306402f0b8b83be5a5eba7068f93eec53 ;;
+          aarch64) image=quay.io/pypa/manylinux_2_28_aarch64@sha256:126d9eea9d6b1717f3e17b2b3ac51da04ef159a5f935dac36fe92d621dc8f246 ;;
+          esac
+          pull "$image"
+          mkdir -p "$RUNNER_TEMP/portable"
+          docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" -v "$RUNNER_TEMP/portable:/p" -w /work \
+            -e HOME=/p -e CARGO_TARGET_DIR=/p/target "$image" bash -euxc '
+              curl --proto "=https" --tlsv1.2 -fsSL --retry 5 https://sh.rustup.rs |
+                sh -s -- -y --profile minimal --default-toolchain stable --no-modify-path
+              PATH=/p/.cargo/bin:$PATH cargo build --release --locked --manifest-path desktop/Cargo.toml'
+          bin="$RUNNER_TEMP/portable/target/release/llmman-desktop"
+          max="$(objdump -T "$bin" | grep -o 'GLIBC_[0-9.]*' | sort -Vu | tail -1)"
+          echo "newest glibc symbol: $max"
+          [ "$(printf '%s\nGLIBC_2.28\n' "$max" | sort -V | tail -1)" = GLIBC_2.28 ] || { echo "::error::needs $max, not 2.28"; exit 1; }
+          for img in rockylinux:8 ubuntu:22.04 debian:12; do
+            pull "$img"
+            docker run --rm -v "$bin:/llmman-desktop:ro" "$img" /llmman-desktop --version
+          done
+          cp "$bin" "desktop/target/${{ matrix.target }}/release/llmman-desktop"
+
+      # --version returns before any GUI code, so it runs headless.
+      - name: Stage binary and check its version
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist-desktop
+          cp "desktop/target/${{ matrix.target }}/$PROFILE_DIR/${{ matrix.binary }}" "dist-desktop/${{ matrix.staged }}"
+          out="$("dist-desktop/${{ matrix.staged }}" --version)"
+          echo "$out"
+          [ "$out" = "llmman-desktop $(packaging/version.sh)" ] || { echo "::error::reports \"$out\""; exit 1; }
+
+      - name: Upload binary
+        if: github.event_name != 'pull_request'
+        uses: ./.github/actions/upload-artifact-retry
+        with:
+          name: ${{ matrix.artifact || matrix.staged }}
+          path: dist-desktop/${{ matrix.staged }}
+
+  desktop-windows-arm:
+    name: Desktop (${{ matrix.target }})
+    if: github.event_name != 'pull_request'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    env: *desktop-env
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-pc-windows-msvc
+            runner: windows-11-arm
+            binary: llmman-desktop.exe
+            staged: llmman-desktop.exe
+            artifact: desktop-exe-aarch64-pc-windows-msvc
+    steps: *desktop-steps
+
+  # --------------------------------------------------------------------------
+  # llmman.app in a .dmg (packaging/desktop-dmg.sh), ad-hoc signed. Main
+  # only: only main uploads the binaries it bundles.
+  # --------------------------------------------------------------------------
+  desktop-dmg:
+    name: Desktop (macOS .dmg)
+    needs: [build, desktop]
+    if: github.event_name != 'pull_request'
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      # Trailing `*`: a retried upload is `<name>-retry`.
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: in
+          pattern: llmman-desktop-aarch64-apple-darwin*
+          merge-multiple: true
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: in
+          pattern: llmman-docker-aarch64-apple-darwin*
+          merge-multiple: true
+
+      - name: Build the .dmg
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist-desktop
+          packaging/desktop-dmg.sh in/llmman-desktop-aarch64-apple-darwin in/llmman \
+            "$(packaging/version.sh)" dist-desktop/llmman-desktop-aarch64-apple-darwin.dmg
+
+      - name: Inspect the .dmg
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(packaging/version.sh)"
+          mnt="$RUNNER_TEMP/dmg"
+          mkdir -p "$mnt"
+          hdiutil attach -nobrowse -readonly -mountpoint "$mnt" dist-desktop/llmman-desktop-aarch64-apple-darwin.dmg
+          trap 'hdiutil detach -force "$mnt" || true' EXIT
+          app="$mnt/llmman.app"
+          [ -L "$mnt/Applications" ] || { echo "::error::no /Applications symlink"; exit 1; }
+          [ "$(plutil -extract LSUIElement raw "$app/Contents/Info.plist")" = true ] || { echo "::error::LSUIElement is not true"; exit 1; }
+          [ -s "$app/Contents/Resources/llmman.icns" ] || { echo "::error::no icon"; exit 1; }
+          codesign --verify --deep --strict --verbose=2 "$app"
+          lipo -verify_arch arm64 "$app/Contents/MacOS/llmman-desktop"
+          lipo -verify_arch arm64 "$app/Contents/MacOS/llmman"
+          out="$("$app/Contents/MacOS/llmman-desktop" --version)"
+          echo "$out"
+          [ "$out" = "llmman-desktop $version" ] || { echo "::error::reports \"$out\""; exit 1; }
+          out="$("$app/Contents/MacOS/llmman" --version)"
+          echo "$out"
+          case "$out" in
+          "llmman $version ("*")") ;;
+          *) echo "::error::llmman reports \"$out\""; exit 1 ;;
+          esac
+
+      - name: Upload .dmg
+        uses: ./.github/actions/upload-artifact-retry
+        with:
+          name: llmman-desktop-dmg
+          path: dist-desktop/llmman-desktop-aarch64-apple-darwin.dmg
+
+  # --------------------------------------------------------------------------
+  # llmman-desktop.msixbundle (packaging/desktop-msix.ps1): x64 and ARM64
+  # packages. Signed with Azure Trusted Signing if the AZURE_* secrets exist,
+  # else unsigned (the Publisher then carries the unsigned marker). Signed,
+  # the repository variable MSIX_PUBLISHER must be the certificate's subject.
+  # Main only, like the binaries it bundles.
+  # --------------------------------------------------------------------------
+  desktop-msix:
+    name: Desktop (Windows .msixbundle)
+    needs: [build, build-windows-arm, desktop, desktop-windows-arm]
+    if: github.event_name != 'pull_request'
+    runs-on: windows-2025
+    timeout-minutes: 30
+    env:
+      MSIX_PUBLISHER: ${{ vars.MSIX_PUBLISHER || 'CN=llmman' }}
+      MSIX_UNSIGNED: ${{ (secrets.AZURE_TENANT_ID != '' && secrets.AZURE_CLIENT_ID != '' && secrets.AZURE_CLIENT_SECRET != '' && secrets.AZURE_TS_ENDPOINT != '' && secrets.AZURE_TS_ACCOUNT_NAME != '' && secrets.AZURE_TS_PROFILE_NAME != '') && 'false' || 'true' }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check signing configuration
+        shell: bash
+        env:
+          PUBLISHER_VAR: ${{ vars.MSIX_PUBLISHER }}
+        run: |
+          set -euo pipefail
+          if [ "$MSIX_UNSIGNED" = true ]; then
+            echo "::notice::AZURE_* secrets are not all set; llmman-desktop.msixbundle is published unsigned"
+          elif [ -z "$PUBLISHER_VAR" ]; then
+            echo "::error::the AZURE_* secrets are set but the MSIX_PUBLISHER variable is not (it must be the signing certificate's subject)"
+            exit 1
+          fi
+
+      # Trailing `*`: a retried upload is `<name>-retry`.
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: in/x64
+          pattern: desktop-exe-x86_64-pc-windows-msvc*
+          merge-multiple: true
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: in/x64
+          pattern: llmman-docker-x86_64-pc-windows-msvc*
+          merge-multiple: true
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: in/arm64
+          pattern: desktop-exe-aarch64-pc-windows-msvc*
+          merge-multiple: true
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: in/arm64
+          pattern: llmman-docker-aarch64-pc-windows-msvc*
+          merge-multiple: true
+
+      - name: Version
+        shell: bash
+        run: echo "VERSION=$(packaging/version.sh)" >> "$GITHUB_ENV"
+
+      - name: Build the packages
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory msix | Out-Null
+          packaging/desktop-msix.ps1 pack x64 $env:VERSION in/x64 msix/llmman-desktop-x64.msix
+          packaging/desktop-msix.ps1 pack arm64 $env:VERSION in/arm64 msix/llmman-desktop-arm64.msix
+
+      - name: Sign the packages (Azure Trusted Signing)
+        if: env.MSIX_UNSIGNED != 'true'
+        uses: azure/trusted-signing-action@c7ab2a863ab5f9a846ddb8265964877ef296ee82 # v2
+        with:
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+          endpoint: ${{ secrets.AZURE_TS_ENDPOINT }}
+          trusted-signing-account-name: ${{ secrets.AZURE_TS_ACCOUNT_NAME }}
+          certificate-profile-name: ${{ secrets.AZURE_TS_PROFILE_NAME }}
+          files-folder: msix
+          files-folder-filter: msix
+          files-folder-recurse: false
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com/
+          timestamp-digest: SHA256
+
+      - name: Build the bundle
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory bundle | Out-Null
+          packaging/desktop-msix.ps1 bundle $env:VERSION msix bundle/llmman-desktop.msixbundle
+
+      - name: Sign the bundle (Azure Trusted Signing)
+        if: env.MSIX_UNSIGNED != 'true'
+        uses: azure/trusted-signing-action@c7ab2a863ab5f9a846ddb8265964877ef296ee82 # v2
+        with:
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+          endpoint: ${{ secrets.AZURE_TS_ENDPOINT }}
+          trusted-signing-account-name: ${{ secrets.AZURE_TS_ACCOUNT_NAME }}
+          certificate-profile-name: ${{ secrets.AZURE_TS_PROFILE_NAME }}
+          files-folder: bundle
+          files-folder-filter: msixbundle
+          files-folder-recurse: false
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com/
+          timestamp-digest: SHA256
+
+      - name: Verify the bundle
+        shell: pwsh
+        run: packaging/desktop-msix.ps1 verify $env:VERSION bundle/llmman-desktop.msixbundle
+
+      - name: Upload bundle
+        uses: ./.github/actions/upload-artifact-retry
+        with:
+          name: llmman-desktop-msixbundle
+          path: bundle/llmman-desktop.msixbundle
+
+  # --------------------------------------------------------------------------
   # rustfmt and the fuzz-crate checks, once, in parallel with `build`.
   # --------------------------------------------------------------------------
   lint-rust:
@@ -665,30 +995,35 @@ jobs:
 
       # ── Packaging ────────────────────────────────────────────────────────
       - name: shellcheck
-        run: shellcheck packaging/version.sh packaging/render.sh packaging/release-tag.sh packaging/llama-build.sh
+        run: shellcheck packaging/version.sh packaging/render.sh packaging/release-tag.sh packaging/llama-build.sh packaging/desktop-dmg.sh
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
 
       # MAJOR.MINOR from Cargo.toml (PATCH must stay 0), PATCH = commit
-      # count; --apply must leave Cargo.toml and Cargo.lock agreeing.
+      # count; --apply must leave each Cargo.toml and Cargo.lock agreeing.
+      # desktop/ shares the root's MAJOR.MINOR.
       - name: version.sh
         id: version
         run: |
           set -euo pipefail
-          base="$(awk '/^\[package\]/{p=1;next} /^\[/{p=0} p && /^version *=/{gsub(/^[^"]*"|".*$/,""); print; exit}' Cargo.toml)"
+          manifest_version() { awk '/^\[package\]/{p=1;next} /^\[/{p=0} p && /^version *=/{gsub(/^[^"]*"|".*$/,""); print; exit}' "$1"; }
+          base="$(manifest_version Cargo.toml)"
           count="$(git rev-list --count HEAD)"
           want="${base%.*}.$count"
           got="$(packaging/version.sh)"
           [ "$got" = "$want" ] || { echo "::error::version.sh printed $got, expected $want"; exit 1; }
           [ "${base##*.}" = "0" ] || { echo "::error::Cargo.toml PATCH is ${base##*.}, must stay 0 (CI owns it)"; exit 1; }
+          [ "$(manifest_version desktop/Cargo.toml)" = "$base" ] || { echo "::error::desktop/Cargo.toml version must be $base"; exit 1; }
 
           packaging/version.sh --apply >/dev/null
-          applied="$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')"
-          [ "$applied" = "$want" ] || { echo "::error::--apply left Cargo.toml at $applied, expected $want"; exit 1; }
-          cargo metadata --locked --format-version 1 >/dev/null
+          for manifest in Cargo.toml desktop/Cargo.toml; do
+            applied="$(cargo metadata --manifest-path "$manifest" --no-deps --format-version 1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')"
+            [ "$applied" = "$want" ] || { echo "::error::--apply left $manifest at $applied, expected $want"; exit 1; }
+            cargo metadata --manifest-path "$manifest" --locked --format-version 1 >/dev/null
+          done
           echo "version=$want" >> "$GITHUB_OUTPUT"
-          echo "OK: version $want applied to Cargo.toml and Cargo.lock"
+          echo "OK: version $want applied to Cargo.toml and Cargo.lock, in desktop/ too"
 
       # Synthetic checksums: this checks rendering, not hashes. Everything
       # goes to $RUNNER_TEMP so `cargo package` below sees a clean tree.
@@ -702,16 +1037,21 @@ jobs:
             llmman-x86_64-unknown-linux-gnu \
             llmman-aarch64-unknown-linux-gnu \
             llmman-x86_64-pc-windows-msvc.exe \
-            llmman-aarch64-pc-windows-msvc.exe; do
+            llmman-aarch64-pc-windows-msvc.exe \
+            llmman-desktop-aarch64-apple-darwin.dmg \
+            llmman-desktop-x86_64-unknown-linux-gnu \
+            llmman-desktop-aarch64-unknown-linux-gnu; do
             printf '%s  %s\n' "$(printf '%s' "$asset" | sha256sum | cut -d' ' -f1)" "$asset"
           done > "$RUNNER_TEMP/fake-checksums.txt"
           packaging/render.sh --version "$VERSION" --checksums "$RUNNER_TEMP/fake-checksums.txt" --out-dir "$RUNNER_TEMP/out"
 
           # A missing platform or a malformed version must be rejected.
-          grep -v aarch64-unknown-linux-gnu "$RUNNER_TEMP/fake-checksums.txt" > "$RUNNER_TEMP/short.txt"
-          if packaging/render.sh --version "$VERSION" --checksums "$RUNNER_TEMP/short.txt" --out-dir "$RUNNER_TEMP/out-bad" 2>/dev/null; then
-            echo "::error::render.sh accepted a checksums file with no Linux aarch64 entry"; exit 1
-          fi
+          for missing in aarch64-unknown-linux-gnu llmman-desktop-aarch64-apple-darwin.dmg; do
+            grep -v "$missing" "$RUNNER_TEMP/fake-checksums.txt" > "$RUNNER_TEMP/short.txt"
+            if packaging/render.sh --version "$VERSION" --checksums "$RUNNER_TEMP/short.txt" --out-dir "$RUNNER_TEMP/out-bad" 2>/dev/null; then
+              echo "::error::render.sh accepted a checksums file with no $missing entry"; exit 1
+            fi
+          done
           for bad in "v$VERSION" "$VERSION-rc1" "0.1" ""; do
             if packaging/render.sh --version "$bad" --checksums "$RUNNER_TEMP/fake-checksums.txt" --out-dir "$RUNNER_TEMP/out-bad" 2>/dev/null; then
               echo "::error::render.sh accepted version \"$bad\""; exit 1
@@ -720,25 +1060,113 @@ jobs:
           echo "OK"
 
       # ruby -c catches the failure that breaks the whole tap (a formula
-      # that does not parse). Homebrew also requires class == filename.
-      - name: Check Homebrew formula
+      # or cask that does not parse). Homebrew also requires class == filename.
+      - name: Check Homebrew formulae and cask
         env:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
           set -euo pipefail
-          f="$RUNNER_TEMP/out/homebrew/Formula/llmman.rb"
+          tap="$RUNNER_TEMP/out/homebrew"
+          test -f "$tap/README.md"
+          fail() { echo "::error::$*"; exit 1; }
+          shas() { grep -c '^ *sha256 "[0-9a-f]\{64\}"$' "$1" || true; }
+
+          f="$tap/Formula/llmman.rb"
           ruby -c "$f"
-          grep -q '^class Llmman < Formula$' "$f" || { echo "::error::$f does not declare 'class Llmman'"; exit 1; }
-          grep -q "^  version \"$VERSION\"$" "$f" || { echo "::error::$f does not declare version $VERSION"; exit 1; }
-          for asset in llmman-aarch64-apple-darwin llmman-x86_64-unknown-linux-gnu llmman-aarch64-unknown-linux-gnu; do
-            grep -q "releases/download/v$VERSION/$asset\"" "$f" || { echo "::error::$f has no url for $asset"; exit 1; }
+          grep -q "^class Llmman < Formula\$" "$f" || fail "$f does not declare 'class Llmman'"
+          grep -q "^  version \"$VERSION\"$" "$f" || fail "$f does not declare version $VERSION"
+          for target in aarch64-apple-darwin x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
+            grep -q "releases/download/v$VERSION/llmman-$target\"" "$f" || fail "$f has no url for llmman-$target"
           done
-          [ "$(grep -c '^ *sha256 "[0-9a-f]\{64\}"$' "$f")" -eq 3 ] || { echo "::error::$f does not have exactly 3 sha256 lines"; exit 1; }
+          [ "$(shas "$f")" -eq 3 ] || fail "$f does not have exactly 3 sha256 lines"
           if grep -q '^ *url ".*x86_64-apple-darwin' "$f"; then
-            echo "::error::$f has a url for x86_64-apple-darwin, which llmman does not publish"; exit 1
+            fail "$f has a url for x86_64-apple-darwin, which llmman does not publish"
           fi
-          test -f "$RUNNER_TEMP/out/homebrew/README.md"
           echo "OK: $f"
+
+          # Linux only: the bare binaries plus the launcher icon (3 sha256 lines).
+          f="$tap/Formula/llmman-desktop.rb"
+          ruby -c "$f"
+          grep -q "^class LlmmanDesktop < Formula\$" "$f" || fail "$f does not declare 'class LlmmanDesktop'"
+          grep -q "^  version \"$VERSION\"$" "$f" || fail "$f does not declare version $VERSION"
+          for target in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
+            grep -q "releases/download/v$VERSION/llmman-desktop-$target\"" "$f" || fail "$f has no url for llmman-desktop-$target"
+          done
+          [ "$(shas "$f")" -eq 3 ] || fail "$f does not have exactly 3 sha256 lines (2 binaries and the icon)"
+          if grep -q 'apple-darwin' "$f"; then
+            fail "$f mentions apple-darwin; macOS installs the cask"
+          fi
+          grep -q '^  depends_on :linux$' "$f" || fail "$f is not Linux-only"
+          grep -q '^  depends_on "llmman"$' "$f" || fail "$f does not depend on llmman"
+          grep -q 'llmman-desktop --version' "$f" || fail "$f has no --version test"
+          grep -q '^  resource "icon" do$' "$f" || fail "$f has no icon resource"
+          grep -q 'share/"applications/llmman-desktop.desktop"' "$f" || fail "$f does not install a .desktop file"
+          grep -q '^  def post_install$' "$f" || fail "$f has no post_install to link the .desktop file"
+          if grep -q 'llmman-desktop &' "$f"; then
+            fail "$f tells users to start the app from a terminal"
+          fi
+          echo "OK: $f"
+
+          f="$tap/Casks/llmman-desktop.rb"
+          ruby -c "$f"
+          grep -q '^cask "llmman-desktop" do$' "$f" || fail "$f does not declare cask \"llmman-desktop\""
+          grep -q "^  version \"$VERSION\"$" "$f" || fail "$f does not declare version $VERSION"
+          grep -q "^  url \"https://github.com/llmmanorg/llmman/releases/download/v$VERSION/llmman-desktop-aarch64-apple-darwin.dmg\"$" "$f" || fail "$f has no url for the .dmg"
+          [ "$(shas "$f")" -eq 1 ] || fail "$f does not have exactly 1 sha256 line"
+          grep -q '^  depends_on arch: :arm64$' "$f" || fail "$f is not arm64 only"
+          grep -q '^  depends_on macos: ' "$f" || fail "$f does not set a minimum macOS"
+          grep -q '^  app "llmman.app"$' "$f" || fail "$f does not install llmman.app"
+          grep -qF 'system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "#{appdir}/llmman.app"]' "$f" || fail "$f does not remove the quarantine attribute in a postflight (llmman.app is not notarized)"
+          grep -q '^  postflight do$' "$f" || fail "$f has no postflight"
+          echo "OK: $f"
+
+      # desktop-msix runs on main only: check here that the manifest is
+      # well-formed and names a program and logos desktop-msix.ps1 downloads.
+      - name: Check MSIX manifest
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import re, xml.dom.minidom
+          text = open("packaging/msix/AppxManifest.xml.in", encoding="utf-8").read()
+          for placeholder in ("@VERSION@", "@ARCH@", "@PUBLISHER@"):
+              assert placeholder in text, f"manifest lacks {placeholder}"
+          text = text.replace("@VERSION@", "0.1.2.0").replace("@ARCH@", "x64").replace("@PUBLISHER@", "CN=llmman")
+          assert not re.search(r"@[A-Z]{2,}@", text), "unknown placeholder in the manifest"
+          doc = xml.dom.minidom.parseString(text)
+          app = doc.getElementsByTagName("Application")[0]
+          assert app.getAttribute("Executable") == "llmman-desktop.exe"
+          assert app.getAttribute("EntryPoint") == "Windows.FullTrustApplication"
+          caps = [c.getAttribute("Name") for c in doc.getElementsByTagName("rescap:Capability")]
+          assert "runFullTrust" in caps, caps
+          logos = [doc.getElementsByTagName("Logo")[0].firstChild.data]
+          logos += [v.getAttribute(a) for v in doc.getElementsByTagName("uap:VisualElements") for a in ("Square150x150Logo", "Square44x44Logo")]
+          pinned = {n.removeprefix("llmman-desktop-") for n in re.findall(r"llmman-desktop-\w+\.png", open("packaging/desktop-msix.ps1").read())}
+          for logo in logos:
+              assert logo.split("\\")[-1] in pinned, f"{logo} is not downloaded by desktop-msix.ps1: {sorted(pinned)}"
+          print("OK: packaging/msix/AppxManifest.xml.in")
+          PY
+
+      # Every desktop icon pin (build.rs, desktop-dmg.sh, desktop-msix.ps1, the
+      # desktop formula) must
+      # name an asset desktop/generate-assets.py makes, with the sha256 of the
+      # file on the docs-assets release; none may be missing or disagree.
+      - name: Check desktop icon pins
+        run: |
+          python3 - <<'PY'
+          import hashlib, re, urllib.request
+          pin = re.compile(r"(llmman-desktop-[\w-]+\.png)\W+(?:sha256\W+)?([0-9a-f]{64})")
+          files = ["desktop/build.rs", "packaging/desktop-dmg.sh", "packaging/desktop-msix.ps1", "packaging/homebrew/Formula/llmman-desktop.rb.in"]
+          pins = {}
+          for f in files:
+              for name, sha in pin.findall(open(f).read()):
+                  assert pins.setdefault(name, sha) == sha, f"{f}: {name} has two different pins"
+          made = set(re.findall(r"\"(llmman-desktop-[\w-]+\.png)\":", open("desktop/generate-assets.py").read()))
+          assert set(pins) == made, f"pinned {sorted(pins)}, generate-assets.py makes {sorted(made)}"
+          for name, sha in pins.items():
+              url = f"https://github.com/llmmanorg/llmman/releases/download/docs-assets/{name}"
+              assert hashlib.sha256(urllib.request.urlopen(url, timeout=60).read()).hexdigest() == sha, f"{name} differs from {url}"
+          print("OK:", ", ".join(sorted(pins)))
+          PY
 
       # Against scoop's real manifest schema.
       - name: Check scoop manifest
@@ -792,7 +1220,7 @@ jobs:
           # The web UI's script names carry a content hash.
           grep -qE '^webui/_expo/static/js/web/entry-[0-9a-f]+\.js$' "$files" ||
             { echo "::error::the web UI's entry script is missing from the .crate"; exit 1; }
-          for never in '^packaging/' '^vllm-plugin/' '^app/' '^docs/' '^\.github/' '^fuzz/' '^csi/' '^deploy/' '^go-shim/go-shim$'; do
+          for never in '^packaging/' '^vllm-plugin/' '^app/' '^docs/' '^\.github/' '^fuzz/' '^csi/' '^deploy/' '^desktop/' '^go-shim/go-shim$'; do
             if grep -q "$never" "$files"; then
               echo "::error::.crate contains files matching $never:"; grep "$never" "$files"; exit 1
             fi
@@ -2283,7 +2711,7 @@ jobs:
     name: Release
     # Everything must be green first. e2e only runs on the same push event
     # this job fires on, so this never waits on a run that will not happen.
-    needs: [tag, build, build-windows-arm, android, lint-packaging, lint-rust, csi, webui, e2e]
+    needs: [tag, build, build-windows-arm, desktop, desktop-windows-arm, desktop-dmg, desktop-msix, android, lint-packaging, lint-rust, csi, webui, e2e]
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
@@ -2336,11 +2764,21 @@ jobs:
           pattern: llmman-android-aarch64-linux-android*
           merge-multiple: true
 
+      # llmman-desktop's binaries, .dmg and .msixbundle, already named for release.
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: dist
+          pattern: llmman-desktop-*
+          merge-multiple: true
+
+      # macOS users get llmman.app (the .dmg, and the cask that installs it);
+      # the bare binary was only the .dmg job's input and is not a release asset.
       - name: Rename binaries for release
         shell: bash
         run: |
           set -euo pipefail
           cd dist
+          rm -f llmman-desktop-aarch64-apple-darwin
           for dir in llmman-docker-*/; do
             target="${dir%/}"          # e.g. llmman-docker-x86_64-unknown-linux-gnu[-retry]
             triple="${target#llmman-docker-}"
@@ -2352,8 +2790,8 @@ jobs:
             fi
           done
 
-      # All six assets, by name, before anything is published, and the
-      # one binary this runner can execute must report this version.
+      # Every asset must exist, and the binaries this runner can run must
+      # report this version.
       - name: Verify release assets
         shell: bash
         env:
@@ -2367,7 +2805,11 @@ jobs:
             llmman-aarch64-apple-darwin \
             llmman-x86_64-pc-windows-msvc.exe \
             llmman-aarch64-pc-windows-msvc.exe \
-            llmman-aarch64-linux-android.apk; do
+            llmman-aarch64-linux-android.apk \
+            llmman-desktop-x86_64-unknown-linux-gnu \
+            llmman-desktop-aarch64-unknown-linux-gnu \
+            llmman-desktop-aarch64-apple-darwin.dmg \
+            llmman-desktop.msixbundle; do
             [ -s "$asset" ] || { echo "::error::release asset $asset is missing or empty"; exit 1; }
           done
           chmod +x llmman-x86_64-unknown-linux-gnu
@@ -2380,6 +2822,10 @@ jobs:
           case "$out" in
           *-dirty*) echo "::error::release binary reports a dirty tree: $out"; exit 1 ;;
           esac
+          chmod +x llmman-desktop-x86_64-unknown-linux-gnu
+          out="$(./llmman-desktop-x86_64-unknown-linux-gnu --version)"
+          echo "$out"
+          [ "$out" = "llmman-desktop $VERSION" ] || { echo "::error::llmman-desktop reports \"$out\", expected \"llmman-desktop $VERSION\""; exit 1; }
 
       # checksums.txt: a release asset for users, and (as an artifact) the
       # hashes publish-packages embeds, so what brew/scoop enforce is the
@@ -2685,7 +3131,8 @@ jobs:
   # Package repos, one matrix entry each. render.sh lays rendered/<id> out
   # as the target repo, so the job body is shared:
   #   Homebrew (#385): macOS arm64, Linux x86_64/aarch64 -> homebrew-tap
-  #                    (`brew install llmmanorg/tap/llmman`)
+  #                    (`brew install llmmanorg/tap/llmman`; llmman-desktop is a
+  #                    formula on Linux, `brew install --cask` on macOS)
   #   scoop (#390):    Windows x64/arm64 -> scoop-bucket
   #                    (`scoop bucket add llmman <url>; scoop install llmman`)
   # Pushes use secrets.TAP_GITHUB_TOKEN (contents:write on both repos).
