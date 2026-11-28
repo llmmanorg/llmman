@@ -18,7 +18,7 @@ jobs:
       github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' &&
       (github.event.workflow_run.conclusion == 'failure' || github.event.workflow_run.conclusion == 'cancelled') &&
       github.event.workflow_run.run_attempt < 3
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     permissions:
       actions: write
       checks: read
