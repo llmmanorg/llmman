@@ -10,7 +10,7 @@
 #
 #   cp ../target/release/llmman llmman-amd64
 #   docker build -t llmman-csi .
-ARG BASE=ubuntu:24.04
+ARG BASE=ubuntu:26.04
 ARG GO_IMAGE=golang:1.27
 
 # The plugin is static (no cgo) and cross-compiled on the build host.
